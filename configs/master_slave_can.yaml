@@ -1,0 +1,207 @@
+teleop:
+  mode: master_slave  # 可选: master_slave(主从臂), meta_quest3_vr(Meta Quest 3 VR), keyboard_3d_mouse(键盘仿3D鼠标)
+  protocol: can
+  backend: pyagxarm
+  command:
+    sample_rate_hz: 100.0
+    # CAN 任一状态流超过 30 ms 未更新，禁止继续计算 dq/ddq 和力反馈。
+    maximum_can_frame_gap_s: 0.06
+    # 双边控制周期超过 50 ms 时，在下一次命令下发前触发紧急复位。
+    control_watchdog_timeout_s: 0.05
+    # 主时间线对齐延迟；状态滤波参数统一配置在 robot_states 下。
+    state_alignment_delay_s: 0.015
+    # 只切换从臂下发方式；主臂始终使用 MIT 重力补偿和力反馈。
+    control_mode: mit  # mit 或 position
+    bilateral_mit:
+      # 主臂拖动阻尼；主臂 kp 固定使用代码默认值 0。
+      leader_kd: [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]
+      # 仅 control_mode=mit 时用于从臂镜像跟踪。
+      follower_kp: [1.0, 1.0, 2.0, 4.0, 1.0, 1.0, 8.0]  # q
+      follower_kd: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]  # v
+      # 首次实机逐轴确认 sign，再逐步增加 gain/limit。
+      # force_feedback_gain: [1, 1, 1, 1, 1, 1, 1]
+      force_feedback_gain: [0, 0, 0, 0, 0, 0, 0]
+      force_feedback_sign: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+      force_feedback_deadband_nm: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+      # force_feedback_limit_nm: [5, 5, 5, 5, 5, 5, 5]
+      force_feedback_limit_nm: [10, 10, 10, 10, 10, 10, 10]
+      force_feedback_lowpass_hz: 10.0
+    joint_step_limit_rad: 0.3
+    reset_on_start: true
+    reset_after_episode: true
+  master_slave:
+    arm_pairs:
+      - name: main
+        leader:
+          name: master_arm
+          channel: can0
+          interface: socketcan
+          bitrate: 1000000
+          firmware: V120
+          # 主臂始终使用固件 follower/CAN 模式；软件 MIT 实现重力补偿拖动和力反馈。
+        follower:
+          name: slave_arm
+          channel: can1
+          interface: socketcan
+          bitrate: 1000000
+          firmware: V120
+          rest_q: [+0.00000, -0.14689, -0.01138, +1.80020, -0.02033, +0.02744, +1.50378]
+output:
+  # directory: ../runs/insert_usb
+  directory: ../runs/tau_refinement
+  prefix: episode
+  # 每个 episode 开始后先运行控制和滤波，但不保存或可视化这段数据。
+  discard_initial_s: 0.2
+
+# checkpoint 内的 config 会自动恢复训练 horizon、输入顺序、输出、网络结构和归一化参数。
+# 在线推理逐帧携带 GRU/LSTM 状态；每个 episode 会创建新状态。
+# horizon/input_keys/output_key 仅用于显式校验，通常无需配置。
+tau_f_inference:
+  enabled: false
+  # tau_f: tau_ext_raw=(tau_id-tau)-tau_f_pred
+  # tau_bg: tau_ext_raw=tau-tau_bg_pred；切换后将 output_key 改成 checkpoint 的实际 target_key。
+  mode: tau_f
+  # checkpoint_path: tau_refinment_ckpt/gru_h50_final/checkpoints/epoch_481_val_loss_0.001716.pt
+  checkpoint_path: ../../PINN/outputs/tau_f_sequence/gru_h50_qt2tf/checkpoints/epoch_032_val_loss_0.046836.pt
+  device: cuda:0
+  torch_num_threads: 1
+  horizon: 50
+  input_keys: [q, tau]
+  output_key: tau_f
+  # tau_ext_raw 先做因果低通，再逐关节硬门控；最终 tau_ext 同时用于反馈和 H5/wrench_ext。
+  tau_ext_lowpass_hz: 10.0
+  tau_ext_gate_threshold_nm: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+
+# 显示在线对齐的 tau_f_cal、末端 wrench_ext、tau 和 tau_ext。
+realtime_plot:
+  enabled: true
+  window_s: 20.0
+  update_rate_hz: 20.0
+  inverse_dynamics:
+    urdf_path: ../urdf/nero/nero_with_gripper.urdf
+    # urdf_path: ../urdf/nero/nero_with_gripper_identified.urdf
+    delay_s: 0.0
+    locked_joint_names: [gripper, gripper_joint1, gripper_joint2]
+    gravity_m_s2: [0.0, 0.0, -9.81]
+  wrench_mapping:
+    frame_name: gripper_base
+    reference_frame: local
+    damping: 0.02
+
+# cameras:
+#   - name: side
+#     enabled: true
+#     visualize: true
+#     backend: v4l2
+#     serial_number: CC1N16200XL
+#     pixel_format: MJPG
+#     buffer_size: 1
+#     startup_timeout_s: 2.0
+#     frame_timeout_s: 0.5
+#     width: 640
+#     height: 480
+#     fps: 25
+#     exposure: 400
+#     # 保持自动曝光，但禁止相机通过延长曝光主动降低采集帧率。
+#     exposure_dynamic_framerate: false
+#     depth: false
+#     # crop: [0, null, 0, null]
+#     output_size: [256, 192]
+
+#   - name: wrist
+#     enabled: true
+#     # 数采和推理共用独立 GUI 进程显示最新帧；预览慢时丢旧帧，不阻塞控制。
+#     visualize: true
+#     backend: v4l2
+#     serial_number: CC1WC520122
+#     pixel_format: MJPG
+#     buffer_size: 1
+#     startup_timeout_s: 2.0
+#     frame_timeout_s: 0.5
+#     width: 640
+#     height: 480
+#     fps: 25
+#     exposure: 400
+#     # 保持自动曝光，但禁止相机通过延长曝光主动降低采集帧率。
+#     exposure_dynamic_framerate: false
+#     depth: false
+#     # crop: [0, null, 0, null]
+#     output_size: [256, 192]
+
+gripper:
+  enabled: true
+  effector: AGX_GRIPPER
+  attach_to: both
+  teleop_enabled: true
+  scale: 1.0
+  offset_m: 0.0
+  min_width_m: 0.0
+  max_width_m: 0.1
+  force_n: 1.0
+  command_rate_hz: 30.0
+  deadband_m: 0.0005
+  keepalive_s: 0.5
+
+robot_states:
+  q:
+    enabled: true
+    # q 保存原始观测值；不再用滑动均值生成 dq。q 低通仅用于 ddq 的二阶导估计。
+    mean_window: 1
+    lowpass: true
+    lowpass_cutoff_hz: 10.0
+
+  velocity:
+    enabled: true
+    lowpass: true
+    lowpass_cutoff_hz: 6.0
+
+  acceleration:
+    enabled: true
+    lowpass: true
+    lowpass_cutoff_hz: 3.0
+
+
+
+  ee_pose:
+    enabled: true
+    lowpass: false
+
+  torque:
+    enabled: true
+    # 因果一阶 IIR；H5 保存和实时预览使用同一类在线滤波
+    lowpass: true
+    lowpass_cutoff_hz: 10
+    median_window: 1
+
+  tau_id:
+    enabled: true
+    # q/dq/ddq 已在关节组状态估计器内低通；tau_id 不再追加 IIR。
+    lowpass: false
+    lowpass_cutoff_hz: 5
+    median_window: 1
+
+  current:
+    enabled: true
+    lowpass: false
+    lowpass_cutoff_hz: 8
+    median_window: 1
+
+
+
+
+
+
+
+
+
+# q 保存原始值；dq 使用 V120 motor_state velocity，ddq 融合 dq 一阶导和 q 二阶导。
+dynamics_processing:
+  enabled: false
+  state_method: finite_difference
+  # finite_difference 模式下下面三项保留给旧 spline/fourier 配置，不参与当前数采。
+  spline_smoothing_rad2: 1.0e-5
+  fourier_fundamental_hz: 0.1
+  fourier_harmonics: 8
+  torque_lowpass_hz: 12.0
+  torque_median_window: 3
+  min_samples: 3

@@ -1,0 +1,3 @@
+pip<24.1
+setuptools<66
+wheel<0.40

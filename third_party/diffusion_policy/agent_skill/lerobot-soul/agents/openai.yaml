@@ -1,0 +1,4 @@
+interface:
+  display_name: "LeRobot Soul"
+  short_description: "LeRobot architecture-aware debugging copilot"
+  default_prompt: "Use $lerobot-soul to diagnose a bug in this LeRobot workspace and propose an OOP-safe fix."

@@ -1,0 +1,74 @@
+# 30-minute / 100 Hz trajectory for tau refinement. All commanded poses are
+# selected from the referenced human teleoperation episode. Intermediate points
+# are bounded minimum-jerk connections that pass the configured MuJoCo checks.
+collection_config: master_slave_can.yaml
+pair: main
+
+model:
+  urdf_path: ../urdf/nero/nero_with_gripper.urdf
+  locked_joint_names: [gripper, gripper_joint1, gripper_joint2]
+  joint_names: [joint1, joint2, joint3, joint4, joint5, joint6, joint7]
+  gravity_m_s2: [0.0, 0.0, -9.81]
+
+trajectory:
+  planner: tau_refinement
+  sample_rate_hz: 100.0
+  joint_limit_margin_rad: 0.05
+  max_velocity_rad_s: [1.2, 1.0, 1.2, 1.0, 1.2, 0.9, 1.2]
+  max_acceleration_rad_s2: [5.0, 4.0, 5.0, 4.0, 5.0, 4.0, 5.0]
+
+  # 13.5 min low-speed workspace replay, 10.5 min distributed holds,
+  # and 6 min bounded transitions that imitate inference target switches.
+  section_fractions: [0.45, 0.35, 0.20]
+  reference_h5_path: ../runs/tau_refinement/episode_0000_20260806_144955.h5
+  reference_dataset: teleop/q_follower
+  workspace_voxel_counts: [8, 10, 6]
+
+  # Representative human poses are connected by MuJoCo-checked joint-space legs;
+  # the complete 590 s human timeline is intentionally not replayed.
+  replay_pose_count: 128
+  replay_speed_scale: 0.15
+  waypoint_min_delta_rad: 0.05
+
+  static_pose_count: 96
+  static_transition_speed_scale: 0.12
+  static_hold_s: 2.0
+
+  # High-level targets change immediately, while the actual 100 Hz q command
+  # follows a bounded minimum-jerk transition. This avoids unsafe position steps.
+  jump_pose_count: 96
+  jump_min_delta_rad: 0.08
+  jump_max_delta_rad: 0.30
+  jump_transition_speed_scale: 0.85
+  # Minimum hold; remaining section time is distributed as additional holds so
+  # transition durations stay fast instead of being stretched to fill 6 minutes.
+  jump_hold_s: 0.20
+
+  run:
+    name: tau_refinement_low_static_switches
+    seed: 20260806
+    duration_s: 1800.0
+    trajectory_path: ../calibration/data/tau_refinement_low_static_switches.npz
+
+simulation:
+  scene_template_path: ../calibration/mujoco/scene_template.xml
+  end_effector_body: gripper_base
+  floor_z_m: -0.02
+  workspace_min_m: [-0.75, -0.75, 0.02]
+  workspace_max_m: [+0.75, +0.75, 1.10]
+  display_rate_hz: 60.0
+  playback_speed: 100.0
+  collision_sample_stride: 1
+  ignored_contact_pairs:
+    - [link5_collision_0, gripper_flange_collision_0]
+
+hardware:
+  # Keep false until the generated trajectory passes full MuJoCo preflight and
+  # the native viewer has been checked against the real workcell.
+  approved: true
+  preflight_report_path: ../calibration/data/tau_refinement_preflight.json
+  max_tracking_error_rad: [0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2]
+  max_abs_torque_nm: [20.0, 20.0, 12.0, 12.0, 6.0, 6.0, 6.0]
+  max_timestamp_gap_s: 0.10
+  start_move_speed_rad_s: 0.25
+  record_cameras: false

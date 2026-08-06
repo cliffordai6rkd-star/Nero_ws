@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nero-collection"
+version = "0.1.0"
+description = "Nero dual-arm teleoperation data collection."
+requires-python = ">=3.10"
+dependencies = [
+    "av>=15,<16",
+    "cmeel-tinyxml2>=10,<11; platform_system == 'Linux'",
+    "cmeel-urdfdom>=4,<5; platform_system == 'Linux'",
+    "h5py>=3.11",
+    "matplotlib>=3.7",
+    "mujoco>=3.3,<4",
+    "numpy>=2.2,<2.3",
+    "opencv-python>=4.9,<4.13",
+    "osqp>=1,<2",
+    "pin>=3,<4",
+    "PyYAML>=6.0",
+    "rerun-sdk>=0.26,<0.27",
+    "scipy>=1.10,<1.16",
+]
+
+[project.scripts]
+nero-collect = "nero_collection.cli:main"
+nero-free-space = "calibration.free_space_cli:main"
+nero-inference = "inference.cli:main"
+
+[project.optional-dependencies]
+tau-f-inference = [
+    "torch>=2.3,<3",
+]
+gpu-identification = [
+    "jax[cuda12]==0.6.2; platform_system == 'Linux' and python_version < '3.11'",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+include = ["nero_collection*", "calibration*", "inference*"]

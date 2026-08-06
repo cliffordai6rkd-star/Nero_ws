@@ -1,0 +1,48 @@
+name: hirol_pick_N_place_abs_jp
+
+image_shape: &image_shape [3, 480, 640]
+shape_meta: &shape_meta
+  # acceptable types: rgb, low_dim
+  obs:
+    ee_cam_color:
+      shape: *image_shape
+      type: rgb
+    third_person_cam_color:
+      shape: *image_shape
+      type: rgb
+    side_cam_color:
+      shape: *image_shape
+      type: rgb
+    state:
+      shape: [8] # ee posi + unit quaternion; jps + gripper 
+      type: low_dim
+      components:
+        joint_positions: [0, 7]    
+        gripper_width: [7, 8]   
+  action:
+    shape: [8]
+    min: [-2.96, -1.76, -2.96, -3.07, -2.96, -2.09, -2.96, 0.0]  # Franka默认限制
+    max: [2.96, 1.76, 2.96, -0.07, 2.96, 3.75, 2.96, 0.08]
+  
+env_runner:
+  _target_: diffusion_policy.env_runner.hirol_fr3_runner.HirolFr3Runner
+  test_start_seed: 100000
+
+dataset:
+  _target_: diffusion_policy.dataset.hirol_dataset.HirolDataset
+  shape_meta: *shape_meta
+  # @TODO: 
+  dataset_path: ${dataset_path}
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  n_obs_steps: ${dataset_obs_steps}
+  n_latency_steps: ${n_latency_steps}
+  use_cache: true
+  seed: 42
+  val_ratio: 0.02
+  max_train_episodes: null
+  delta_action: false
+
+
+# python ray_train_multirun.py --config-dir=./diffusion_policy/config --config-name=train_hirol_fr3_pick_N_place_unet_abs_jp.yaml --seeds=42,43 --monitor_key=test/mean_score --dataset_path=/home/zyx/dataset/dp/fr3/0915/pick_n_place_1_step_0_skip_abs_jps.zarr multi_run.run_dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}' multi_run.wandb_name_base='${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}

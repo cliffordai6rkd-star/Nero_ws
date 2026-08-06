@@ -1,0 +1,5 @@
+# Older packages in this repository, especially gym==0.21.0, fail to build
+# with newer setuptools releases.
+setuptools<66
+wheel<0.40
+Cython<3

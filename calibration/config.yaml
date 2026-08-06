@@ -1,0 +1,116 @@
+collection_config: ../configs/master_slave_can.yaml
+pair: main
+
+model:
+  urdf_path: ../urdf/nero/nero_with_gripper.urdf
+  # urdf_path: ../urdf/nero/nero_with_grippe.urdf
+  locked_joint_names: [gripper, gripper_joint1, gripper_joint2]
+  # This order is checked against the reduced Pinocchio model before any motion.
+  joint_names: [joint1, joint2, joint3, joint4, joint5, joint6, joint7]
+  gravity_m_s2: [0.0, 0.0, -9.81]
+
+excitation:
+  sample_rate_hz: 100.0
+  duration_s: 10.0
+  fundamental_hz: 0.1
+  harmonics: 5
+  optimization_trials: 500
+  amplitude_rad: [0.35, 0.35, 0.35, 0.35, 0.18, 0.11, 0.18]
+  max_velocity_rad_s: [0.28, 0.25, 0.28, 0.23, 0.32, 0.25, 0.32]
+  max_acceleration_rad_s2: [0.65, 0.58, 0.65, 0.52, 0.75, 0.60, 0.75]
+  joint_limit_margin_rad: 0.10
+  max_tracking_error_rad: [0.06, 0.06, 0.06, 0.06, 0.06, 0.06, 0.06]
+  start_move_speed_rad_s: 0.35
+  profiles:
+    - name: train_a
+      role: train
+      seed: 20260719
+      center_rad: [0.3, -0.3, 0.3, 1.55, 0.3, 0.3, 0.3]
+      repetitions: 2
+      trajectory_path: data/excitation_train.npz
+      dataset_path: data/dynamics_train_a.npz
+    - name: train_b
+      role: train
+      seed: 20260721
+      center_rad: [-0.10, -0.02, -0.10, 1.68, -0.08, 0.12, -0.18]
+      repetitions: 2
+      trajectory_path: data/excitation_train_b.npz
+      dataset_path: data/dynamics_train_b.npz
+    - name: train_c
+      role: train
+      seed: 20260720
+      center_rad: [0.30, -0.28, 0.30, 1.42, 0.30, -0.30, 0.30]
+      repetitions: 2
+      trajectory_path: data/excitation_train_c.npz
+      dataset_path: data/dynamics_train_c.npz
+    - name: train_low
+      role: train
+      seed: 20260718
+      center_rad: [0.0, -0.65, 0.0, 1.10, 0.0, 0.0, 0.0]
+
+    - name: train_mid
+      role: train
+      seed: 20260717
+      center_rad: [0.2, -0.30, 0.2, 1.55, 0.2, 0.1, 0.2]
+
+    - name: train_high
+      role: train
+      seed: 20260716
+      center_rad:  [-0.2, 0.10, -0.2, 1.65, -0.2, -0.1, -0.2]
+
+    - name: validation
+      role: validation
+      seed: 20260722
+      center_rad: [0.00, -0.15, 0.00, 1.55, 0.00, 0.05, 0.00]
+      repetitions: 2
+      trajectory_path: data/excitation_validation.npz
+      dataset_path: data/dynamics_validation.npz
+
+safety:
+  # Set true only after reviewing the generated trajectory in the real workcell.
+  approved: true
+  max_abs_torque_nm: [20.0, 20.0, 12.0, 12.0, 6.0, 6.0, 6.0]
+  max_timestamp_gap_s: 0.10
+
+preprocess:
+  # Both dq and ddq are derived from measured q; V112 motor velocity is never used.
+  state_method: spline
+  spline_smoothing_rad2: 1.0e-5
+  fourier_harmonics: 8
+  torque_lowpass_hz: 12.0
+  torque_median_window: 3
+  outlier_z: 6.0
+  endpoint_trim_s: 0.25
+  validation_fraction: 0.25
+  split_seed: 20260719
+  min_samples: 500
+  coulomb_velocity_scale_rad_s: 0.02
+
+identification:
+  svd_relative_tolerance: 1.0e-8
+  huber_delta: 1.5
+  max_irls_iterations: 30
+  ridge: 1.0e-8
+  physical_prior_weight: 1.0e-3
+  mass_bounds_kg: [0.0001, 10.0]
+  max_abs_com_m: 0.50
+  max_coulomb_nm: [8.0, 8.0, 6.0, 6.0, 4.0, 4.0, 4.0]
+  max_viscous_nm_per_rad_s: [8.0, 8.0, 6.0, 6.0, 4.0, 4.0, 4.0]
+  max_abs_bias_nm: [8.0, 8.0, 6.0, 6.0, 4.0, 4.0, 4.0]
+  max_physical_evaluations: 15000
+  physical_tolerance: 1.0e-7
+  physical_optimizer_backend: jax
+
+simulation:
+  scene_template_path: mujoco/scene_template.xml
+  end_effector_body: gripper_base
+  floor_z_m: -0.02
+  # Visual review boundary in the URDF world frame; replace with the real cleared workcell.
+  workspace_min_m: [-0.8, -0.8, 0.0]
+  workspace_max_m: [0.8, 0.8, 1.2]
+  display_rate_hz: 30.0
+  playback_speed: 1.0
+  collision_sample_stride: 10
+  # Persistent MuJoCo convex-hull overlap: 301/301 samples, -0.028506 m on all profiles.
+  ignored_contact_pairs:
+    - [link5_collision_0, gripper_flange_collision_0]

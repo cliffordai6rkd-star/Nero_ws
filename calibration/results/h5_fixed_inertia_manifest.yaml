@@ -1,0 +1,74 @@
+format_version: 2
+created_at: '2026-07-22T15:13:10.048880+08:00'
+identification_mode: fixed_urdf_inertia_friction_bias_only
+source_urdf: /mnt/code/lcx/nero_ws/urdf/nero/nero_with_gripper.urdf
+identified_urdf: /mnt/code/lcx/nero_ws/urdf/nero/nero_with_gripper.urdf
+config_path: /mnt/code/lcx/nero_ws/calibration/config.yaml
+training_data:
+- /mnt/code/lcx/nero_ws/calibration/data/h5_imported/train_000_episode_0006_20260722_150232.npz
+- /mnt/code/lcx/nero_ws/calibration/data/h5_imported/train_001_episode_0005_20260722_150127.npz
+joint_names:
+- joint1
+- joint2
+- joint3
+- joint4
+- joint5
+- joint6
+- joint7
+locked_joint_names:
+- gripper
+- gripper_joint1
+- gripper_joint2
+friction:
+  coulomb_nm:
+  - 0.37262258305255097
+  - 0.7634840370527027
+  - 0.3453465162185369
+  - 0.8643889082576576
+  - 0.12802209848516577
+  - 0.08762022141425148
+  - 0.15215905939924404
+  viscous_nm_per_rad_s:
+  - 0.23934409282344174
+  - 0.1927402173252351
+  - 0.25660702860123163
+  - 0.11902316951378653
+  - 0.14852530579868714
+  - 0.27061493768655986
+  - 0.07996061654147828
+  coulomb_velocity_scale_rad_s: 0.02
+  velocity_sign_model: tanh(dq / 0.02)
+joint_torque_bias_nm:
+- -0.027409073879651916
+- -0.6819169713391042
+- 0.003056109218935681
+- -0.4800692350395737
+- 0.050215531692879005
+- -0.02596598572304465
+- -0.13796103382118777
+fit:
+  rank: 21
+  condition_number: 2.979683494606725
+  singular_values:
+  - 1.3406772272415528
+  - 1.3402510593957997
+  - 1.335650859454683
+  - 1.3282892062048695
+  - 1.3172200256095528
+  - 1.2990632329708252
+  - 1.2861473963902752
+  - 1.0004891674558003
+  - 1.0000695181781099
+  - 0.9993316539880858
+  - 0.9991089447994257
+  - 0.9984133510439349
+  - 0.9973670831714829
+  - 0.9968666227105392
+  - 0.5933648214075491
+  - 0.5617877688243564
+  - 0.5164423690549618
+  - 0.48442668225775776
+  - 0.4704207510774992
+  - 0.4528392022847977
+  - 0.4499394750040399
+  irls_iterations: 12

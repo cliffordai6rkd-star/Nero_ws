@@ -1,0 +1,135 @@
+defaults:
+  - _self_
+  - task_lerobot_v3@task: hirol_fr3_pnp_cam_ee_joint_to_ee_transformer
+
+name: train_hirol_fr3_pnp_cam_ee_joint_to_ee_transformer
+_target_: diffusion_policy.workspace.train_diffusion_transformer_hybrid_workspace.TrainDiffusionTransformerHybridWorkspace
+
+dataset_path: data/pnp_30_ep/pick_and_place_lerobotv3
+
+task_name: ${task.name}
+shape_meta: ${task.shape_meta}
+exp_name: ${name}
+
+horizon: 
+n_obs_steps: 2
+n_action_steps: 8
+n_latency_steps: 0
+dataset_obs_steps: ${n_obs_steps}
+past_action_visible: False
+keypoint_visible_rate: 1.0
+obs_as_cond: True
+
+policy:
+  _target_: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicy
+
+  shape_meta: ${shape_meta}
+
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddim.DDIMScheduler
+    num_train_timesteps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    clip_sample: True
+    set_alpha_to_one: True
+    steps_offset: 0
+    prediction_type: epsilon
+
+  horizon: ${horizon}
+  n_action_steps: ${eval:'${n_action_steps}+${n_latency_steps}'}
+  n_obs_steps: ${n_obs_steps}
+  num_inference_steps: 8
+
+  crop_shape: [202, 202]
+  obs_encoder_group_norm: True
+  eval_fixed_crop: True
+
+  n_layer: 8
+  n_cond_layers: 0
+  n_head: 4
+  n_emb: 256
+  p_drop_emb: 0.0
+  p_drop_attn: 0.3
+  causal_attn: True
+  time_as_cond: True
+  obs_as_cond: ${obs_as_cond}
+
+ema:
+  _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: 4
+  num_workers: 6
+  shuffle: True
+  pin_memory: True
+  persistent_workers: True
+  prefetch_factor: 2
+
+val_dataloader:
+  batch_size: 4
+  num_workers: 4
+  shuffle: False
+  pin_memory: True
+  persistent_workers: True
+  prefetch_factor: 2
+
+optimizer:
+  transformer_weight_decay: 1.0e-3
+  obs_encoder_weight_decay: 1.0e-6
+  learning_rate: 1.0e-4
+  betas: [0.9, 0.95]
+
+training:
+  device: "cuda:0"
+  seed: 42
+  debug: False
+  resume: True
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  num_epochs: 600
+  gradient_accumulate_every: 4
+  use_ema: True
+  rollout_every: 100
+  checkpoint_every: 25
+  val_every: 5
+  sample_every: 20
+  max_train_steps: 600
+  max_val_steps: 40
+  tqdm_interval_sec: 1.0
+
+logging:
+  project: diffusion_policy_debug
+  resume: True
+  mode: online
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+  tags: ["${name}", "${task_name}", "${exp_name}"]
+  id: null
+  group: null
+
+checkpoint:
+  topk:
+    monitor_key: val_loss
+    mode: min
+    k: 5
+    format_str: 'epoch={epoch:04d}-val_loss={val_loss:.6f}.ckpt'
+  save_last_ckpt: True
+  save_last_snapshot: False
+
+multi_run:
+  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}

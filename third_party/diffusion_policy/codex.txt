@@ -1,0 +1,34 @@
+• 项目目的与思路
+
+  - 目标是用扩散模型学习机器人动作序列策略，图像/状态观测条件生成动作，核心策略与采样逻辑在 diffusion_policy/policy/diffusion_unet_image_policy.py:15，扩散 UNet 在 diffusion_policy/
+    model/diffusion/conditional_unet1d.py:69。
+  - 观测由多路图像与低维状态拼成并编码，shape_meta 定义输入/动作形状，编码器在 diffusion_policy/model/vision/multi_image_obs_encoder.py:11，任务形状定义在 diffusion_policy/config/
+    task/hirol_fr3_abs_jps.yaml:4。
+  - 代码基于“任务/方法拆分”的设计思路：任务侧 Dataset/EnvRunner，方法侧 Policy/Workspace，设计说明在 README.md:263 与 README.md:274。
+  - 训练生命周期由 Workspace 统一管理（日志、checkpoint、评估时机），基础接口在 diffusion_policy/workspace/base_workspace.py:13，图像扩散训练实现于 diffusion_policy/workspace/
+    train_diffusion_unet_image_workspace.py:35。
+  - 评估通过 EnvRunner 统一接口完成，PushT 例子在 diffusion_policy/env_runner/pusht_image_runner.py:20，Hirol runner 当前为空实现 diffusion_policy/env_runner/hirol_fr3_runner.py:30。
+
+  关键流程步骤
+
+  - 数据准备：从原始任务目录读取并组装 episode，再写入 zarr/ReplayBuffer，读取逻辑在 hirol_dataset/reader.py:35，zarr 转换在 hirol_dataset/dp_zarr_dataloader.py:37。
+  - 数据集加载：HirolDataset 读取 zarr 到内存 ReplayBuffer，并构建 SequenceSampler 切片训练序列，见 diffusion_policy/dataset/hirol_dataset.py:59，diffusion_policy/common/
+    replay_buffer.py:84，diffusion_policy/common/sampler.py:78。
+  - 启动训练：train.py:48 用 Hydra 解析配置并实例化 Workspace，训练配置示例在 diffusion_policy/config/train_hirol_fr3_unet_abs_jp.yaml:1。
+  - 训练循环：Workspace 创建 dataloader/normalizer/优化器/EMA 并调用 policy.compute_loss 反向传播，入口在 diffusion_policy/workspace/train_diffusion_unet_image_workspace.py:62，损失实
+    现见 diffusion_policy/policy/diffusion_unet_image_policy.py:192。
+  - 评估与 rollout：eval.py:25 加载 checkpoint 调用 EnvRunner，仿真 runner 示例在 diffusion_policy/env_runner/pusht_image_runner.py:145，Hirol runner 需自行补全 diffusion_policy/
+    env_runner/hirol_fr3_runner.py:30。
+
+  代码结构与重要文件
+
+  - 入口脚本：训练与评估分别在 train.py:48 与 eval.py:25，仿真示例采集在 demo_pusht.py:7，真实机器人采集与评估在 demo_real_robot.py:32 与 eval_real_robot.py:50。
+  - 配置层：方法配置与任务配置分别在 diffusion_policy/config/train_hirol_fr3_unet_abs_jp.yaml:1 和 diffusion_policy/config/task/hirol_fr3_abs_jps.yaml:1，决定 shape_meta 与数据路径。
+  - 训练框架：Workspace 抽象与 checkpoint 管理在 diffusion_policy/workspace/base_workspace.py:13，图像扩散训练实现于 diffusion_policy/workspace/
+    train_diffusion_unet_image_workspace.py:35。
+  - 模型层：图像策略与推理/损失在 diffusion_policy/policy/diffusion_unet_image_policy.py:15，扩散 UNet 在 diffusion_policy/model/diffusion/conditional_unet1d.py:69，观测编码器在
+    diffusion_policy/model/vision/multi_image_obs_encoder.py:11。
+  - 数据层：Hirol 数据集读取在 diffusion_policy/dataset/hirol_dataset.py:59，通用 ReplayBuffer 与 SequenceSampler 在 diffusion_policy/common/replay_buffer.py:84 与 diffusion_policy/
+    common/sampler.py:78。
+  - 执行/环境：EnvRunner 评估接口在 diffusion_policy/env_runner/pusht_image_runner.py:20，PushT 仿真环境在 diffusion_policy/env/pusht/pusht_image_env.py:6，真实机器人环境封装在
+    diffusion_policy/real_world/real_env.py:32。

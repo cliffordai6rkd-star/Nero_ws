@@ -1,0 +1,59 @@
+name: insert_usb_force_aware
+
+image_shape: &image_shape [3, 192, 256]
+shape_meta: &shape_meta
+  obs:
+    wrist:
+      shape: *image_shape
+      type: rgb
+    wrench_ext:
+      shape: [8, 6]
+      type: low_dim
+  action:
+    shape: [7]
+
+# Hardware rollout is intentionally separate from the first training stage.
+env_runner: null
+
+normalizer:
+  mode: limits
+  last_n_dims: 1
+
+dataset:
+  _target_: diffusion_policy.dataset.hirol_lerobot_v3_dataset.HirolLeRobotV3Dataset
+  shape_meta: *shape_meta
+  dataset_path: ${dataset_path}
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: 0
+  n_obs_steps: ${n_obs_steps}
+  n_latency_steps: 0
+  seed: ${training.seed}
+  val_ratio: 0.1
+  max_train_episodes: null
+  window_sampling_strategy: idx
+  image_feature_map:
+    wrist: observation.images.wrist
+  lowdim_feature_groups:
+    wrench_ext:
+      - observation.wrench_ext
+  action_feature_fields:
+    - action.ee_pose
+  action_layout: prechunked
+  timestamp_key: timestamp
+  timestamp_step_sec: 0.1
+  timestamp_tolerance_sec: null
+  local_files_only: true
+  preload_images: false
+  load_result_add: ram
+
+  image_randomer_config:
+    resize: false
+    random_crop: false
+    rotation: false
+    color_jitter: true
+    color_jitter_params:
+      brightness: 0.3
+      contrast: 0.3
+      saturation: 0.1
+      hue: 0.03

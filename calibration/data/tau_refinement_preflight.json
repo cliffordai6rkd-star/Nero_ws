@@ -1,0 +1,50 @@
+{
+  "config_path": "/mnt/code/lcx/nero_ws/configs/tau_refinement_coverage.yaml",
+  "config_sha256": "fbb7a22cee7d47bcda311a0816ad96ac61a347a356c03e1036090ff2c45b44f3",
+  "format": "nero_free_space_preflight/v2",
+  "passed": true,
+  "sample_rate_hz": 100.0,
+  "trajectory": {
+    "contact_events": [],
+    "contact_samples_checked": 180000,
+    "duration_s": 1800.0,
+    "name": "tau_refinement_low_static_switches",
+    "passed": true,
+    "planner": "tau_refinement",
+    "reference_h5_path": "/mnt/code/lcx/nero_ws/runs/tau_refinement/episode_0000_20260806_144955.h5",
+    "reference_h5_sha256": "7ce61c73b13862160c6bde519e5ca61889d2f57c66f31c8fa52a27b92b64b085",
+    "replay_pose_count": 128,
+    "samples": 180000,
+    "scene_path": "/mnt/code/lcx/nero_ws/calibration/data/tau_refinement_low_static_switches.scene.xml",
+    "segment_names": [
+      "empirical_workspace_low_speed",
+      "empirical_workspace_static",
+      "bounded_target_switches"
+    ],
+    "segment_sample_counts": [
+      81000,
+      63000,
+      36000
+    ],
+    "static_pose_count": 96,
+    "target_switch_count": 96,
+    "target_switch_delta_rad": [
+      0.08,
+      0.3
+    ],
+    "trajectory_path": "/mnt/code/lcx/nero_ws/calibration/data/tau_refinement_low_static_switches.npz",
+    "trajectory_sha256": "03bc940cd49d6830d7df091895d4abc7c5982a2f26f67f9a3a6cb6fa1b390c08",
+    "workspace_convex_hull_volume_m3": 0.04234535145932375,
+    "workspace_max_m": [
+      -0.09408901447350573,
+      0.4070045371406713,
+      0.5017595654051659
+    ],
+    "workspace_min_m": [
+      -0.44891223616596493,
+      -0.26962161879950347,
+      0.13544340642912772
+    ],
+    "workspace_violation_count": 0
+  }
+}

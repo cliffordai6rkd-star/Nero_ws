@@ -1,0 +1,168 @@
+<?xml version='1.0' encoding='utf-8'?>
+<mujoco model="Nero Fourier excitation scene">
+  <compiler angle="radian" autolimits="true" />
+  <option gravity="0 0 -9.81" integrator="implicitfast" />
+  <statistic center="0 0 0.4" extent="0.8" />
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0" />
+    <rgba haze="0.15 0.25 0.35 1" />
+    <global azimuth="-140" elevation="-30" />
+  </visual>
+  <asset>
+    <texture type="skybox" builtin="flat" rgb1="0 0 0" rgb2="0 0 0" width="512" height="3072" />
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8" width="300" height="300" />
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2" />
+    <mesh name="base_link" file="/mnt/code/lcx/nero_ws/urdf/nero/meshes/base_link.stl" />
+    <mesh name="link1" file="/mnt/code/lcx/nero_ws/urdf/nero/meshes/link1.stl" />
+    <mesh name="link2" file="/mnt/code/lcx/nero_ws/urdf/nero/meshes/link2.stl" />
+    <mesh name="link3" file="/mnt/code/lcx/nero_ws/urdf/nero/meshes/link3.stl" />
+    <mesh name="link4" file="/mnt/code/lcx/nero_ws/urdf/nero/meshes/link4.stl" />
+    <mesh name="link5" file="/mnt/code/lcx/nero_ws/urdf/nero/meshes/link5.stl" />
+    <mesh name="link6" file="/mnt/code/lcx/nero_ws/urdf/nero/meshes/link6.stl" />
+    <mesh name="link7" file="/mnt/code/lcx/nero_ws/urdf/nero/meshes/link7.stl" />
+    <mesh name="gripper_flange" file="/mnt/code/lcx/nero_ws/urdf/nero/meshes/gripper_flange.stl" />
+    <mesh name="gripper_base" file="/mnt/code/lcx/nero_ws/urdf/nero/meshes/gripper_base.stl" />
+    <mesh name="gripper_link1" file="/mnt/code/lcx/nero_ws/urdf/nero/meshes/gripper_link1.stl" />
+    <mesh name="gripper_link2" file="/mnt/code/lcx/nero_ws/urdf/nero/meshes/gripper_link2.stl" />
+  </asset>
+  <worldbody>
+    <light pos="0 0 1.5" dir="0 0 -1" directional="true" />
+    <geom name="world_floor" size="0 0 0.05" type="plane" material="groundplane" pos="0 0 -0.02" />
+    <body name="base_link">
+      <inertial pos="-0.00319466 -5.46761e-05 0.0432176" quat="0.712681 0.00763931 0.0100067 0.701375" mass="1.06458" diaginertia="0.00114403 0.00102664 0.000908653" />
+      <geom type="mesh" mesh="base_link" name="base_link_collision_0" />
+      <body name="link1" pos="0 0 0.138">
+        <inertial pos="-0.000768106 -5.71803e-05 -0.00686373" quat="0.998496 0.0243284 -0.0474034 0.0129308" mass="0.767105" diaginertia="0.000668361 0.000545022 0.000513619" />
+        <joint name="joint1" pos="0 0 0" axis="0 0 1" range="-2.70526 2.70526" actuatorfrcrange="-100 100" />
+        <geom type="mesh" mesh="link1" name="link1_collision_0" />
+        <body name="link2" quat="1.89469e-08 1.89469e-08 0.707107 -0.707107">
+          <inertial pos="0.000796867 -0.0789033 0.00111849" quat="0.724173 0.689546 -0.00281155 -0.00963045" mass="0.693819" diaginertia="0.00201137 0.00182229 0.000632162" />
+          <joint name="joint2" pos="0 0 0" axis="0 0 1" range="-1.74 1.74" actuatorfrcrange="-100 100" />
+          <geom type="mesh" mesh="link2" name="link2_collision_0" />
+          <body name="link3" pos="0 -0.31 0" quat="-1.37922e-08 1.37922e-08 -0.707107 0.707107">
+            <inertial pos="0.000145134 -0.00121379 -0.0486114" quat="0.999978 -0.00572699 -0.000503892 -0.00336231" mass="0.672465" diaginertia="0.0034323 0.00338703 0.000288126" />
+            <joint name="joint3" pos="0 0 0" axis="0 0 1" range="-2.75 2.75" actuatorfrcrange="-100 100" />
+            <geom type="mesh" mesh="link3" name="link3_collision_0" />
+            <body name="link4" quat="-1.37922e-08 1.37922e-08 -0.707107 0.707107">
+              <inertial pos="-0.000313346 -0.0567519 0.000760561" quat="0.743967 0.668141 -0.00555621 -0.00837616" mass="0.484514" diaginertia="0.000503972 0.000403451 0.00023296" />
+              <joint name="joint4" pos="0 0 0" axis="0 0 1" range="-1.01 2.14" actuatorfrcrange="-100 100" />
+              <geom type="mesh" mesh="link4" name="link4_collision_0" />
+              <body name="link5" pos="0 -0.27001 0" quat="0.5 0.5 -0.5 0.5">
+                <inertial pos="0.00265591 0.00201196 -0.116209" quat="0.994383 -0.0299767 0.0135244 0.100607" mass="0.583684" diaginertia="0.000897188 0.000859677 0.000214923" />
+                <joint name="joint5" pos="0 0 0" axis="0 0 1" range="-2.75 2.75" actuatorfrcrange="-100 100" />
+                <geom type="mesh" mesh="link5" name="link5_collision_0" />
+                <body name="link6" quat="0.5 0.5 -0.5 0.5">
+                  <inertial pos="9.50151e-05 0.00107831 -0.00019111" quat="0.708463 0.705104 -0.0268147 0.0137484" mass="0.314041" diaginertia="6.02857e-05 5.75589e-05 4.69904e-05" />
+                  <joint name="joint6" pos="0 0 0" axis="0 0 1" range="-0.73 0.95" actuatorfrcrange="-100 100" />
+                  <geom type="mesh" mesh="link6" name="link6_collision_0" />
+                  <body name="link7" pos="0 -0.0235 0" quat="0.707107 0.707107 0 0">
+                    <inertial pos="-0.00014 -0.0001 -0.00275" quat="0.5 0.5 -0.5 0.5" mass="1e-06" diaginertia="2e-07 1.1e-07 1.1e-07" />
+                    <joint name="joint7" pos="0 0 0" axis="0 0 1" range="-1.5708 1.5708" actuatorfrcrange="-100 100" />
+                    <geom type="mesh" mesh="link7" name="link7_collision_0" />
+                    <body name="gripper_flange" pos="0.031 0 -0.0235" quat="0.499998 -0.5 0.500002 -0.5">
+                      <inertial pos="0.000253201 -0.000322696 -0.0100829" quat="0.707107 0.707107 0 0" mass="0.047711" diaginertia="3.61411e-05 2.69594e-05 1.78242e-05" />
+                      <geom type="mesh" mesh="gripper_flange" name="gripper_flange_collision_0" />
+                      <body name="gripper_base" pos="0 0 0.006">
+                        <inertial pos="-0.000183807 8.05033e-05 0.0321437" quat="0.999976 9.08444e-05 0.00689649 0.000788512" mass="0.45" diaginertia="0.000929442 0.000714469 0.000394318" />
+                        <geom type="mesh" mesh="gripper_base" name="gripper_base_collision_0" />
+                        <body name="gripper_link" />
+                        <body name="gripper_link1" pos="0 0 0.138" quat="1.89469e-08 1.89469e-08 0.707107 0.707107">
+                          <inertial pos="0.000651232 -0.049193 0.00972259" quat="0.477798 0.572974 -0.518028 0.418398" mass="0.025" diaginertia="7.74531e-05 7.36783e-05 5.0886e-06" />
+                          <geom type="mesh" mesh="gripper_link1" name="gripper_link1_collision_0" />
+                        </body>
+                        <body name="gripper_link2" pos="0 0 0.138" quat="0.707107 0.707107 0 0">
+                          <inertial pos="0.000651232 -0.049193 0.00972259" quat="0.477798 0.572974 -0.518028 0.418398" mass="0.025" diaginertia="7.74531e-05 7.36783e-05 5.0886e-06" />
+                          <geom type="mesh" mesh="gripper_link2" name="gripper_link2_collision_0" />
+                        </body>
+                      </body>
+                    </body>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+    <geom name="world_ee_path_0" type="sphere" pos="-0.174722129135 0.0190584897069 0.576393045775" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_1" type="sphere" pos="-0.190670207103 -0.00182384981019 0.568198324315" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_2" type="sphere" pos="-0.225853814718 -0.0632569115746 0.549754542666" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_3" type="sphere" pos="-0.235844634586 -0.0805668053423 0.554861330839" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_4" type="sphere" pos="-0.230379459993 -0.0565144723587 0.572663862279" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_5" type="sphere" pos="-0.220102403759 -0.0273930529614 0.588070243186" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_6" type="sphere" pos="-0.205662375131 0.00322185219246 0.599235801583" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_7" type="sphere" pos="-0.188538299428 0.0322579094751 0.605132955846" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_8" type="sphere" pos="-0.170472263296 0.0569742087581 0.605527161219" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_9" type="sphere" pos="-0.153170673674 0.0748649340902 0.601017574975" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_10" type="sphere" pos="-0.138172354636 0.0839591516882 0.592998096908" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_11" type="sphere" pos="-0.126608928203 0.0833719899022 0.583244218307" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_12" type="sphere" pos="-0.118941230212 0.0737271401282 0.573235207337" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_13" type="sphere" pos="-0.114904054779 0.0573132293242 0.563858432103" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_14" type="sphere" pos="-0.113734887669 0.0377425062059 0.555984875765" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_15" type="sphere" pos="-0.11457226202 0.0187662924272 0.551236605548" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_16" type="sphere" pos="-0.116779342542 0.00291083142205 0.551618302238" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_17" type="sphere" pos="-0.119997956484 -0.0086901079613 0.558151411389" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_18" type="sphere" pos="-0.124064707949 -0.0153880313002 0.570003415616" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_19" type="sphere" pos="-0.129107534143 -0.0164747814123 0.584721695792" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_20" type="sphere" pos="-0.135769393895 -0.0115578666012 0.599114171162" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_21" type="sphere" pos="-0.14509682815 -0.00118470630779 0.610239773705" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_22" type="sphere" pos="-0.15794508954 0.0130314636165 0.61603731378" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_23" type="sphere" pos="-0.174323994296 0.0288930147126 0.615377842245" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_24" type="sphere" pos="-0.193118537978 0.044343453343 0.607822527365" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_25" type="sphere" pos="-0.212285858776 0.0579842326683 0.593576587057" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_26" type="sphere" pos="-0.229428389043 0.0690563643294 0.573825348163" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_27" type="sphere" pos="-0.242556686852 0.0769594606908 0.551045759757" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_28" type="sphere" pos="-0.25069007778 0.080832250707 0.528713636267" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_29" type="sphere" pos="-0.253862503321 0.079608081881 0.510419668547" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_30" type="sphere" pos="-0.252516140364 0.0724698947813 0.49892468261" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_31" type="sphere" pos="-0.246825520726 0.0594500754356 0.495600113608" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_32" type="sphere" pos="-0.236497483501 0.0418091298566 0.500452815198" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_33" type="sphere" pos="-0.221028671832 0.0217281357556 0.51255408703" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_34" type="sphere" pos="-0.19996764299 0.00147739508204 0.530377842035" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_35" type="sphere" pos="-0.173082130356 -0.0170886165223 0.55189394949" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_36" type="sphere" pos="-0.140868369682 -0.0323515485171 0.574684653693" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_37" type="sphere" pos="-0.105684767126 -0.0426989073238 0.596238707949" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_38" type="sphere" pos="-0.104621863134 -0.035545986755 0.60618103178" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_39" type="sphere" pos="-0.156429007096 0.00176692520101 0.588059894991" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_40" type="sphere" pos="-0.174722129135 0.0190584897069 0.576393045775" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_41" type="sphere" pos="-0.152161975873 0.0190585079594 0.576393070128" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_42" type="sphere" pos="-0.173435563826 0.0190584204029 0.576392931834" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_43" type="sphere" pos="-0.193842703805 0.0190583551259 0.576392793458" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_44" type="sphere" pos="-0.181803016212 0.0190586222507 0.576393217565" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_45" type="sphere" pos="-0.174721819843 0.0303686946722 0.5763928978" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_46" type="sphere" pos="-0.174722193512 0.0346110040145 0.576393140004" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_47" type="sphere" pos="-0.174722173839 0.0153398733406 0.576393080163" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_48" type="sphere" pos="-0.174722058945 -0.00235302729288 0.576393032413" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_49" type="sphere" pos="-0.174722104278 0.0190584813919 0.576542002044" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_50" type="sphere" pos="-0.174722117803 0.0190584856386 0.595886315063" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_51" type="sphere" pos="-0.174722157514 0.019058499341 0.576570237974" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_52" type="sphere" pos="-0.174722191609 0.0190585095883 0.558040888507" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_53" type="sphere" pos="-0.174721947893 0.0190584320611 0.57320458837" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_54" type="sphere" pos="-0.174722136533 0.0190583257576 0.576393049326" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_55" type="sphere" pos="-0.174722130711 0.0190586664572 0.576393002648" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_56" type="sphere" pos="-0.174722125401 0.0190586510705 0.576393016176" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_57" type="sphere" pos="-0.174722140662 0.0190583655949 0.576393039924" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_58" type="sphere" pos="-0.174722078858 0.0190584889684 0.576393218738" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_59" type="sphere" pos="-0.174722143454 0.0190584902656 0.576392995168" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_60" type="sphere" pos="-0.174722130893 0.0190584897344 0.576393039308" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_61" type="sphere" pos="-0.174722145648 0.0190584895947 0.576392979839" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_62" type="sphere" pos="-0.17472207386 0.0190584888947 0.576393236004" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_63" type="sphere" pos="-0.174722012199 0.0190580552223 0.576392976317" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_64" type="sphere" pos="-0.174722235523 0.0190590460602 0.576393123249" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_65" type="sphere" pos="-0.174722220092 0.0190590831657 0.576393102097" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_66" type="sphere" pos="-0.17472201017 0.019057942175 0.576393005686" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_67" type="sphere" pos="-0.174722129135 0.0190584897069 0.576393045775" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_68" type="sphere" pos="-0.174722129135 0.0190584897069 0.576393045775" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_69" type="sphere" pos="-0.174722129135 0.0190584897069 0.576393045775" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_70" type="sphere" pos="-0.174722129135 0.0190584897069 0.576393045775" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_71" type="sphere" pos="-0.174722129135 0.0190584897069 0.576393045775" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_72" type="sphere" pos="-0.174722129135 0.0190584897069 0.576393045775" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_73" type="sphere" pos="-0.179925088604 0.0120597358082 0.574652376842" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_74" type="sphere" pos="-0.179353251363 0.0130701538249 0.575856734371" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_75" type="sphere" pos="-0.178159474492 0.0150999778751 0.577017544037" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_76" type="sphere" pos="-0.176648586364 0.0175549714103 0.577895546776" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_77" type="sphere" pos="-0.174981511057 0.0200189533005 0.578386277354" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_78" type="sphere" pos="-0.173339473995 0.0220915861338 0.578463060081" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+    <geom name="world_ee_path_79" type="sphere" pos="-0.172006473313 0.0233005874328 0.578106132306" size="0.006" rgba="1 0.58 0.05 0.9" contype="0" conaffinity="0" group="4" />
+  </worldbody>
+</mujoco>

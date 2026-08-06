@@ -1,0 +1,21 @@
+h5py>=3.11
+matplotlib>=3.7
+mujoco<4,>=3.3
+numpy<2.3,>=2.2
+opencv-python-headless<4.13,>=4.9
+osqp<2,>=1
+pin<4,>=3
+PyYAML>=6.0
+scipy<1.16,>=1.10
+
+[:platform_system == "Linux"]
+cmeel-tinyxml2<11,>=10
+cmeel-urdfdom<5,>=4
+
+[gpu-identification]
+
+[gpu-identification:platform_system == "Linux" and python_version < "3.11"]
+jax[cuda12]==0.6.2
+
+[tau-f-inference]
+torch<3,>=2.3

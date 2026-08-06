@@ -1,0 +1,43 @@
+name: hirol_fr3_jps_ee_state2euler
+
+image_shape: &image_shape [3, 128, 128]
+shape_meta: &shape_meta
+  # acceptable types: rgb, low_dim
+  obs:
+    ee_cam_color:
+      shape: *image_shape
+      type: rgb
+    third_person_cam_color:
+      shape: *image_shape
+      type: rgb
+    side_cam_color:
+      shape: *image_shape
+      type: rgb
+    state:
+      shape: [8] # jps/ee(quat) + gripper 
+      type: low_dim
+      components:
+        joint_positions: [0, 7]    
+        gripper_width: [7, 8]   
+  action:
+    shape: [7] # xyz euler gripper
+    # min: [-2.96, -1.76, -2.96, -3.07, -2.96, -2.09, -2.96, 0.0]  # Franka默认限制
+    # max: [2.96, 1.76, 2.96, -0.07, 2.96, 3.75, 2.96, 0.08]
+  
+env_runner:
+  _target_: diffusion_policy.env_runner.hirol_fr3_runner.HirolFr3Runner
+  test_start_seed: 100000
+
+dataset:
+  _target_: diffusion_policy.dataset.hirol_dataset.HirolDataset
+  shape_meta: *shape_meta
+  # dataset_path will be provided via command line argument
+  dataset_path: ${dataset_path}
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  n_obs_steps: ${dataset_obs_steps}
+  n_latency_steps: ${n_latency_steps}
+  seed: 42
+  val_ratio: 0.02
+  max_train_episodes: null

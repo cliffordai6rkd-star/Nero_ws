@@ -1,0 +1,42 @@
+name: hirol_peg_in_hole_abs_jp
+
+image_shape: &image_shape [3, 480, 640]
+shape_meta: &shape_meta
+  # acceptable types: rgb, low_dim
+  obs:
+    ee_cam_color:
+      shape: *image_shape
+      type: rgb
+    third_person_cam_color:
+      shape: *image_shape
+      type: rgb
+    state:
+      shape: [15] # ee posi + unit quaternion; jps + gripper 
+      type: low_dim
+      components:
+        ee_position: [0, 3]        # 索引0-2
+        ee_quaternion: [3, 7]     # 索引3-6
+        joint_positions: [7, 14]    # 索引7-13
+        gripper_width: [14, 15]     # 索引14
+  action:
+    shape: [8]
+    min: [-2.96, -1.76, -2.96, -3.07, -2.96, -2.09, -2.96, 0.0]  # Franka默认限制
+    max: [2.96, 1.76, 2.96, -0.07, 2.96, 3.75, 2.96, 0.08]
+  
+env_runner:
+  _target_: diffusion_policy.env_runner.base_image_runner.BaseImageRunner
+
+dataset:
+  _target_: diffusion_policy.dataset.hirol_dataset.HirolDataset
+  shape_meta: *shape_meta
+  dataset_path: /home/yuxuan/Code/hirol/converted_dataset/dp/peg_in_hole.zarr
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  n_obs_steps: ${dataset_obs_steps}
+  n_latency_steps: ${n_latency_steps}
+  use_cache: true
+  seed: 42
+  val_ratio: 0.02
+  max_train_episodes: null
+  delta_action: false

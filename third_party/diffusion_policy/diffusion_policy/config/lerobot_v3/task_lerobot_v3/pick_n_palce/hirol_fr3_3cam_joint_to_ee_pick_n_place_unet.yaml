@@ -1,0 +1,60 @@
+name: hirol_fr3_3cam_joint_pick_n_place_lerobot_v3
+
+image_shape: &image_shape [3, 192, 192]
+shape_meta: &shape_meta
+  obs:
+    ee_cam_color:
+      shape: *image_shape
+      type: rgb
+    third_person_cam_color:
+      shape: *image_shape
+      type: rgb
+    side_cam_color:
+      shape: *image_shape
+      type: rgb
+    state_ee:
+      shape: [15]
+      type: low_dim
+      components:
+        ee_position: [0, 3]
+        ee_quaternion: [3, 7]
+        joint_positions: [7, 14]
+        gripper_width: [14, 15]
+  action:
+    shape: [8]
+    components:
+      ee_position: [0, 3]
+      ee_quaternion: [3, 7]
+      gripper_width: [7, 8]
+
+env_runner:
+  _target_: diffusion_policy.env_runner.hirol_fr3_runner.HirolFr3Runner
+  test_start_seed: 100000
+
+dataset:
+  _target_: diffusion_policy.dataset.hirol_lerobot_v3_dataset.HirolLeRobotV3Dataset
+  shape_meta: *shape_meta
+  dataset_path: ${dataset_path}
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  n_obs_steps: ${dataset_obs_steps}
+  n_latency_steps: ${n_latency_steps}
+  seed: 42
+  val_ratio: 0.05
+  max_train_episodes: null
+  window_sampling_strategy: idx
+  image_feature_map:
+    ee_cam_color: observation.images.ee_cam_color
+    third_person_cam_color: observation.images.third_person_cam_color
+    side_cam_color: observation.images.side_cam_color
+  lowdim_feature_groups:
+    state_ee:
+      - observation.state
+  action_feature_fields:
+    - action.ee_pose
+    - action.gripper_width
+  timestamp_key: timestamp
+  timestamp_step_sec: null
+  timestamp_tolerance_sec: null
+  local_files_only: true

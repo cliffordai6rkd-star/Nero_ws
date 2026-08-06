@@ -1,0 +1,15 @@
+-r uv-common.txt
+--index-url https://download.pytorch.org/whl/cu116
+--extra-index-url https://pypi.org/simple
+
+torch==1.12.1+cu116
+torchvision==0.13.1+cu116
+ray[default,tune]==2.2.0
+free-mujoco-py==2.1.6
+pygame==2.1.2
+pybullet-svl==3.1.6.4
+robomimic==0.2.0
+pytorchvideo==0.1.5
+r3m @ https://github.com/facebookresearch/r3m/archive/b2334e726887fa0206962d7984c69c5fb09cceab.tar.gz
+mujoco<3
+dm-control==1.0.9

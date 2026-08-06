@@ -1,0 +1,173 @@
+# LeRobot Architecture Snapshot
+
+Generated: 2026-03-13T17:12:09
+Repo root: /home/hph/Code/lerobot
+
+## Project
+- name: lerobot
+- version: 0.4.5
+- requires-python: >=3.12
+
+## Console scripts
+- lerobot-calibrate
+- lerobot-dataset-viz
+- lerobot-edit-dataset
+- lerobot-eval
+- lerobot-find-cameras
+- lerobot-find-joint-limits
+- lerobot-find-port
+- lerobot-imgtransform-viz
+- lerobot-info
+- lerobot-record
+- lerobot-replay
+- lerobot-setup-can
+- lerobot-setup-motors
+- lerobot-teleoperate
+- lerobot-train
+- lerobot-train-tokenizer
+
+## Source map
+- top-level packages under src/lerobot:
+  - async_inference
+  - calibration
+  - cameras
+  - configs
+  - data_processing
+  - datasets
+  - envs
+  - model
+  - motors
+  - optim
+  - policies
+  - processor
+  - rl
+  - robots
+  - scripts
+  - teleoperators
+  - templates
+  - transport
+  - utils
+- robots:
+  - bi_openarm_follower
+  - bi_so_follower
+  - earthrover_mini_plus
+  - franka_research3
+  - hope_jr
+  - koch_follower
+  - lekiwi
+  - omx_follower
+  - openarm_follower
+  - reachy2
+  - so_follower
+  - unitree_g1
+- teleoperators:
+  - bi_openarm_leader
+  - bi_so_leader
+  - gamepad
+  - homunculus
+  - keyboard
+  - koch_leader
+  - omx_leader
+  - openarm_leader
+  - openarm_mini
+  - phone
+  - reachy2_teleoperator
+  - so_leader
+  - spacemouse
+  - unitree_g1
+- cameras:
+  - opencv
+  - reachy2_camera
+  - realsense
+  - zmq
+- policies:
+  - act
+  - diffusion
+  - groot
+  - pi0
+  - pi05
+  - pi0_fast
+  - rtc
+  - sac
+  - sarm
+  - smolvla
+  - tdmpc
+  - vqbet
+  - wall_x
+  - xvla
+- env modules:
+  - configs
+  - factory
+  - fr3_mujoco
+  - fr3_mujoco_teleop
+  - libero
+  - metaworld
+  - utils
+
+## Tests
+- artifacts
+- async_inference
+- cameras
+- configs
+- datasets
+- envs
+- fixtures
+- mocks
+- motors
+- optim
+- policies
+- processor
+- rl
+- robots
+- scripts
+- teleoperators
+- training
+- transport
+- utils
+
+## Examples
+- backward_compatibility/replay.py
+- dataset/load_lerobot_dataset.py
+- dataset/slurm_compute_rabc.py
+- dataset/use_dataset_image_transforms.py
+- dataset/use_dataset_tools.py
+- lekiwi/evaluate.py
+- lekiwi/record.py
+- lekiwi/replay.py
+- lekiwi/teleoperate.py
+- phone_to_so100/evaluate.py
+- phone_to_so100/record.py
+- phone_to_so100/replay.py
+- phone_to_so100/teleoperate.py
+- port_datasets/display_error_files.py
+- port_datasets/port_droid.py
+- port_datasets/slurm_aggregate_shards.py
+- port_datasets/slurm_port_shards.py
+- port_datasets/slurm_upload.py
+- rtc/eval_dataset.py
+- rtc/eval_with_real_robot.py
+- so100_to_so100_EE/evaluate.py
+- so100_to_so100_EE/record.py
+- so100_to_so100_EE/replay.py
+- so100_to_so100_EE/teleoperate.py
+- training/train_policy.py
+- training/train_with_streaming.py
+- tutorial/act/act_training_example.py
+- tutorial/act/act_using_example.py
+- tutorial/async-inf/policy_server.py
+- tutorial/async-inf/robot_client.py
+- tutorial/diffusion/diffusion_training_example.py
+- tutorial/diffusion/diffusion_using_example.py
+- tutorial/pi0/using_pi0_example.py
+- tutorial/rl/hilserl_example.py
+- tutorial/rl/reward_classifier_example.py
+- tutorial/smolvla/using_smolvla_example.py
+
+## Key docs
+- installation.mdx
+- integrate_hardware.mdx
+- debug_processor_pipeline.mdx
+- processors_robots_teleop.mdx
+- bring_your_own_policies.mdx
+- lerobot-dataset-v3.mdx
+- async.mdx
