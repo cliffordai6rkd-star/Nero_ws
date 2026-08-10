@@ -9,7 +9,7 @@ from nero_collection.contact_wrench import (
     PinocchioContactWrenchEstimator,
     PinocchioJointTorqueResidualEstimator,
 )
-from nero_collection.tau_f_inference import TauFSequencePredictor, ZeroTauFPredictor
+from nero_collection.tau_ext_inference import SequenceTorquePredictor
 
 
 class WorldModelWrenchAdapter:
@@ -18,8 +18,6 @@ class WorldModelWrenchAdapter:
     _TAU_F_TO_STATE = {
         "q": "q",
         "dq": "v",
-        "ddq": "a",
-        "tau": "tau",
     }
 
     def __init__(
@@ -30,10 +28,11 @@ class WorldModelWrenchAdapter:
         inverse_dynamics=None,
         wrench_mapper=None,
     ) -> None:
-        self.tau_f_predictor = tau_f_predictor or (
-            TauFSequencePredictor(collection.tau_f_inference)
-            if collection.tau_f_inference.enabled
-            else ZeroTauFPredictor()
+        if tau_f_predictor is None and not collection.tau_ext_inference.enabled:
+            raise ValueError("world-model wrench mapping requires tau_ext inference")
+        self.tau_f_predictor = tau_f_predictor or SequenceTorquePredictor(
+            collection.tau_ext_inference.tau_f,
+            name="tau_f",
         )
         self.inverse_dynamics = (
             inverse_dynamics
@@ -77,6 +76,15 @@ class WorldModelWrenchAdapter:
             )
         tau_f_inputs = {}
         for tau_f_key in self.tau_f_predictor.metadata.input_keys:
+            if tau_f_key == "delta_q":
+                # World-model trajectories contain realized state, not a separate
+                # controller command. Evaluate the tracked-command case delta_q=0.
+                measured = np.zeros_like(history_values["q"][-tau_f_horizon:])
+                predicted = np.zeros_like(future_values["q"])
+                tau_f_inputs[tau_f_key] = np.concatenate(
+                    (measured, predicted), axis=0
+                )
+                continue
             state_key = self._TAU_F_TO_STATE[tau_f_key]
             measured = history_values[state_key][-tau_f_horizon:]
             tau_f_inputs[tau_f_key] = np.concatenate(
@@ -94,7 +102,11 @@ class WorldModelWrenchAdapter:
                 future_values["a"][step],
                 future_values["tau"][step],
             )
-            tau_external = residual.tau_residual - tau_f[step]
+            tau_external = (
+                future_values["tau"][step]
+                - np.asarray(residual.tau_id, dtype=np.float64)
+                - tau_f[step]
+            )
             mapping = self.wrench_mapper.map_joint_torque(
                 future_values["q"][step],
                 tau_external,

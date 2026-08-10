@@ -105,8 +105,7 @@ class BilateralJointController:
 
         cfg = self.config
         scale = _vector(cfg.position_scale)
-        follower_target = self._follower_q0 + scale * (leader.q - self._leader_q0)
-        follower_target = np.clip(follower_target, self.position_lower, self.position_upper)
+        follower_target = self.follower_target(leader, follower)
 
         gravity_leader = self.dynamics.gravity_torque(leader.q) * _vector(
             cfg.leader_gravity_scale
@@ -183,6 +182,16 @@ class BilateralJointController:
             tau_ext_follower=tau_ext,
             tau_feedback_leader=feedback,
         )
+
+    def follower_target(self, leader: ArmState, follower: ArmState) -> np.ndarray:
+        """Return the side-effect-free follower target used by ``compute``."""
+        _validate_state("leader", leader)
+        _validate_state("follower", follower)
+        if self._leader_q0 is None or self._follower_q0 is None:
+            raise RuntimeError("Bilateral controller must be activated before compute")
+        scale = _vector(self.config.position_scale)
+        target = self._follower_q0 + scale * (leader.q - self._leader_q0)
+        return np.clip(target, self.position_lower, self.position_upper)
 
     def hold(self, leader: ArmState, follower: ArmState) -> BilateralControlResult:
         _validate_state("leader", leader)

@@ -42,7 +42,7 @@ class DynamicsProcessingConfig:
 @dataclass(frozen=True)
 class ContactWrenchConfig:
     urdf_path: Path = Path("urdf/nero/nero_with_gripper.urdf")
-    frame_name: str = "gripper_base"
+    frame_name: str = "gripper_tcp"
     delay_s: float = 0.5
     damping: float = 0.02
     reference_frame: str = "local"
@@ -77,17 +77,40 @@ class RealtimePlotConfig:
 
 
 @dataclass(frozen=True)
-class TauFInferenceConfig:
-    enabled: bool = False
-    mode: str = "tau_f"
+class SequenceCheckpointConfig:
     checkpoint_path: Path | None = None
     device: str = "cpu"
-    torch_num_threads: int = 1
     horizon: int | None = None
     input_keys: tuple[str, ...] | None = None
     output_key: str | None = None
-    tau_ext_lowpass_hz: float | None = None
-    tau_ext_gate_threshold_nm: tuple[float, ...] = (0.0,) * 7
+
+
+@dataclass(frozen=True)
+class CausalKalmanConfig:
+    position_std: tuple[float, ...] = (5.0e-4,) * 7
+    velocity_std: tuple[float, ...] = (3.0e-2,) * 7
+    jerk_std: tuple[float, ...] = (2.0,) * 7
+    initial_position_std: tuple[float, ...] = (1.0e-2,) * 7
+    initial_velocity_std: tuple[float, ...] = (2.0e-1,) * 7
+    initial_acceleration_std: tuple[float, ...] = (5.0,) * 7
+    max_gap_s: float = 0.1
+
+
+@dataclass(frozen=True)
+class TauExtFilterConfig:
+    enabled: bool = True
+    mode: str = "moving_average"
+    window: int = 21
+    cutoff_hz: float = 20.0
+
+
+@dataclass(frozen=True)
+class TauExtInferenceConfig:
+    enabled: bool = False
+    tau_f: SequenceCheckpointConfig = field(default_factory=SequenceCheckpointConfig)
+    tau_next: SequenceCheckpointConfig = field(default_factory=SequenceCheckpointConfig)
+    state_estimator: CausalKalmanConfig = field(default_factory=CausalKalmanConfig)
+    tau_ext_filter: TauExtFilterConfig = field(default_factory=TauExtFilterConfig)
 
 
 @dataclass(frozen=True)
@@ -212,7 +235,7 @@ class CollectionConfig:
     cameras: tuple[CameraConfig, ...] = ()
     gripper: GripperConfig = field(default_factory=GripperConfig)
     realtime_plot: RealtimePlotConfig = field(default_factory=RealtimePlotConfig)
-    tau_f_inference: TauFInferenceConfig = field(default_factory=TauFInferenceConfig)
+    tau_ext_inference: TauExtInferenceConfig = field(default_factory=TauExtInferenceConfig)
     dynamics_processing: DynamicsProcessingConfig = field(default_factory=DynamicsProcessingConfig)
     robot_states: dict[str, StateParamConfig] = field(default_factory=dict)
     raw_yaml: str = ""
@@ -230,6 +253,7 @@ DEFAULT_STATE_PARAMS = {
     "ee_pose": StateParamConfig(enabled=True, lowpass=False),
     "torque": StateParamConfig(enabled=True, lowpass=False),
     "tau_id": StateParamConfig(enabled=True, lowpass=False),
+    "tau_id_filtered": StateParamConfig(enabled=True, lowpass=False),
     "current": StateParamConfig(enabled=False, lowpass=False),
 }
 
@@ -255,10 +279,19 @@ def load_config(path: str | Path) -> CollectionConfig:
     cameras = tuple(_parse_camera(item) for item in data.get("cameras", []) if item.get("enabled", True))
     gripper = _parse_gripper(data.get("gripper", {}))
     realtime_plot = _parse_realtime_plot(data.get("realtime_plot", {}), config_path.parent)
-    tau_f_inference = _parse_tau_f_inference(
-        data.get("tau_f_inference", {}),
+    tau_ext_inference = _parse_tau_ext_inference(
+        data.get("tau_ext_inference", {}),
         config_path.parent,
     )
+    if "tau_f_inference" in data:
+        raise ValueError(
+            "tau_f_inference was removed; configure the two-model "
+            "tau_ext_inference block instead."
+        )
+    if realtime_plot.enabled and not tau_ext_inference.enabled:
+        raise ValueError(
+            "realtime_plot.enabled=true requires tau_ext_inference.enabled=true"
+        )
     dynamics_processing = _parse_dynamics_processing(data.get("dynamics_processing", {}))
     robot_states = _parse_state_params(data.get("robot_states", {}))
     return CollectionConfig(
@@ -267,7 +300,7 @@ def load_config(path: str | Path) -> CollectionConfig:
         cameras=cameras,
         gripper=gripper,
         realtime_plot=realtime_plot,
-        tau_f_inference=tau_f_inference,
+        tau_ext_inference=tau_ext_inference,
         dynamics_processing=dynamics_processing,
         robot_states=robot_states,
         raw_yaml=raw_yaml,
@@ -710,7 +743,7 @@ def _parse_realtime_plot(
         wrench_data = {}
     if not isinstance(wrench_data, dict):
         raise ValueError("realtime_plot.wrench_mapping must be a mapping")
-    frame_name = str(wrench_data.get("frame_name", "gripper_base"))
+    frame_name = str(wrench_data.get("frame_name", "gripper_tcp"))
     if not frame_name:
         raise ValueError("realtime_plot.wrench_mapping.frame_name must not be empty")
     damping = float(wrench_data.get("damping", 0.02))
@@ -745,21 +778,116 @@ def _parse_realtime_plot(
     )
 
 
-def _parse_tau_f_inference(
+def _parse_tau_ext_inference(
     data: dict[str, Any],
     config_dir: Path | None = None,
-) -> TauFInferenceConfig:
+) -> TauExtInferenceConfig:
     if data is None:
         data = {}
     if not isinstance(data, dict):
-        raise ValueError("tau_f_inference must be a mapping")
+        raise ValueError("tau_ext_inference must be a mapping")
+    unknown = set(data) - {
+        "enabled",
+        "tau_f",
+        "tau_next",
+        "state_estimator",
+        "tau_ext_filter",
+    }
+    if unknown:
+        raise ValueError(
+            f"tau_ext_inference contains unknown options: {sorted(unknown)}"
+        )
 
     enabled = bool(data.get("enabled", False))
-    mode = str(data.get("mode", "tau_f")).strip().lower()
-    if mode not in {"tau_f", "tau_bg"}:
-        raise ValueError("tau_f_inference.mode must be tau_f or tau_bg")
-    checkpoint_value = data.get("checkpoint_path")
+    tau_f = _parse_sequence_checkpoint(
+        data.get("tau_f", {}),
+        "tau_ext_inference.tau_f",
+        config_dir,
+    )
+    tau_next = _parse_sequence_checkpoint(
+        data.get("tau_next", {}),
+        "tau_ext_inference.tau_next",
+        config_dir,
+    )
+    state_estimator = _parse_causal_kalman(
+        data.get("state_estimator", {}),
+        "tau_ext_inference.state_estimator",
+    )
+    tau_ext_filter = _parse_tau_ext_filter(data.get("tau_ext_filter", {}))
+    if enabled:
+        missing = [
+            name
+            for name, model in (("tau_f", tau_f), ("tau_next", tau_next))
+            if model.checkpoint_path is None
+        ]
+        if missing:
+            raise ValueError(
+                "tau_ext_inference requires both checkpoint paths when enabled; "
+                f"missing={missing}"
+            )
+    return TauExtInferenceConfig(
+        enabled=enabled,
+        tau_f=tau_f,
+        tau_next=tau_next,
+        state_estimator=state_estimator,
+        tau_ext_filter=tau_ext_filter,
+    )
+
+
+def _parse_tau_ext_filter(data: dict[str, Any]) -> TauExtFilterConfig:
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        raise ValueError("tau_ext_inference.tau_ext_filter must be a mapping")
+    allowed = {"enabled", "mode", "window", "cutoff_hz"}
+    unknown = set(data) - allowed
+    if unknown:
+        raise ValueError(
+            "tau_ext_inference.tau_ext_filter contains unknown options: "
+            f"{sorted(unknown)}"
+        )
+    enabled = bool(data.get("enabled", True))
+    mode = str(data.get("mode", "moving_average")).strip().lower()
+    if mode not in {"moving_average", "median"}:
+        raise ValueError(
+            "tau_ext_inference.tau_ext_filter.mode must be moving_average or median"
+        )
+    window = int(data.get("window", 21))
+    if window < 1:
+        raise ValueError("tau_ext_inference.tau_ext_filter.window must be positive")
+    if mode == "median" and window % 2 == 0:
+        raise ValueError(
+            "tau_ext_inference.tau_ext_filter.window must be odd in median mode"
+        )
+    cutoff_hz = float(data.get("cutoff_hz", 20.0))
+    if not isfinite(cutoff_hz) or cutoff_hz <= 0.0:
+        raise ValueError(
+            "tau_ext_inference.tau_ext_filter.cutoff_hz must be positive and finite"
+        )
+    return TauExtFilterConfig(
+        enabled=enabled,
+        mode=mode,
+        window=window,
+        cutoff_hz=cutoff_hz,
+    )
+
+
+def _parse_sequence_checkpoint(
+    data: dict[str, Any],
+    name: str,
+    config_dir: Path | None,
+) -> SequenceCheckpointConfig:
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        raise ValueError(f"{name} must be a mapping")
+    allowed = {"checkpoint_path", "device", "horizon", "input_keys", "output_key"}
+    unknown = set(data) - allowed
+    if unknown:
+        raise ValueError(f"{name} contains unknown options: {sorted(unknown)}")
+
     checkpoint_path = None
+    checkpoint_value = data.get("checkpoint_path")
     if checkpoint_value is not None:
         checkpoint_path = Path(checkpoint_value).expanduser()
         if not checkpoint_path.is_absolute():
@@ -771,69 +899,75 @@ def _parse_tau_f_inference(
                 if not config_relative.exists() and project_relative.exists()
                 else config_relative
             )
-    if enabled and checkpoint_path is None:
-        raise ValueError(
-            "tau_f_inference.checkpoint_path is required when inference is enabled"
-        )
 
     device = str(data.get("device", "cpu")).strip()
     if not device:
-        raise ValueError("tau_f_inference.device must not be empty")
-    torch_num_threads = int(data.get("torch_num_threads", 1))
-    if torch_num_threads <= 0:
-        raise ValueError("tau_f_inference.torch_num_threads must be positive")
-
+        raise ValueError(f"{name}.device must not be empty")
     horizon_value = data.get("horizon")
     horizon = None if horizon_value is None else int(horizon_value)
     if horizon is not None and horizon <= 0:
-        raise ValueError("tau_f_inference.horizon must be positive when provided")
+        raise ValueError(f"{name}.horizon must be positive when provided")
 
     input_value = data.get("input_keys")
     input_keys = None if input_value is None else tuple(str(key) for key in input_value)
-    allowed_inputs = {"q", "dq", "ddq", "tau"}
+    allowed_inputs = {"q", "dq", "delta_q"}
     if input_keys is not None:
-        if not input_keys:
-            raise ValueError("tau_f_inference.input_keys must not be empty")
-        if len(set(input_keys)) != len(input_keys):
-            raise ValueError("tau_f_inference.input_keys must not contain duplicates")
-        unknown = sorted(set(input_keys) - allowed_inputs)
-        if unknown:
+        if not input_keys or len(set(input_keys)) != len(input_keys):
+            raise ValueError(f"{name}.input_keys must be non-empty and unique")
+        unknown_inputs = sorted(set(input_keys) - allowed_inputs)
+        if unknown_inputs:
             raise ValueError(
-                f"tau_f_inference.input_keys contains unsupported values: {unknown}"
+                f"{name}.input_keys contains unsupported values: {unknown_inputs}"
             )
 
     output_value = data.get("output_key")
     output_key = None if output_value is None else str(output_value).strip()
     if output_key == "":
-        raise ValueError("tau_f_inference.output_key must not be empty")
-
-    tau_ext_lowpass_hz = _optional_float(data.get("tau_ext_lowpass_hz"))
-    if tau_ext_lowpass_hz is not None and (
-        not isfinite(tau_ext_lowpass_hz) or tau_ext_lowpass_hz <= 0
-    ):
-        raise ValueError(
-            "tau_f_inference.tau_ext_lowpass_hz must be positive when provided"
-        )
-    gate_threshold = _joint_vector(
-        data.get("tau_ext_gate_threshold_nm", (0.0,) * 7),
-        "tau_f_inference.tau_ext_gate_threshold_nm",
-    )
-    if any(value < 0.0 for value in gate_threshold):
-        raise ValueError(
-            "tau_f_inference.tau_ext_gate_threshold_nm must be non-negative"
-        )
-    return TauFInferenceConfig(
-        enabled=enabled,
-        mode=mode,
+        raise ValueError(f"{name}.output_key must not be empty")
+    return SequenceCheckpointConfig(
         checkpoint_path=checkpoint_path,
         device=device,
-        torch_num_threads=torch_num_threads,
         horizon=horizon,
         input_keys=input_keys,
         output_key=output_key,
-        tau_ext_lowpass_hz=tau_ext_lowpass_hz,
-        tau_ext_gate_threshold_nm=gate_threshold,
     )
+
+
+def _parse_causal_kalman(data: dict[str, Any], name: str) -> CausalKalmanConfig:
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        raise ValueError(f"{name} must be a mapping")
+    parameter_names = (
+        "position_std",
+        "velocity_std",
+        "jerk_std",
+        "initial_position_std",
+        "initial_velocity_std",
+        "initial_acceleration_std",
+    )
+    unknown = set(data) - {*parameter_names, "max_gap_s"}
+    if unknown:
+        raise ValueError(f"{name} contains unknown options: {sorted(unknown)}")
+    defaults = CausalKalmanConfig()
+    parameters = {
+        key: _positive_joint_parameter(data.get(key, getattr(defaults, key)), f"{name}.{key}")
+        for key in parameter_names
+    }
+    max_gap_s = float(data.get("max_gap_s", defaults.max_gap_s))
+    if not isfinite(max_gap_s) or max_gap_s <= 0.0:
+        raise ValueError(f"{name}.max_gap_s must be positive and finite")
+    return CausalKalmanConfig(**parameters, max_gap_s=max_gap_s)
+
+
+def _positive_joint_parameter(value: Any, name: str) -> tuple[float, ...]:
+    if isinstance(value, (int, float)):
+        result = (float(value),) * 7
+    else:
+        result = tuple(float(item) for item in value)
+    if len(result) != 7 or any(not isfinite(item) or item <= 0.0 for item in result):
+        raise ValueError(f"{name} must be a positive scalar or seven positive values")
+    return result
 
 
 def _parse_arm_pair(data: dict[str, Any]) -> ArmPairConfig:
@@ -963,10 +1097,8 @@ def _optional_float(value: Any) -> float | None:
 
 def _joint_vector(value: Any, name: str) -> tuple[float, ...]:
     if not isinstance(value, (list, tuple)) or len(value) != 7:
-        prefix = name if name.startswith("tau_f_inference.") else f"teleop.command.{name}"
-        raise ValueError(f"{prefix} must contain exactly 7 values")
+        raise ValueError(f"teleop.command.{name} must contain exactly 7 values")
     vector = tuple(float(item) for item in value)
     if not all(isfinite(item) for item in vector):
-        prefix = name if name.startswith("tau_f_inference.") else f"teleop.command.{name}"
-        raise ValueError(f"{prefix} values must be finite")
+        raise ValueError(f"teleop.command.{name} values must be finite")
     return vector

@@ -7,7 +7,7 @@
 - 100 Hz 软件双边主从控制：两臂均保持固件 `follower_mode`，逻辑主臂使用 MIT 零刚度拖动、低阻尼和重力前馈，逻辑从臂可选择 MIT 阻抗或 position 跟踪。
 - 从臂关节外力矩反馈：动力学残差经过启动零偏、低通、死区、增益、限幅、变化率限制和启动渐入后反射到主臂。该实时触觉反馈链与下述 checkpoint 摩擦预测链相互独立。
 - 主从夹爪遥操，以及关节状态、控制命令、力矩、电流、末端位姿、夹爪和 RGB 图像的 H5 v7 采集。
-- 在线 `tau_f` 循环网络推理：计算 `tau_f_cal`、`tau_f_pred`、`tau_ext` 和六维末端 `wrench_ext`，支持实时显示、H5 保存、历史数据回填和 Rerun 回放。
+- 在线双模型外力矩推理：同步计算 `tau_ext_cal/tau_ext_pred` 及对应的 `wrench_cal/wrench_pred`，支持实时显示和 H5 保存。
 - 动力学辨识：Fourier 激励轨迹、MuJoCo 预检、真机采集、H5 导入、惯性/摩擦/零偏辨识、URDF/manifest 输出和独立验证。
 - 自由空间自动采集：基于真实 H5 已到达路径生成 30 分钟低速/静态覆盖轨迹，执行全帧 MuJoCo 预检、逐帧真机安全联锁和 30,000 帧自动分片。
 - 7 轴滚动时域 OSC-QP 力/位姿控制接口。该模块目前可独立调用和 benchmark，尚未接入正式数采机械臂执行链。
@@ -371,9 +371,31 @@ python scripts/print_arm_q.py \
 8. 遥操过程中按空格停止，随后按 `y` 保存或按 `n` 丢弃。
 9. 当 `reset_after_episode: true` 时，无论按 `y` 还是 `n`，两臂都会退出双边控制并共同复位。
 
-当 `tau_f_inference.enabled: true` 时，每个对齐后的关节状态都会执行一次在线推理。系统从 checkpoint 内的 `config` 自动恢复模型结构、输入顺序、输出、训练 horizon 和归一化统计；每个 episode 从零 GRU/LSTM 状态开始，之后逐帧调用循环网络并携带隐藏状态，不再维护或重复计算 50 帧滑窗。`mode: tau_f` 使用 `tau_ext_raw = (tau_id - tau) - tau_f_pred`；`mode: tau_bg` 使用无接触数据训练的背景力矩模型并计算 `tau_ext_raw = tau - tau_bg_pred`。两种模式都将残差依次经过可配置的因果低通和逐关节硬门控，最终 `tau_ext` 只计算一次，并同时用于主臂力反馈、H5 保存以及 `tau_ext = J(q)^T wrench_ext` 的阻尼最小二乘映射。绘图在独立进程中，只显示主数采进程已经对齐的结果；每次按 `r` 开始录制时会先清空四个面板的历史窗口。
+当 `tau_ext_inference.enabled: true` 时，每个对齐后的 follower 样本只执行一次双模型推理。控制命令先经过关节步长限制，再按 ZOH 语义作为该时刻的 `q_cmd`；`tau_f` 与 `tau_next` checkpoint 共享同一份 `[q, dq, q_cmd-q]` 特征。系统从两个 checkpoint 分别恢复 LSTM/GRU 结构、输入顺序、训练 horizon 和归一化统计，并以独立固定窗口推理。
 
-现有 checkpoint 仍按“每个 50 帧训练窗口从零状态开始”训练。在线状态持续超过 50 帧后，其结果不再严格等价于原滑窗推理；确定长期使用该模式前，应采用连续 chunk 的 truncated BPTT 重新训练，并在训练中携带和定期 detach 状态。新 episode、控制器重启或轨迹中断时必须重置循环状态。
+在线加速度不读取 `ArmState.ddq`，而是使用与 PINN `offline_tau_labels.py` forward pass 相同的变步长常加速度 Kalman Filter：状态为 `[q,dq,ddq]`，观测为实测 `[q,dq]`，过程噪声为连续 white-jerk，并在时间间隔超过 `max_gap_s` 时复位。RTS 是使用未来观测的离线 backward smoother，只用于构造训练标签，不能进入在线控制。RNEA 保留实测 `q/dq`，只使用 `ddq_kf_causal`：
+
+```text
+tau_id_raw      = RNEA(q, dq, ddq_kf_causal)
+tau_id_filtered = causal_lowpass(tau_id_raw)
+tau_ext_cal_raw = tau_id_filtered + tau_f_pred - tau_follower_filtered
+tau_next_target = tau_next_checkpoint_target_filter(tau_follower_filtered)
+tau_ext_pred_raw= tau_next_pred - tau_next_target
+tau_ext_cal     = lowpass(moving_average(tau_ext_cal_raw, 21), 20 Hz)
+tau_ext_pred    = lowpass(moving_average(tau_ext_pred_raw, 21), 20 Hz)
+```
+
+`tau_f` checkpoint 必须声明 `matched_causal_torque_filter_v1` target contract 以及训练
+标签使用的 cutoff/median window。启动时会验证它们与在线实测 torque 滤波配置完全
+一致；旧 checkpoint 或参数不匹配会直接拒绝启用。`tau_follower` 和 `tau_id` 使用两个
+独立但同参数、同时间戳、同 episode reset 的滤波状态，避免重复过滤实测 torque。
+`tau_next` checkpoint 的 target filter 只在共享源滤波之后作用于 `tau_ext_pred` 分支的
+测量 torque；当前配置复现三点因果中值。`tau_next_pred` 不会再次过滤，`tau_f` 分支也
+不会经过这一级，因此不改变 `10 Hz/median1` matched contract。
+
+`tau_ext_filter` 与 PINN 数据推理保持一致：每条 raw residual 只经过一次 21 点因果滑动均值和 20 Hz 一阶因果低通，启动窗口以第一个真实 residual 填充。`tau_ext_pred` 用于主臂双边力反馈，override 路径不会再进入双边控制器的旧 residual 低通。两条处理后的外力矩分别经同一个 Jacobian 阻尼最小二乘映射得到 `wrench_cal/wrench_pred`；原始对照保留为 `*_raw`。绘图独立进程的左列依次显示 `tau_ext_cal/tau_ext_pred`，右列显示 `wrench_cal/wrench_pred`，每次开始录制都会清空全部滤波状态和历史。
+
+两个 checkpoint 按“每个 50 帧训练窗口从零状态开始”训练。在线模式保持相同语义：episode 开始后先采满 50 个真实样本，约 0.5 秒预热期间不执行模型前向且力反馈保持为零；完整窗口到齐后才开始预测，每个窗口都重新创建零循环状态。第 51 帧预测使用第 2-51 帧；新 episode 或控制器重启时清空两个窗口和 Kalman 状态。
 
 程序运行时的终端提示和日志均为英文。
 
@@ -514,8 +536,8 @@ python scripts/free_space.py \
 采集器会再次核对配置指纹和每条 NPZ 的 SHA-256；配置或轨迹在仿真后发生变化都会拒绝运动。
 真机按 100 Hz 发送从臂位置命令，并逐帧检查跟踪误差、关节软限位、力矩阈值、时间戳间隔和循环截止时间。
 自由空间采集器只负责轨迹执行、安全联锁和 30,000 帧 episode 分片；字段计算、H5 schema 和保存全部
-复用常规 `EpisodeBuffer` 数采逻辑。输出与常规数采相同，保留 `q_cmd`、`tau_f_cal`、
-`tau_f_pred`、`tau_ext` 和轨迹来源元数据，不在上层重命名或重新计算数据。
+复用常规 `EpisodeBuffer` 数采逻辑。输出与常规数采相同，保留 `q_cmd`、
+`ddq_kf_causal`、两种模型预测、两种外力矩和轨迹来源元数据。
 H5 目录和文件前缀继承 `collection_config` 的 `output` 配置，自动续接常规数采的 episode 编号。轨迹
 seed、配置 SHA-256、轨迹 SHA-256、参考 H5 SHA-256 和工作空间范围保存在
 `/metadata/episode_json`。
@@ -569,16 +591,16 @@ YAML 中省略的主臂零刚度、位置比例、关节/力矩安全限幅、�
 - `realtime_plot.inverse_dynamics.delay_s`: 兼容旧配置的字段，配置应保持 `0.0`。状态时间线延迟由 `teleop.command.state_alignment_delay_s` 单独控制。
 - `realtime_plot.inverse_dynamics.locked_joint_names`: 从完整 URDF 裁剪夹爪关节，使 Pinocchio 模型只保留七个机械臂关节。
 - `realtime_plot.inverse_dynamics.gravity_m_s2`: Pinocchio RNEA 使用的基坐标系重力向量。
-- `realtime_plot.wrench_mapping.frame_name`: `tau_ext` 雅可比映射使用的末端 URDF frame，当前为 `gripper_base`。
+- `realtime_plot.wrench_mapping.frame_name`: 两条 `tau_ext_*` 雅可比映射使用的末端 URDF frame，当前为 `gripper_base`。
 - `realtime_plot.wrench_mapping.reference_frame`: wrench 的表达坐标系；`local` 为末端局部系，`local_world_aligned` 为原点位于末端、轴与基座对齐的坐标系。
-- `realtime_plot.wrench_mapping.damping`: 求解 `tau_ext = J(q)^T wrench_ext` 的阻尼最小二乘系数，用于降低奇异位形附近的数值放大。
-- `tau_f_inference.checkpoint_path`: PINN 序列模型 checkpoint；相对路径按 YAML 所在目录解析。
-- `tau_f_inference.device` / `torch_num_threads`: 推理设备和 PyTorch CPU 线程数；当前实机配置使用 `cuda:0`。
-- `tau_f_inference.horizon` / `input_keys` / `output_key`: 可选一致性检查；省略时完全使用 checkpoint 内的配置，填写后若不一致会在启动时直接报错。
-- `tau_f_inference.mode`: `tau_f` 保留原 RNEA/摩擦残差链路，`tau_bg` 使用实测力矩减去网络预测背景力矩。
-- `tau_f_inference.tau_ext_lowpass_hz`: 最终外力矩链路的因果一阶低通截止频率；设为 `null` 或省略时不低通。
-- `tau_f_inference.tau_ext_gate_threshold_nm`: 7 维硬门控阈值；低通后绝对值小于对应阈值的关节外力矩置零。
-- `dynamics_processing.*`: H5 保存阶段和实时 `tau_f` 使用同一处理参数。状态导数由 V120 官方 velocity、q 二阶导和真实 CAN 时间差生成。当前该开关关闭，实测力矩不追加滤波；启用后才执行配置的因果中值/一阶 IIR。
+- `realtime_plot.wrench_mapping.damping`: 求解 `tau_ext_* = J(q)^T wrench_*` 的阻尼最小二乘系数，用于降低奇异位形附近的数值放大。
+- `tau_ext_inference.tau_f` / `tau_next`: 两个 PINN 序列模型的独立 checkpoint 配置；两者缺一不可。
+- `checkpoint_path`: 可指向具体 `.pt`，也可指向 checkpoint 目录；目录模式启动时选择文件名中 `val_loss` 最低的文件。相对路径按 YAML 所在目录解析。
+- `device`: 每个模型可独立选择 `cpu` 或 `cuda:0`；CPU 推理线程数固定为 `1`。
+- `horizon` / `input_keys` / `output_key`: checkpoint 一致性检查。当前两个模型均要求 `horizon=50`、输入 `[q,dq,delta_q]`；输出分别为 `tau_f` 和 `tau`。
+- `tau_f` target contract: checkpoint 必须包含 `target_contract=matched_causal_torque_filter_v1` 及 `target_filter.cutoff_hz/median_window`；当前为 `10 Hz/1`。
+- `tau_ext_inference.state_estimator.*`: 在线因果 Kalman 的观测噪声、white-jerk 过程噪声、初始协方差和断流复位阈值，必须与 PINN 离线标签配置中的 forward filter 一致。
+- `dynamics_processing.*`: 控制 H5 中测得力矩的因果处理；`ddq_kf_causal` 始终由 `tau_ext_inference.state_estimator` 单独产生，不使用旧的 `d(dq)/dt` 作为 RNEA 加速度。
 - `cameras[*].backend`: 当前真实相机使用 `v4l2`；每台相机在独立子进程和独立 PyAV/FFmpeg 解码线程中持续抓帧，数采/推理主进程只按需取得最新帧。
 - `cameras[*].serial_number` / `device`: 可按 USB 序列号解析 `/dev/video*`，也可显式指定设备节点。当前 `wrist=CC1WC520122`，`external=1111111111111111`。
 - `cameras[*].pixel_format`、`width`、`height`、`fps`: 当前双相机配置示例均请求 `MJPG 640x480@25`。H5 使用相机逐帧真实时间戳，不把请求帧率当作实际帧率，也不假定多相机硬件同步。
@@ -587,7 +609,7 @@ YAML 中省略的主臂零刚度、位置比例、关节/力矩安全限幅、�
 - `cameras[*].crop`: `[y0,y1,x0,x1]`；`output_size` 是写入 H5 前的 `[width,height]`。OpenCV BGR 会转换为连续内存的 RGB `uint8`。
 - `cameras[*].buffer_size`: 设为 `1` 以减少旧帧延迟。每台相机只向数采循环交付最新且尚未交付的帧。
 - `cameras[*].frame_timeout_s`: 已启动相机允许的最长无帧时间；连续读取失败或超过该时间会触发数采安全异常。当前腕部相机配置为 `0.5 s`。
-- `robot_states`: 支持 `q`、`velocity`、`acceleration`、`ee_pose`、`torque`、`tau_id`、`current`。`q.mean_window` 保留为兼容字段，当前固定为 `1`，不再参与 dq 计算；`q/velocity/acceleration.lowpass_cutoff_hz` 分别控制 q 二阶导支路、官方 velocity 和融合后 ddq 的因果低通。H5 中的 `q` 始终保存原始观测值。
+- `robot_states`: 支持 `q`、`velocity`、`acceleration`、`ee_pose`、`torque`、`tau_id`、`tau_id_filtered`、`current`。`tau_id_filtered` 已在推理器内部完成与 torque 匹配的滤波，保存时不会再次处理。
 
 CAN 帧间隔、双边控制周期、相机无帧或 MIT 前馈力矩越界任一安全异常发生后，常规数采会停止遥操命令和相机线程，将两臂切回固件 `follower_mode`，重建 CAN 状态时间线，尝试回到 `rest_q`，随后断开连接并以退出码 `1` 结束。该故障处理路径严格禁止调用机械臂 `disable()`；即使复位失败，也只继续断连退出。
 
@@ -605,21 +627,24 @@ python -m pip install --upgrade "git+https://github.com/agilexrobotics/pyAgxArm.
 
 生成文件遵循 `/home/rei/mnt/code/lcx/data/train_episode/wipe_board/wipe_board` 的风格：
 
-- 根属性：常规双边数采和自由空间自动采集均使用 `format=factr_multimodal_episode/v7`，并包含 `saved_at_us`
+- 根属性：常规双边数采使用 `format=factr_multimodal_episode/v9`，并包含 `saved_at_us`
 - `/config_yaml`: 本次采集配置原文
 - `/teleop/timestamp_us`: 延迟后的固定主时间线；重复目标时刻不重复写入
 - `/teleop/q_follower`、`q_cmd`：从臂实测关节角和实际发送给从臂的关节命令
 - `/teleop/q_leader`、`dq_leader`、`ddq_leader`：软件逻辑主臂状态
-- `/teleop/dq_follower`：V120 `motor_state_*` 官方 velocity 按主时间线对齐后的七维速度
-- `/teleop/ddq_follower`：官方 velocity 一阶导与 q 二阶导等权最小二乘融合并低通后的七维加速度
+- `/teleop/dq_follower`：V120 `motor_state_*` 官方 velocity 转换到 q/URDF 关节坐标系并按主时间线对齐后的七维速度；转换符号为 `[-1,-1,-1,-1,-1,+1,-1]`
+- `/teleop/ddq_follower`：滤波后的官方 velocity 按真实 motor 时间差求一阶导、再低通后的七维加速度
 - `/teleop/ee_pose_follower`
 - `/teleop/tau_follower`、`current_follower`
-- `/teleop/tau_f_cal`：在线 RNEA 残差，定义为 `tau_id - tau_follower`
-- `/teleop/tau_f_pred` 或 `/teleop/tau_bg_pred`：由模式决定的 checkpoint 在线预测结果
-- `/teleop/tau_ext_raw`：模式公式直接得到、尚未低通的外力矩残差
-- `/teleop/tau_ext_filtered`：低通后、门控前的外力矩残差
-- `/teleop/tau_ext`：低通和硬门控后的最终外力矩，用于反馈、存储和 wrench 映射
-- `/teleop/wrench_ext`：由 `tau_ext = J(q)^T wrench_ext` 阻尼最小二乘映射得到的末端 wrench，shape 为 `(N,6)`，分量顺序为 `Fx,Fy,Fz,Mx,My,Mz`
+- `/teleop/ddq_kf_causal`：与 PINN forward-KF 一致的在线因果加速度
+- `/teleop/tau_id`：`RNEA(q_follower,dq_follower,ddq_kf_causal)`
+- `/teleop/tau_id_filtered`：与 `tau_follower` 同参数独立因果低通后的 `tau_id`
+- `/teleop/tau_f_pred`：摩擦/残差 checkpoint 的在线预测
+- `/teleop/tau_next_pred`：自由空间总力矩 checkpoint 的在线预测
+- `/teleop/tau_ext_cal_raw`、`tau_ext_pred_raw`：未经 residual 后处理的两条外力矩
+- `/teleop/tau_ext_cal`、`tau_ext_pred`：各自的 raw residual 经过一次 `21 点因果滑动均值 -> 20 Hz 一阶低通`；`tau_ext_pred` 同时用于双边力反馈
+- `/teleop/wrench_cal_raw`、`wrench_pred_raw`：由 raw residual 映射的诊断 wrench
+- `/teleop/wrench_cal`、`wrench_pred`：分别由处理后的两条外力矩经 `tau_ext_* = J(q)^T wrench_*` 阻尼最小二乘映射得到，frame 为闭合夹爪指尖中心 `gripper_tcp`，shape 为 `(N,6)`，分量顺序为 `Fx,Fy,Fz,Mx,My,Mz`
 - `/teleop/gripper_follower`、`gripper_cmd`：从夹爪实际开合宽度和实际发送给从夹爪的命令，单位均为 m
 - `/cameras/<name>/frames` 和 `/cameras/<name>/timestamp_us`，仅在相机实际接入时写入
 
@@ -628,30 +653,27 @@ python -m pip install --upgrade "git+https://github.com/agilexrobotics/pyAgxArm.
 `joint_12`、`joint_34`、`joint_56` 和 `joint_7` 保留原始 q 历史；七个 `motor_state_*` 分别维护官方 velocity 历史。保存和控制使用的 `q[k]` 始终是原始关节角，`dq` 不再由 q 差分：
 
 ```text
-q_lp[k]       = lowpass(q_raw[k])
-dq[k]         = lowpass(motor_state_velocity[k])
-ddq_dq[k]     = (dq[k] - dq[k-1]) / dt_motor
-dq_from_q[k]  = (q_lp[k] - q_lp[k-1]) / dt_q
-ddq_q[k]      = (dq_from_q[k] - dq_from_q[k-1]) / dt_q
-ddq_fused[k]  = mean(ddq_dq[k], ddq_q_nearest[k])
-ddq[k]        = lowpass(ddq_fused[k])
+dq[k]         = lowpass(motor_state_velocity[k] * joint_sign)
+ddq_raw[k]    = (dq[k] - dq[k-1]) / dt_motor
+ddq[k]        = lowpass(ddq_raw[k])
 ```
 
-第一帧用当前 q、官方 velocity 和零加速度初始化各支路。之后每个 CAN 帧按真实时间差更新两路加速度估计，等权最小二乘融合后再执行 acceleration 低通。主时间线使用 `now - state_alignment_delay_s`，分别从 q 组历史和七个 motor 历史选择最近样本，拼成同一时间戳的 `q/dq/ddq`；力矩和电流来自相同 motor 样本。H5Writer 不再二次计算状态导数。
+第一帧用当前 q、已转换到关节坐标系的官方 velocity 和零加速度初始化。之后每个 motor CAN 帧先低通 velocity，再按相邻 motor 帧的真实时间差计算普通状态字段 `ddq_follower`；它保留作观测诊断，不参与外力矩 RNEA。外力矩链路使用独立的 `ddq_kf_causal`。主时间线使用 `now - state_alignment_delay_s`，从 q 组历史和七个 motor 历史选择最近样本；力矩和电流来自相同 motor 样本。同一主时间格的快照、双模型窗口和 Kalman 只推进一次。实时数采和推理不进行需要未来样本的插值；超过配置上限的 CAN 间隔由 watchdog 拒绝。
 
-H5 只保存最终业务数据，不保存 `*_raw`、CAN 来源时间戳、采集时间戳、状态年龄或组间偏差等过程数据。
+H5 额外保存 `control_timestamp_us`、`state_acquired_timestamp_follower_us`、`q_source_timestamp_follower_us`、`motor_source_timestamp_follower_us` 和 `state_source_skew_follower_us`。`teleop` 属性中的 `input_frame_count` 与 `duplicate_input_frame_count` 用于核对控制循环重复读取；PINN 特征映射未声明这些字段时不会把它们作为训练输入。
 
-当前 `dynamics_processing.enabled: false` 且 `robot_states.torque.lowpass: false`，因此 H5 中的
-`tau_follower` 保存对齐后的 SDK 实测力矩，不追加中值或低通，数据集属性为
-`processing_method=nearest_motor_sample_unfiltered`。若启用 `dynamics_processing`，才会按
-`torque_median_window` 和 `torque_lowpass_hz` 执行因果中值/一阶 IIR；所有模式的 `zero_phase` 均为 `false`。
+当前 `dynamics_processing.enabled: false` 且 `robot_states.torque.lowpass: true`，因此 H5 与双模型公式中的
+`tau_follower` 使用一条 10 Hz 因果一阶 IIR，`tau_id_filtered` 使用参数相同但状态独立的
+另一条 IIR。若启用 `dynamics_processing`，则改用其 `torque_median_window` 和
+`torque_lowpass_hz`；参数必须仍与 checkpoint target contract 一致，所有模式的
+`zero_phase` 均为 `false`。
 
-第一个完整对齐状态即可产生 `tau_f_cal`、`tau_f_pred` 和 `tau_ext`。启动帧使用按上述规则初始化的零 `dq/ddq`，之后与 `teleop/timestamp_us` 逐帧等长对齐。
+第一个完整对齐状态即可产生 `ddq_kf_causal`；两个 torque prediction 和两条 `tau_ext_*` 在前 49 帧写零，第 50 个真实样本形成完整窗口后才有效。Kalman 启动帧加速度初始化为零，之后所有推理结果与 `teleop/timestamp_us` 逐帧等长对齐。
 每个推理数据集都记录实际 checkpoint、horizon、输入顺序、输出字段、网络结构和归一化模式属性。
 
 ## Rerun episode 可视化
 
-按 episode 索引打开 H5：左侧显示相机图像，中间显示末端三维轨迹及当前点，右侧分别显示末端外力和外力矩。可视化脚本直接读取 `/teleop/wrench_ext`，不再离线计算；缺少该字段的旧 H5 需要先使用下文的回填脚本补齐。
+当前在线实时窗口已经使用新双链路字段。旧的 Rerun episode 脚本仍面向 v7 `/teleop/wrench_ext`，不属于 v9 数采写入契约；读取新文件时应选择 `/teleop/wrench_cal` 或 `/teleop/wrench_pred`。
 
 ```bash
 python scripts/visualize_h5_rerun.py \
@@ -671,15 +693,6 @@ python scripts/open_rerun_recording.py runs/insert_usb/episode_0052.rerun.rrd
 ```
 
 如果环境中曾安装同名但无关的 `rerun` 包，需要先执行 `python -m pip uninstall rerun`，再安装项目声明的 `rerun-sdk`。
-
-已有 episode 可使用原子回填脚本补充 `/teleop/wrench_ext`。默认只检查，加 `--write` 才会在同目录生成完整临时副本并原子替换原 H5：
-
-```bash
-python scripts/backfill_wrench_ext.py runs --recursive
-python scripts/backfill_wrench_ext.py runs --recursive --write
-```
-
-已经存在 `wrench_ext` 的文件默认跳过；只有明确需要按当前映射参数重算时才增加 `--overwrite`。执行回填时必须停止数采，避免修改仍在写入的 episode。
 
 ## 真实 SDK 接入点
 

@@ -8,342 +8,255 @@ import pytest
 
 from nero_collection.config import (
     CollectionConfig,
-    DynamicsProcessingConfig,
     OutputConfig,
     StateParamConfig,
-    TauFInferenceConfig,
+    TauExtInferenceConfig,
     TeleopConfig,
 )
 from nero_collection.h5_writer import EpisodeBuffer
-from nero_collection.tau_f_inference import OnlineTauFResult, TauFCheckpointMetadata
+from nero_collection.tau_ext_inference import (
+    OnlineTauExtResult,
+    SequenceCheckpointMetadata,
+    TauExtInferenceMetadata,
+)
 
 
-def test_h5_v7_keeps_bilateral_state_and_commands(
+def _model_metadata(path: Path, output_key: str) -> SequenceCheckpointMetadata:
+    return SequenceCheckpointMetadata(
+        checkpoint_path=path,
+        horizon=50,
+        input_keys=("q", "dq", "delta_q"),
+        input_dims={"q": 7, "dq": 7, "delta_q": 7},
+        output_key=output_key,
+        output_dim=7,
+        architecture="lstm",
+        normalize_mode="quantile" if output_key == "tau_f" else "gaussian",
+        target_contract=(
+            "matched_causal_torque_filter_v1" if output_key == "tau_f" else None
+        ),
+        target_filter_cutoff_hz=10.0 if output_key == "tau_f" else None,
+        target_filter_median_window=1 if output_key == "tau_f" else None,
+    )
+
+
+class _Inference:
+    def __init__(self, tmp_path: Path) -> None:
+        self.metadata = TauExtInferenceMetadata(
+            tau_f=_model_metadata(tmp_path / "tau_f.pt", "tau_f"),
+            tau_next=_model_metadata(tmp_path / "tau_next.pt", "tau"),
+            input_keys=("q", "dq", "delta_q"),
+        )
+        self.calls = 0
+        self.taus = []
+
+    def estimate_aligned(self, timestamp_us, q, dq, tau, q_cmd):
+        self.calls += 1
+        q = np.asarray(q, dtype=np.float64)
+        dq = np.asarray(dq, dtype=np.float64)
+        tau = np.asarray(tau, dtype=np.float64)
+        self.taus.append(tau.copy())
+        tau_id = np.full(7, 2.0)
+        tau_f = np.full(7, 0.5)
+        tau_next = np.full(7, 4.0)
+        return OnlineTauExtResult(
+            timestamp_us=int(timestamp_us),
+            q=q.copy(),
+            dq=dq.copy(),
+            ddq_kf_causal=np.full(7, 3.0),
+            tau=tau.copy(),
+            tau_id=tau_id,
+            tau_id_filtered=tau_id.copy(),
+            tau_f_pred=tau_f,
+            tau_next_pred=tau_next,
+            tau_ext_cal=tau_id + tau_f - tau,
+            tau_ext_pred=tau_next - tau,
+        )
+
+    def warm_up(self):
+        pass
+
+    def reset_episode(self):
+        pass
+
+
+def _config(tmp_path: Path) -> CollectionConfig:
+    states = {
+        name: StateParamConfig(enabled=True, lowpass=False)
+        for name in (
+            "q",
+            "velocity",
+            "acceleration",
+            "ee_pose",
+            "torque",
+            "tau_id",
+            "current",
+        )
+    }
+    return CollectionConfig(
+        teleop=TeleopConfig(),
+        output=OutputConfig(directory=tmp_path),
+        tau_ext_inference=TauExtInferenceConfig(enabled=True),
+        robot_states=states,
+    )
+
+
+def test_episode_buffer_passes_raw_tau_to_online_filter_once(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.robot_states["torque"] = StateParamConfig(
+        enabled=True,
+        lowpass=True,
+        lowpass_cutoff_hz=10.0,
+        median_window=1,
+    )
+    inference = _Inference(tmp_path)
+    buffer = EpisodeBuffer(
+        config=config,
+        arm_names=("main",),
+        sample_rate_hz=100.0,
+        online_tau_ext=inference,
+    )
+    zeros = np.zeros(7)
+    for index, tau_value in enumerate((0.0, 10.0)):
+        buffer.append_teleop(
+            1_000_000 + index * 10_000,
+            {
+                "q_follower": ("q", zeros),
+                "dq_follower": ("velocity", zeros),
+                "tau_follower": ("torque", np.full(7, tau_value)),
+                "q_cmd": ("q", zeros),
+            },
+        )
+
+    alpha = 1.0 - np.exp(-2.0 * np.pi * 10.0 * 0.01)
+    np.testing.assert_allclose(inference.taus[1], 10.0)
+    np.testing.assert_allclose(buffer.teleop_data["tau_follower"][1], 10.0 * alpha)
+
+
+def test_h5_v9_saves_matched_filter_dual_tau_ext_schema(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    h5py = pytest.importorskip("h5py")
+    try:
+        import h5py
+    except (ImportError, ValueError) as exc:
+        pytest.skip(f"h5py is unavailable or ABI-incompatible: {exc}")
 
-    class FakeEstimator:
+    class _WrenchMapper:
         def __init__(self, _config):
             pass
 
-        def estimate(self, q, dq, ddq, tau):
-            zeros = np.zeros(7)
-            from nero_collection.contact_wrench import JointTorqueResidualEstimate
-
-            return JointTorqueResidualEstimate(
-                tau_id=zeros,
-                tau_friction=zeros,
-                tau_bias=zeros,
-                tau_model=zeros,
-                tau_residual=-np.asarray(tau),
-            )
+        def map_joint_torque(self, q, tau):
+            return SimpleNamespace(wrench=np.asarray(tau, dtype=np.float64)[:6])
 
     monkeypatch.setattr(
-        "nero_collection.h5_writer.PinocchioJointTorqueResidualEstimator",
-        FakeEstimator,
+        "nero_collection.h5_writer.PinocchioContactWrenchEstimator",
+        _WrenchMapper,
     )
-    config = CollectionConfig(
-        teleop=TeleopConfig(),
-        output=OutputConfig(directory=tmp_path),
-        robot_states={
-            "q": StateParamConfig(enabled=True),
-            "velocity": StateParamConfig(enabled=True),
-            "acceleration": StateParamConfig(enabled=True),
-            "ee_pose": StateParamConfig(enabled=True),
-            "torque": StateParamConfig(enabled=True),
-            "current": StateParamConfig(enabled=True),
-        },
+    inference = _Inference(tmp_path)
+    buffer = EpisodeBuffer(
+        config=_config(tmp_path),
+        arm_names=("main",),
+        sample_rate_hz=100.0,
+        online_tau_ext=inference,
     )
-    buffer = EpisodeBuffer(config=config, arm_names=("main",), sample_rate_hz=100.0)
-    pose = np.eye(4, dtype=np.float64)
-    for index, timestamp_us in enumerate(
-        (1_000_000, 1_010_000, 1_020_000, 1_030_000)
-    ):
-        follower = np.full(7, float(index), dtype=np.float64)
-        leader = np.full(7, 100.0 + index, dtype=np.float64)
+    for index in range(3):
+        q = np.full(7, index * 0.1)
         buffer.append_teleop(
-            timestamp_us,
+            1_000_000 + index * 10_000,
             {
-                "q_follower": ("q", follower),
-                "q_cmd": ("q", follower + 0.1),
-                "q_timestamp_follower_us": ("timestamp", np.asarray([timestamp_us])),
-                "q_acquired_timestamp_follower_us": (
-                    "timestamp",
-                    np.asarray([timestamp_us + 1]),
-                ),
-                "dq_follower": ("velocity", follower + 0.2),
-                "ddq_follower": ("acceleration", follower + 0.3),
-                "ee_pose_follower": ("ee_pose", pose),
-                "tau_follower": ("torque", follower + 0.4),
-                "motor_timestamp_follower_us": (
-                    "timestamp",
-                    np.full(7, timestamp_us, dtype=np.int64),
-                ),
-                "motor_acquired_timestamp_follower_us": (
-                    "timestamp",
-                    np.full(7, timestamp_us + 1, dtype=np.int64),
-                ),
-                "current_follower": ("current", follower + 0.5),
-                "gripper_follower": ("gripper", np.asarray([0.02])),
-                "gripper_cmd": ("gripper", np.asarray([0.03])),
-                "q_leader": ("q", leader),
-                "dq_leader": ("velocity", leader),
-                "ddq_leader": ("acceleration", leader),
-                "ee_pose_leader": ("ee_pose", pose),
-                "cmd_ee_pose": ("ee_pose", pose),
-                "tau_leader": ("torque", leader),
-                "current_leader": ("current", leader),
-                "gripper_leader": ("gripper", np.asarray([0.04])),
-                "gripper_state": ("gripper", np.asarray([0.02])),
-                "gripper_value": ("gripper", np.asarray([0.02])),
+                "q_follower": ("q", q),
+                "dq_follower": ("velocity", np.full(7, 0.2)),
+                "ddq_follower": ("acceleration", np.full(7, 99.0)),
+                "tau_follower": ("torque", np.full(7, 10.0)),
+                "q_cmd": ("q", q + 0.1),
             },
         )
 
     output = buffer.save(tmp_path / "episode.h5")
 
-    expected = {
-        "timestamp_us",
-        "q_follower",
-        "q_cmd",
-        "dq_follower",
-        "ddq_follower",
-        "ee_pose_follower",
-        "tau_follower",
-        "current_follower",
-        "gripper_follower",
-        "gripper_cmd",
-        "q_leader",
-        "dq_leader",
-        "ddq_leader",
-        "tau_leader",
-        "current_leader",
-        "tau_f",
-        "tau_f_timestamp_us",
+    assert inference.calls == 3
+    new_fields = {
+        "ddq_kf_causal",
+        "tau_id",
+        "tau_id_filtered",
+        "tau_f_pred",
+        "tau_next_pred",
+        "tau_ext_cal_raw",
+        "tau_ext_pred_raw",
+        "tau_ext_cal",
+        "tau_ext_pred",
+        "wrench_cal_raw",
+        "wrench_pred_raw",
+        "wrench_cal",
+        "wrench_pred",
+    }
+    removed_fields = {
+        "tau_f_cal",
+        "tau_bg_pred",
+        "tau_ext_raw",
+        "tau_ext_filtered",
+        "tau_ext",
+        "wrench_ext",
     }
     with h5py.File(output, "r") as h5:
         teleop = h5["teleop"]
-        assert h5.attrs["format"] == "factr_multimodal_episode/v7"
-        assert teleop.attrs["data_role"] == "bilateral"
-        assert set(teleop.keys()) == expected
-        assert teleop["ee_pose_follower"].attrs["frame_name"] == "tcp"
-
-
-def test_h5_saves_online_tau_f_outputs_on_follower_timeline(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    h5py = pytest.importorskip("h5py")
-
-    class FakeInference:
-        def __init__(self, *args, **kwargs):
-            self.metadata = TauFCheckpointMetadata(
-                checkpoint_path=tmp_path / "model.pt",
-                horizon=50,
-                input_keys=("q", "dq", "tau"),
-                input_dims={"q": 7, "dq": 7, "tau": 7},
-                output_key="tau_f",
-                output_dim=7,
-                architecture="lstm",
-                normalize_mode="gaussian",
-            )
-
-        def estimate_centered(self, timestamp_us, q, dq, ddq, tau):
-            tau = np.asarray(tau, dtype=np.float64)
-            tau_f_cal = np.full(7, 2.0)
-            tau_f_pred = np.full(7, 0.5)
-            return OnlineTauFResult(
-                timestamp_us=timestamp_us,
-                q=np.asarray(q),
-                dq=np.asarray(dq),
-                ddq=np.asarray(ddq),
-                tau=tau,
-                tau_id=tau + tau_f_cal,
-                tau_f_cal=tau_f_cal,
-                tau_f_pred=tau_f_pred,
-                tau_ext=tau_f_cal - tau_f_pred,
-            )
-
-    class FakeWrenchEstimator:
-        def __init__(self, _config):
-            pass
-
-        def map_joint_torque(self, _q, tau_ext):
-            return SimpleNamespace(
-                wrench=np.full(6, float(np.asarray(tau_ext)[0]))
-            )
-
-    monkeypatch.setattr("nero_collection.h5_writer.OnlineTauFInference", FakeInference)
-    monkeypatch.setattr(
-        "nero_collection.h5_writer.PinocchioContactWrenchEstimator",
-        FakeWrenchEstimator,
-    )
-    config = CollectionConfig(
-        teleop=TeleopConfig(),
-        output=OutputConfig(directory=tmp_path),
-        dynamics_processing=DynamicsProcessingConfig(
-            enabled=True,
-            state_method="finite_difference",
-            torque_median_window=1,
-            min_samples=3,
-        ),
-        tau_f_inference=TauFInferenceConfig(
-            enabled=True,
-            checkpoint_path=tmp_path / "model.pt",
-        ),
-        robot_states={
-            "q": StateParamConfig(enabled=True),
-            "velocity": StateParamConfig(enabled=True),
-            "acceleration": StateParamConfig(enabled=True),
-            "torque": StateParamConfig(enabled=True),
-        },
-    )
-    buffer = EpisodeBuffer(
-        config=config,
-        arm_names=("main",),
-        sample_rate_hz=100.0,
-    )
-    accepted_count = 0
-    for index in range(5):
-        value = np.full(7, float(index))
-        accepted = buffer.append_teleop(
-            1_000_000 + index * 10_000,
-            {
-                "q_follower": ("q", value),
-                "dq_follower": ("velocity", np.zeros(7)),
-                "ddq_follower": ("acceleration", np.zeros(7)),
-                "tau_follower": ("torque", value + 1.0),
-            },
-        )
-        if accepted is None:
-            continue
-        accepted_count += 1
-        assert set(("tau_f_cal", "tau_f_pred", "tau_ext")) <= set(accepted.values)
-    assert accepted_count == 5
-
-    output = buffer.save(tmp_path / "online.h5")
-    with h5py.File(output, "r") as h5:
-        teleop = h5["teleop"]
-        for name in ("q_follower", "dq_follower", "ddq_follower", "tau_follower"):
-            assert teleop[name].shape == (5, 7)
-            assert teleop[name].attrs["timestamp_path"] == "teleop/timestamp_us"
-        assert h5.attrs["format"] == "factr_multimodal_episode/v7"
-        assert "tau_f" not in teleop
-        assert "tau_f_timestamp_us" not in teleop
-        assert teleop["tau_f_cal"][:] == pytest.approx(np.full((5, 7), 2.0))
-        assert teleop["tau_f_cal"].attrs["timestamp_path"] == "teleop/timestamp_us"
-        assert teleop["tau_ext"].attrs["definition"] == "tau_f_cal - tau_f_pred"
-        assert teleop["tau_f_pred"].shape == (5, 7)
-        assert teleop["tau_ext"].shape == (5, 7)
-        assert teleop["tau_ext"][:] == pytest.approx(np.full((5, 7), 1.5))
-        assert teleop["wrench_ext"].shape == (5, 6)
-        assert teleop["wrench_ext"][:] == pytest.approx(np.full((5, 6), 1.5))
-        assert teleop["wrench_ext"].attrs["state_name"] == "wrench"
-        assert teleop["wrench_ext"].attrs["frame_name"] == "gripper_base"
-        assert teleop["wrench_ext"].attrs["reference_frame"] == "local"
-        assert teleop["wrench_ext"].attrs["wrench_convention"] == "environment_on_tool"
-        assert teleop["tau_f_pred"].attrs["model_horizon"] == 50
-        assert teleop["tau_f_pred"].attrs["model_training_horizon"] == 50
+        assert h5.attrs["format"] == "factr_multimodal_episode/v9"
+        assert new_fields <= set(teleop)
+        assert removed_fields.isdisjoint(teleop)
+        np.testing.assert_allclose(teleop["ddq_kf_causal"], 3.0)
+        np.testing.assert_allclose(teleop["tau_ext_cal_raw"], -7.5)
+        np.testing.assert_allclose(teleop["tau_ext_pred_raw"], -6.0)
+        np.testing.assert_allclose(teleop["tau_ext_cal"], -7.5)
+        np.testing.assert_allclose(teleop["tau_ext_pred"], -6.0)
+        np.testing.assert_allclose(teleop["wrench_cal"], -7.5)
+        np.testing.assert_allclose(teleop["wrench_pred"], -6.0)
         assert (
-            teleop["tau_f_pred"].attrs["model_inference_mode"]
-            == "stateful_recurrent_step"
+            teleop["tau_ext_cal"].attrs["definition"]
+            == "tau_ext_filter(tau_id_filtered + tau_f_pred - tau_follower)"
         )
         assert (
-            teleop["tau_f_pred"].attrs["processing_method"]
-            == "online_stateful_recurrent_single_frame"
+            teleop["tau_ext_pred"].attrs["definition"]
+            == "tau_ext_filter(tau_next_pred - tau_follower)"
         )
-        assert teleop["tau_f_pred"].attrs["model_output_key"] == "tau_f"
+        assert not bool(teleop["tau_ext_cal"].attrs["feedback_source"])
+        assert bool(teleop["tau_ext_pred"].attrs["feedback_source"])
+        assert teleop["tau_next_pred"].attrs["history_warmup_samples"] == 50
+        assert teleop["tau_ext_pred"].attrs["history_warmup_output"] == "zeros"
+        assert teleop["ddq_kf_causal"].attrs["max_gap_s"] == pytest.approx(0.1)
+        assert not bool(teleop["ddq_kf_causal"].attrs["lowpass"])
+        assert not bool(teleop["tau_f_pred"].attrs["lowpass"])
+        assert bool(teleop["tau_id_filtered"].attrs["lowpass"])
+        assert teleop["tau_id_filtered"].attrs["lowpass_cutoff_hz"] == 10.0
+        assert bool(teleop["tau_ext_cal"].attrs["lowpass"])
+        assert teleop["tau_ext_cal"].attrs["moving_average_window"] == 21
+        assert teleop["tau_ext_cal"].attrs["lowpass_cutoff_hz"] == 20.0
+        assert not bool(teleop["tau_ext_cal_raw"].attrs["lowpass"])
 
 
-def test_h5_stores_precomputed_tau_bg_without_running_inference_again(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    h5py = pytest.importorskip("h5py")
-
-    class FakeInference:
-        metadata = TauFCheckpointMetadata(
-            checkpoint_path=tmp_path / "tau_bg.pt",
-            horizon=50,
-            input_keys=("q", "tau"),
-            input_dims={"q": 7, "tau": 7},
-            output_key="tau_bg",
-            output_dim=7,
-            architecture="gru",
-            normalize_mode="gaussian",
-        )
-
-        @staticmethod
-        def estimate_centered(*_args):
-            raise AssertionError("precomputed control result must not be inferred again")
-
-        @staticmethod
-        def reset_episode():
-            pass
-
-    class FakeWrenchEstimator:
-        def __init__(self, _config):
-            pass
-
-        @staticmethod
-        def map_joint_torque(_q, tau_ext):
-            return SimpleNamespace(wrench=np.asarray(tau_ext)[:6])
-
-    monkeypatch.setattr(
-        "nero_collection.h5_writer.PinocchioContactWrenchEstimator",
-        FakeWrenchEstimator,
-    )
-    config = CollectionConfig(
-        teleop=TeleopConfig(),
-        output=OutputConfig(directory=tmp_path),
-        tau_f_inference=TauFInferenceConfig(
-            enabled=True,
-            mode="tau_bg",
-            checkpoint_path=tmp_path / "tau_bg.pt",
-            tau_ext_lowpass_hz=10.0,
-            tau_ext_gate_threshold_nm=(0.5,) * 7,
-        ),
-        robot_states={
-            "q": StateParamConfig(enabled=True),
-            "velocity": StateParamConfig(enabled=True),
-            "acceleration": StateParamConfig(enabled=True),
-            "torque": StateParamConfig(enabled=True),
-        },
-    )
+def test_precomputed_dual_results_are_not_inferred_twice(tmp_path: Path) -> None:
+    inference = _Inference(tmp_path)
     buffer = EpisodeBuffer(
-        config=config,
+        config=_config(tmp_path),
         arm_names=("main",),
         sample_rate_hz=100.0,
-        online_tau_f=FakeInference(),
+        online_tau_ext=inference,
     )
     zeros = np.zeros(7)
-    accepted = buffer.append_teleop(
-        1_000_000,
-        {
-            "q_follower": ("q", zeros),
-            "dq_follower": ("velocity", zeros),
-            "ddq_follower": ("acceleration", zeros),
-            "tau_follower": ("torque", np.full(7, 2.0)),
-            "tau_f_cal": ("torque", zeros),
-            "tau_bg_pred": ("torque", np.full(7, 0.5)),
-            "tau_ext_raw": ("torque", np.full(7, 1.5)),
-            "tau_ext_filtered": ("torque", np.full(7, 1.2)),
-            "tau_ext": ("torque", np.full(7, 1.2)),
-        },
-    )
+    values = {
+        "q_follower": ("q", zeros),
+        "dq_follower": ("velocity", zeros),
+        "tau_follower": ("torque", zeros),
+        "q_cmd": ("q", zeros),
+        "ddq_kf_causal": ("acceleration", zeros),
+        "tau_id": ("torque", zeros),
+        "tau_f_pred": ("torque", zeros),
+        "tau_next_pred": ("torque", zeros),
+        "tau_ext_cal": ("torque", zeros),
+        "tau_ext_pred": ("torque", zeros),
+    }
+
+    accepted = buffer.append_teleop(1_000_000, values)
 
     assert accepted is not None
-    np.testing.assert_allclose(accepted.values["tau_ext"][1], np.full(7, 1.2))
-    output = buffer.save(tmp_path / "tau_bg.h5")
-    with h5py.File(output, "r") as h5:
-        teleop = h5["teleop"]
-        assert "tau_bg_pred" in teleop
-        assert "tau_f_pred" not in teleop
-        np.testing.assert_allclose(teleop["tau_ext"][:], np.full((1, 7), 1.2))
-        assert teleop["tau_ext"].attrs["definition"] == (
-            "tau_follower - tau_bg_pred"
-        )
-        assert teleop["tau_ext"].attrs["external_torque_mode"] == "tau_bg"
-        assert teleop["tau_ext"].attrs["gate_applied"]
-        assert teleop["tau_bg_pred"].attrs["model_output_key"] == "tau_bg"
+    assert inference.calls == 0
+    assert set(values) <= set(accepted.values)

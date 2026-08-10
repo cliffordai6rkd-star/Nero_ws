@@ -9,6 +9,41 @@ from nero_collection.config import StateParamConfig
 
 
 @dataclass
+class CausalTrailingMedian:
+    """Causal trailing median with first-sample padding at startup."""
+
+    window: int
+    history: deque[np.ndarray] = field(default_factory=deque)
+
+    def __post_init__(self) -> None:
+        if self.window < 1 or self.window % 2 == 0:
+            raise ValueError("median window must be a positive odd integer")
+
+    def apply(
+        self,
+        value: np.ndarray,
+        timestamp_us: int | None = None,
+    ) -> np.ndarray:
+        del timestamp_us
+        value = np.asarray(value, dtype=np.float64)
+        if not np.all(np.isfinite(value)):
+            raise ValueError("median filter inputs must be finite")
+        if self.history and value.shape != self.history[0].shape:
+            raise ValueError(
+                f"filter shape changed from {self.history[0].shape} to {value.shape}"
+            )
+        self.history.append(value.copy())
+        while len(self.history) > self.window:
+            self.history.popleft()
+        samples = list(self.history)
+        samples = [samples[0]] * (self.window - len(samples)) + samples
+        return np.median(np.stack(samples, axis=0), axis=0)
+
+    def reset(self) -> None:
+        self.history.clear()
+
+
+@dataclass
 class OnePoleLowPass:
     cutoff_hz: float
     median_window: int = 1
@@ -54,6 +89,57 @@ class OnePoleLowPass:
         self.state = None
         self.previous_timestamp_us = None
         self.history.clear()
+
+
+@dataclass
+class CausalWindowLowPass:
+    """Causal window filter followed by one one-pole low-pass stage.
+
+    ``moving_average`` matches the PINN rollout visualizer: the startup window
+    is padded with the first real sample, then a trailing boxcar average is
+    passed through a one-pole IIR. ``median`` uses the same startup convention
+    through :class:`OnePoleLowPass`.
+    """
+
+    mode: str
+    window: int
+    cutoff_hz: float
+    history: deque[np.ndarray] = field(default_factory=deque)
+    lowpass: OnePoleLowPass = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.mode = str(self.mode).strip().lower()
+        if self.mode not in {"moving_average", "median"}:
+            raise ValueError("filter mode must be moving_average or median")
+        if self.window < 1:
+            raise ValueError("filter window must be positive")
+        if self.mode == "median" and self.window % 2 == 0:
+            raise ValueError("median filter window must be odd")
+        median_window = self.window if self.mode == "median" else 1
+        self.lowpass = OnePoleLowPass(self.cutoff_hz, median_window)
+
+    def apply(self, value: np.ndarray, timestamp_us: int) -> np.ndarray:
+        value = np.asarray(value, dtype=np.float64)
+        if not np.all(np.isfinite(value)):
+            raise ValueError("filter inputs must be finite")
+        if self.mode == "median":
+            return self.lowpass.apply(value, timestamp_us)
+
+        if self.history and value.shape != self.history[0].shape:
+            raise ValueError(
+                f"filter shape changed from {self.history[0].shape} to {value.shape}"
+            )
+        self.history.append(value.copy())
+        while len(self.history) > self.window:
+            self.history.popleft()
+        samples = list(self.history)
+        samples = [samples[0]] * (self.window - len(samples)) + samples
+        averaged = np.mean(np.stack(samples, axis=0), axis=0)
+        return self.lowpass.apply(averaged, timestamp_us)
+
+    def reset(self) -> None:
+        self.history.clear()
+        self.lowpass.reset()
 
 
 @dataclass

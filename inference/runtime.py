@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 import time
 from collections import deque
 from dataclasses import replace
@@ -21,7 +22,7 @@ from nero_collection.cameras import CameraFrame, CameraManager, CameraVisualizer
 from nero_collection.config import CollectionConfig, load_config
 from nero_collection.contact_wrench import PinocchioContactWrenchEstimator
 from nero_collection.filters import OnePoleLowPass
-from nero_collection.tau_f_inference import OnlineTauFInference
+from nero_collection.tau_ext_inference import OnlineTauExtInference
 from nero_collection.time_utils import now_us
 
 
@@ -40,7 +41,7 @@ class NeroInferenceRuntime:
         pipeline: NeroInferencePipeline | None = None,
         arm: Any | None = None,
         cameras: CameraManager | None = None,
-        online_tau_f: OnlineTauFInference | None = None,
+        online_tau_ext: OnlineTauExtInference | None = None,
         wrench_estimator: PinocchioContactWrenchEstimator | None = None,
         wrench_plotter: InferenceWrenchPlotter | None = None,
         continuous_state_stream: bool | None = None,
@@ -70,8 +71,8 @@ class NeroInferenceRuntime:
             visualizer=CameraVisualizer.from_config(collection.cameras),
         )
         self.pipeline = pipeline or NeroInferencePipeline(config)
-        self.online_tau_f = online_tau_f or OnlineTauFInference(
-            collection.tau_f_inference,
+        self.online_tau_ext = online_tau_ext or OnlineTauExtInference(
+            collection.tau_ext_inference,
             collection.realtime_plot.inverse_dynamics,
             collection.dynamics_processing,
             collection.robot_states,
@@ -104,6 +105,11 @@ class NeroInferenceRuntime:
         self._started = False
         self._episode_index = 0
         protection = config.observation_protection
+        online_tau_ext_config = getattr(self.online_tau_ext, "config", None)
+        tau_ext_filter = getattr(online_tau_ext_config, "tau_ext_filter", None)
+        self._tau_ext_post_filter_enabled = bool(
+            getattr(tau_ext_filter, "enabled", False)
+        )
         self._wrench_filter = OnePoleLowPass(
             protection.wrench_lowpass_cutoff_hz,
             protection.wrench_median_window,
@@ -117,12 +123,15 @@ class NeroInferenceRuntime:
             round(1.0e6 / sample_rate_hz)
         ) if np.isfinite(sample_rate_hz) and sample_rate_hz > 0.0 else 10_000
         self._last_state_stream_rollover_count = 0
+        self._q_cmd_lock = threading.Lock()
+        self._q_cmd_history: deque[tuple[int, np.ndarray]] = deque(maxlen=4096)
         self._state_stream = ContinuousInferenceStateStream(
             self.arm,
-            self.online_tau_f,
+            self.online_tau_ext,
             self.wrench_estimator,
             wrench_processor=self._process_stream_wrench,
             on_sample=self._on_stream_sample,
+            q_cmd_provider=self._get_q_cmd,
         )
         self._observation_warmup_started_us: int | None = None
         self._inference_control_mode_ready = False
@@ -130,11 +139,15 @@ class NeroInferenceRuntime:
     def _process_stream_wrench(
         self,
         raw_wrench: np.ndarray,
+        wrench_from_filtered_tau: np.ndarray,
         timestamp_us: int,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Filter/gate each CAN-derived wrench before it enters DP history."""
-        wrench = np.asarray(raw_wrench, dtype=np.float64).reshape(-1)
-        if self.config.observation_protection.enabled:
+        wrench = np.asarray(wrench_from_filtered_tau, dtype=np.float64).reshape(-1)
+        if (
+            self.config.observation_protection.enabled
+            and not self._tau_ext_post_filter_enabled
+        ):
             wrench = self._wrench_filter.apply(wrench, int(timestamp_us))
         processed_wrench = self._apply_dp_contact_gate_for_visualization(wrench)
         if self.config.wrench_visualization.enabled:
@@ -186,10 +199,19 @@ class NeroInferenceRuntime:
             if not self.config.observation_protection.enabled:
                 self._prepare_inference_control_mode()
                 self._inference_control_mode_ready = True
+            initial_state = self._wait_for_valid_aligned_state()
+            self._set_q_cmd(
+                initial_state.q,
+                timestamp_us=int(
+                    getattr(initial_state, "q_timestamp_us", 0)
+                    or getattr(initial_state, "timestamp_us", 0)
+                    or now_us()
+                ),
+            )
             self.cameras.start()
             self.wrench_plotter.start()
-            self.online_tau_f.warm_up()
-            self._reset_online_tau_f_episode()
+            self.online_tau_ext.warm_up()
+            self._reset_online_tau_ext_episode()
             self.pipeline.reset()
             self._reset_observation_protection()
             self._start_state_stream()
@@ -332,7 +354,7 @@ class NeroInferenceRuntime:
     def _end_episode_state(self) -> None:
         self._stop_state_stream(clear=True)
         self.pipeline.reset()
-        self._reset_online_tau_f_episode()
+        self._reset_online_tau_ext_episode()
         self.wrench_plotter.clear_history()
         self._latest_frame = None
         self._reset_observation_protection()
@@ -389,12 +411,8 @@ class NeroInferenceRuntime:
             command.maximum_can_frame_gap_s,
         )
 
-    def _reset_online_tau_f_episode(self) -> None:
-        reset_episode = getattr(self.online_tau_f, "reset_episode", None)
-        if callable(reset_episode):
-            reset_episode()
-        else:
-            self.online_tau_f.reset_recurrent_state()
+    def _reset_online_tau_ext_episode(self) -> None:
+        self.online_tau_ext.reset_episode()
 
     def _prepare_inference_control_mode(self) -> None:
         if not self.command_enabled or not self.config.predictor.enabled:
@@ -484,7 +502,15 @@ class NeroInferenceRuntime:
             if maximum_error <= command.reset_error_limit_rad:
                 self.arm.set_follower_mode()
                 self.arm.enable()
-                self._wait_for_valid_aligned_state()
+                final_state = self._wait_for_valid_aligned_state()
+                self._set_q_cmd(
+                    final_state.q,
+                    timestamp_us=int(
+                        getattr(final_state, "q_timestamp_us", 0)
+                        or getattr(final_state, "timestamp_us", 0)
+                        or now_us()
+                    ),
+                )
                 return
             if time.monotonic() >= deadline:
                 raise RuntimeError(
@@ -769,8 +795,9 @@ class NeroInferenceRuntime:
         )
         if self.command_enabled:
             if self.config.predictor.enabled:
+                q_cmd = np.asarray(sample.q, dtype=np.float64)
                 self.arm.command_joint_impedance(
-                    q=sample.q,
+                    q=q_cmd,
                     v_des=np.zeros(7, dtype=np.float64),
                     kp=np.zeros(7, dtype=np.float64),
                     kd=np.asarray(self.config.runtime.command_kd, dtype=np.float64),
@@ -781,8 +808,33 @@ class NeroInferenceRuntime:
                     raise RuntimeError(
                         "direct IK pipeline did not produce a joint-position command"
                     )
-                self.arm.command_joint_positions(output.joint_position_command)
+                q_cmd = np.asarray(output.joint_position_command, dtype=np.float64)
+                self.arm.command_joint_positions(q_cmd)
+            self._set_q_cmd(q_cmd)
         return output
+
+    def _get_q_cmd(self, timestamp_us: int) -> np.ndarray | None:
+        with self._q_cmd_lock:
+            if not self._q_cmd_history:
+                return None
+            for command_timestamp_us, q_cmd in reversed(self._q_cmd_history):
+                if command_timestamp_us <= int(timestamp_us):
+                    return q_cmd.copy()
+            return self._q_cmd_history[0][1].copy()
+
+    def _set_q_cmd(
+        self,
+        q_cmd: np.ndarray,
+        *,
+        timestamp_us: int | None = None,
+    ) -> None:
+        value = np.asarray(q_cmd, dtype=np.float64).reshape(-1)
+        if value.shape != (7,) or not np.all(np.isfinite(value)):
+            raise ValueError(f"q_cmd must be a finite seven-joint vector; got {value}")
+        with self._q_cmd_lock:
+            self._q_cmd_history.append(
+                (int(now_us() if timestamp_us is None else timestamp_us), value.copy())
+            )
 
     def _apply_dp_contact_gate_for_visualization(
         self,

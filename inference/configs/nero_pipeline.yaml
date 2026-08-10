@@ -54,7 +54,7 @@ dp_sampling:
 
 robot:
   urdf_path: ../../urdf/nero/nero_with_gripper.urdf
-  frame_name: gripper_base
+  frame_name: gripper_tcp
   # DP action 所属 frame；启用 predictor 时 checkpoint 内配置优先。
   action_frame_name: link7
   locked_joint_names: [gripper, gripper_joint1, gripper_joint2]
@@ -77,7 +77,8 @@ observation_protection:
   # 启动及每次 episode 复位后保持静止，持续采样 tau_f/wrench，满 2 秒才允许策略推理。
   enabled: true
   warmup_duration_s: 2.0
-  # 5 点中值抑制孤立尖峰，再以一阶因果低通平滑输入 checkpoint 的 wrench。
+  # tau_ext_filter 已启用时不再重复滤波 wrench；下面参数只作为关闭
+  # tau_ext_filter 时的后备观测滤波配置。
   wrench_median_window: 5
   wrench_lowpass_cutoff_hz: 5.0
 
@@ -110,7 +111,7 @@ torque_filter:
 
 wrench_visualization:
   # 独立进程绘制四张图：原始/处理后的合力和六维分量，不阻塞控制循环。
-  # 处理曲线使用 observation_protection 的低通和 DP checkpoint 的接触门控。
+  # 处理曲线使用 tau_ext_filter 的结果和 DP checkpoint 的接触门控。
   enabled: true
   window_s: 10.0
   update_rate_hz: 20.0

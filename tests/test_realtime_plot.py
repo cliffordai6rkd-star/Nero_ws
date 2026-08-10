@@ -22,6 +22,7 @@ from nero_collection.contact_wrench import (
 from nero_collection.contact_wrench import JointTorqueResidualEstimate
 from nero_collection.realtime_dynamics import CenteredThreePointTorqueResidualStream
 from nero_collection.realtime_plot import (
+    _MatplotlibPlotWindow,
     RealtimeJointPlotter,
     SlidingJointBuffer,
 )
@@ -40,7 +41,7 @@ def test_realtime_plot_config_defaults_to_ten_second_window() -> None:
         "gripper_joint2",
     )
     assert config.inverse_dynamics.manifest_path is None
-    assert config.wrench_mapping.frame_name == "gripper_base"
+    assert config.wrench_mapping.frame_name == "gripper_tcp"
     assert config.wrench_mapping.reference_frame == "local"
     assert config.wrench_mapping.damping == pytest.approx(0.02)
 
@@ -102,47 +103,56 @@ def test_sliding_joint_buffer_keeps_only_latest_ten_seconds() -> None:
         buffer.append(
             timestamp_s * 1_000_000,
             joints,
-            wrench,
             joints * 3,
-            joints * 4,
+            wrench,
+            wrench * 4,
         )
 
-    time_s, tau_f_cal, wrench_ext, tau, tau_ext = buffer.arrays()
+    time_s, tau_ext_cal, tau_ext_pred, wrench_cal, wrench_pred = buffer.arrays()
 
     assert time_s == pytest.approx([-6.0, 0.0])
-    assert tau_f_cal.shape == (2, 7)
-    assert np.allclose(tau_f_cal[:, 0], [2.0, 3.0])
-    assert wrench_ext.shape == (2, 6)
-    assert np.allclose(wrench_ext[:, 0], [4.0, 6.0])
-    assert np.allclose(tau[:, 0], [6.0, 9.0])
-    assert np.allclose(tau_ext[:, 0], [8.0, 12.0])
+    assert tau_ext_cal.shape == (2, 7)
+    assert np.allclose(tau_ext_cal[:, 0], [2.0, 3.0])
+    assert np.allclose(tau_ext_pred[:, 0], [6.0, 9.0])
+    assert wrench_cal.shape == (2, 6)
+    assert np.allclose(wrench_cal[:, 0], [4.0, 6.0])
+    assert np.allclose(wrench_pred[:, 0], [16.0, 24.0])
 
 
 def test_sliding_joint_buffer_rejects_non_seven_dimensional_data() -> None:
     buffer = SlidingJointBuffer(window_s=10.0)
 
-    with pytest.raises(RuntimeError, match="7D tau_f_cal"):
-        buffer.append(1, np.zeros(6), np.zeros(6), np.zeros(7), np.zeros(7))
+    with pytest.raises(RuntimeError, match="7D tau_ext_cal"):
+        buffer.append(1, np.zeros(6), np.zeros(7), np.zeros(6), np.zeros(6))
 
-    with pytest.raises(RuntimeError, match="7D tau_ext"):
-        buffer.append(1, np.zeros(7), np.zeros(6), np.zeros(7), np.zeros(6))
+    with pytest.raises(RuntimeError, match="7D tau_ext_pred"):
+        buffer.append(1, np.zeros(7), np.zeros(6), np.zeros(6), np.zeros(6))
 
-    with pytest.raises(RuntimeError, match="6D wrench_ext"):
-        buffer.append(1, np.zeros(7), np.zeros(7), np.zeros(7), np.zeros(7))
+    with pytest.raises(RuntimeError, match="6D wrench_cal"):
+        buffer.append(1, np.zeros(7), np.zeros(7), np.zeros(7), np.zeros(6))
 
 
 def test_sliding_joint_buffer_clear_removes_all_history() -> None:
     buffer = SlidingJointBuffer(window_s=10.0)
-    buffer.append(1, np.ones(7), np.ones(6), np.ones(7), np.ones(7))
+    buffer.append(1, np.ones(7), np.ones(7), np.ones(6), np.ones(6))
 
     buffer.clear()
 
-    time_s, tau_f_cal, wrench_ext, tau, tau_ext = buffer.arrays()
+    time_s, tau_ext_cal, tau_ext_pred, wrench_cal, wrench_pred = buffer.arrays()
     assert time_s.shape == (0,)
-    assert tau_f_cal.shape == (0, 7)
-    assert wrench_ext.shape == (0, 6)
-    assert tau.shape == (0, 7)
-    assert tau_ext.shape == (0, 7)
+    assert tau_ext_cal.shape == (0, 7)
+    assert tau_ext_pred.shape == (0, 7)
+    assert wrench_cal.shape == (0, 6)
+    assert wrench_pred.shape == (0, 6)
+
+
+def test_realtime_plot_places_tau_left_and_wrench_right() -> None:
+    assert tuple(item[0] for item in _MatplotlibPlotWindow._PLOTS) == (
+        "tau_ext_cal",
+        "wrench_cal",
+        "tau_ext_pred",
+        "wrench_pred",
+    )
 
 
 def test_damped_wrench_maps_joint_residual_and_reports_nullspace_error() -> None:
@@ -428,10 +438,8 @@ def test_realtime_plot_process_accepts_sample_and_stops(monkeypatch: pytest.Monk
     )
     values = {
         "q_follower": ("q", np.linspace(-0.5, 0.5, 7)),
-        "tau_f_cal": ("torque", np.arange(7, dtype=np.float64)),
-        "tau_f_pred": ("torque", np.arange(7, dtype=np.float64) * 2.0),
-        "tau_follower": ("torque", np.arange(7, dtype=np.float64) * 3.0),
-        "tau_ext": ("torque", np.arange(7, dtype=np.float64) * 4.0),
+        "tau_ext_cal": ("torque", np.arange(7, dtype=np.float64)),
+        "tau_ext_pred": ("torque", np.arange(7, dtype=np.float64) * 2.0),
     }
 
     plotter.start()

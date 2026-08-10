@@ -22,7 +22,7 @@ from nero_collection.teleop.master_slave import (
     MasterSlaveTeleop,
     TeleopSafetyError,
 )
-from nero_collection.tau_f_inference import OnlineTauFResult
+from nero_collection.tau_ext_inference import OnlineTauExtResult
 
 
 def test_reset_behavior_is_enabled_by_default() -> None:
@@ -185,6 +185,10 @@ class FakeBilateralController:
     def activate(self, leader: ArmState, follower: ArmState) -> None:
         self.activations.append((leader, follower))
 
+    @staticmethod
+    def follower_target(leader: ArmState, follower: ArmState) -> np.ndarray:
+        return follower.q + leader.q
+
     def compute(
         self,
         leader: ArmState,
@@ -272,22 +276,25 @@ def test_learned_tau_ext_is_used_once_for_feedback_and_teleop_values() -> None:
     class Inference:
         def __init__(self) -> None:
             self.calls = 0
+            self.timestamps: list[int] = []
 
-        def estimate_aligned_raw(self, timestamp_us, q, dq, ddq, tau):
+        def estimate_aligned(self, timestamp_us, q, dq, tau, q_cmd):
             self.calls += 1
-            tau_ext = np.linspace(0.1, 0.7, 7)
-            return OnlineTauFResult(
+            self.timestamps.append(int(timestamp_us))
+            tau_ext_cal = np.linspace(0.1, 0.7, 7)
+            tau_ext_pred = np.linspace(0.2, 0.8, 7)
+            return OnlineTauExtResult(
                 timestamp_us=timestamp_us,
                 q=np.asarray(q),
                 dq=np.asarray(dq),
-                ddq=np.asarray(ddq),
+                ddq_kf_causal=np.zeros(7),
                 tau=np.asarray(tau),
                 tau_id=np.zeros(7),
-                tau_f_cal=np.zeros(7),
+                tau_id_filtered=np.zeros(7),
                 tau_f_pred=np.ones(7),
-                tau_ext=tau_ext,
-                tau_ext_raw=tau_ext + 0.2,
-                tau_ext_filtered=tau_ext + 0.1,
+                tau_next_pred=np.ones(7) * 2.0,
+                tau_ext_cal=tau_ext_cal,
+                tau_ext_pred=tau_ext_pred,
             )
 
     teleop = _teleop_with_fakes(
@@ -296,7 +303,7 @@ def test_learned_tau_ext_is_used_once_for_feedback_and_teleop_values() -> None:
         BiasedFollower(np.zeros(7)),
     )
     inference = Inference()
-    teleop.online_tau_f = inference
+    teleop.online_tau_ext = inference
     teleop._bilateral_active = True
     teleop._last_bilateral_step_t = None
 
@@ -304,15 +311,98 @@ def test_learned_tau_ext_is_used_once_for_feedback_and_teleop_values() -> None:
 
     controller = teleop.pairs[0].controller
     assert inference.calls == 1
+    assert inference.timestamps == [1]
     np.testing.assert_allclose(
         controller.tau_ext_overrides[-1],
-        values["tau_ext"][1],
+        values["tau_ext_pred"][1],
     )
-    np.testing.assert_allclose(values["tau_ext_raw"][1], np.linspace(0.3, 0.9, 7))
+    np.testing.assert_allclose(values["tau_ext_pred"][1], np.linspace(0.2, 0.8, 7))
+    assert "tau_ext" not in values
+
+
+def test_learned_tau_ext_feedback_stays_zero_during_history_warmup() -> None:
+    class Inference:
+        def estimate_aligned(self, timestamp_us, q, dq, tau, q_cmd):
+            return OnlineTauExtResult(
+                timestamp_us=timestamp_us,
+                q=np.asarray(q),
+                dq=np.asarray(dq),
+                ddq_kf_causal=np.zeros(7),
+                tau=np.asarray(tau),
+                tau_id=np.zeros(7),
+                tau_id_filtered=np.zeros(7),
+                tau_f_pred=np.ones(7),
+                tau_next_pred=np.ones(7) * 2.0,
+                tau_ext_cal=np.ones(7) * 3.0,
+                tau_ext_pred=np.ones(7) * 4.0,
+                history_ready=False,
+            )
+
+    teleop = _teleop_with_fakes(
+        CommandConfig(),
+        FakeLeader(),
+        BiasedFollower(np.zeros(7)),
+    )
+    teleop.online_tau_ext = Inference()
+    teleop._bilateral_active = True
+    teleop._last_bilateral_step_t = None
+
+    teleop.teleop_step()
+
     np.testing.assert_allclose(
-        values["tau_ext_filtered"][1],
-        np.linspace(0.2, 0.8, 7),
+        teleop.pairs[0].controller.tau_ext_overrides[-1],
+        0.0,
     )
+
+
+def test_dual_tau_ext_uses_limited_follower_q_cmd_before_inference() -> None:
+    class Inference:
+        def __init__(self) -> None:
+            self.q_cmds: list[np.ndarray] = []
+
+        def estimate_aligned(
+            self,
+            timestamp_us,
+            q,
+            dq,
+            tau,
+            q_cmd,
+        ):
+            self.q_cmds.append(np.asarray(q_cmd, dtype=np.float64).copy())
+            zeros = np.zeros(7)
+            return OnlineTauExtResult(
+                timestamp_us=timestamp_us,
+                q=np.asarray(q),
+                dq=np.asarray(dq),
+                ddq_kf_causal=zeros,
+                tau=np.asarray(tau),
+                tau_id=zeros,
+                tau_id_filtered=zeros,
+                tau_f_pred=zeros,
+                tau_next_pred=zeros,
+                tau_ext_cal=zeros,
+                tau_ext_pred=zeros,
+            )
+
+    leader = FakeLeader()
+    leader.q.fill(0.2)
+    follower = BiasedFollower(np.zeros(7))
+    teleop = _teleop_with_fakes(
+        CommandConfig(joint_step_limit_rad=0.08),
+        leader,
+        follower,
+    )
+    inference = Inference()
+    teleop.online_tau_ext = inference
+    teleop._bilateral_active = True
+    teleop._last_bilateral_step_t = None
+
+    _, values = teleop.teleop_step()
+
+    assert len(inference.q_cmds) == 1
+    np.testing.assert_allclose(inference.q_cmds[0], np.full(7, 0.08))
+    np.testing.assert_allclose(values["q_cmd"][1], inference.q_cmds[0])
+    assert len(teleop.pairs[0].controller.tau_ext_overrides) == 1
 
 
 def test_reset_uses_five_sample_mean_to_fine_tune(monkeypatch: pytest.MonkeyPatch) -> None:

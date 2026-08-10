@@ -269,6 +269,15 @@
     <parent link="gripper_flange"/>
     <child link="gripper_base"/>
   </joint>
+  <!-- Fixed tool-center point at the midpoint between the closed fingertips.
+       The finger joints start 0.138 m from gripper_base and the finger meshes
+       extend another 0.0765 m along the gripper's +Z axis. -->
+  <link name="gripper_tcp"/>
+  <joint name="gripper_tcp_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0 0 0.2145"/>
+    <parent link="gripper_base"/>
+    <child link="gripper_tcp"/>
+  </joint>
   <link name="gripper_link"/>
   <joint name="gripper" type="prismatic">
     <origin rpy="0 0 0" xyz="0 0 0"/>

@@ -134,7 +134,7 @@ V3 运行时数据流为：
 ```text
 image + wrench history -> DP checkpoint -> action_target (xyz + xyzw)
 q/v/a/tau/wrench history + future action -> world_model_v3 -> future q/v/a/tau
-future q/v/a/tau -> RNEA tau_id - tau - frozen tau_f -> tau_ext
+future q/v/a/tau -> RNEA tau_id + frozen tau_f - tau -> tau_ext_cal
 tau_ext -> damped J(q)^T inverse -> future target wrench_ext
 latest action pose + target f_ext + measured f_ext -> OSC-QP -> tau_command
 ```
@@ -147,7 +147,7 @@ DP physical action -> V4 checkpoint action normalization
 q/tau history + normalized future action -> world_model_v4 -> future q/tau
 [observed q history, predicted future q]
   -> causal q mean/LPF -> difference -> dq LPF -> difference -> ddq LPF
-future q/dq/ddq/tau -> RNEA tau_id - tau - frozen tau_f -> tau_ext
+future q/dq/ddq/tau -> RNEA tau_id + frozen tau_f - tau -> tau_ext_cal
 tau_ext -> damped J(q)^T inverse -> future target wrench_ext
 latest action pose + target f_ext + measured f_ext -> OSC-QP -> tau_command
 ```
@@ -193,7 +193,7 @@ follower CAN joint groups + motor states
   -> 与数采相同的 delayed state timeline
      (15 ms delay, 100 Hz, q mean + q/dq/ddq causal low-pass)
   -> aligned q/dq/ddq/tau
-  -> tau-f estimate_aligned_raw(q,dq,ddq,tau)
+  -> tau-ext estimate_aligned(timestamp,q,dq,tau,q_cmd)
   -> tau_id - tau - tau_f_pred
   -> tau_ext
   -> damped J(q)^T inverse
@@ -206,7 +206,8 @@ follower CAN joint groups + motor states
 isolated hardware process
   pyagx CAN sampler -> delayed/aligned q,dq,ddq,tau timeline
                     -> shared state ring (4096 aligned states)
-inference process  <- ordered ring drain -> stateful tau_f -> tau_ext -> wrench
+inference process  <- ordered ring drain -> causal KF + dual fixed windows
+                   -> tau_ext_cal_raw -> one tau_ext filter -> wrench_cal
                    -> bounded wrench history (4096 canonical samples)
 main runtime       <- latest state for control
                    <- drain all accumulated wrench samples for DP history
@@ -216,42 +217,40 @@ main runtime       <- latest state for control
 `timestamp_us`；`acquired_timestamp_us` 只用于检查状态是否过期。PyAgx SDK、CAN parser、
 状态采样和机械臂指令只存在于独立硬件子进程。主循环忙于 DP 推理或 minimum-jerk 动作执行
 时，子进程仍持续采样，共享环保留中间状态；推理状态线程恢复运行后按时间顺序排空共享环，
-推进 tau-f recurrent state，并把期间产生的每一帧 wrench 补回 open-loop 的带时间戳 CAN 历史。相机帧仍由
+推进 tau-f/tau-next 两个 50 帧滑动窗口，并把期间产生的每一帧 wrench 补回 open-loop 的带时间戳 CAN 历史。相机帧仍由
 `CameraManager` 连续采集，DP 在形成完整窗口时再按相机时间戳与 CAN 历史对齐；因此
 不会用重复 CAN 帧填充 checkpoint 所需的历史（例如一张图像对应 8 个互不重复的 CAN
 样本）。
 
 实机 backend 默认启用该流；`mock` backend 默认保留同步读取，仅用于测试和离线回放。
-episode reset、startup recovery 和 shutdown 会先停止并清空连续流，再重置 tau-f、滤波器
-与 DP 历史，避免复位运动污染下一段 recurrent 输入。CAN watchdog 或 tau-f/wrench
+episode reset、startup recovery 和 shutdown 会先停止并清空连续流，再重置两个 torque 窗口、因果 Kalman
+与 DP 历史，避免复位运动污染下一段窗口输入。CAN watchdog 或 tau-ext/wrench
 计算异常会记录为 stream fault，主循环随后 fail-closed，而不是继续使用旧状态。
 
 相机预览与状态流完全隔离：每台真实 V4L2 相机由独立 `spawn` 子进程持续采集，并将配置中
 `visualize: true` 的最新 RGB 帧直接投递给 GUI 子进程。GUI 子进程拥有唯一的 OpenCV 窗口
 和事件循环，即使主推理进程正在执行模型，预览仍可刷新。数据与预览队列都有界且非阻塞，
 消费者跟不上时只丢弃旧帧；相机帧不会被预览进程重新用于 DP 对齐，
-因此不会阻塞或改变 `q/dq/ddq/tau_f/wrench` 的计算时间线。数采和推理都复用同一个
+因此不会阻塞或改变 `q/dq/ddq_kf_causal/tau_ext/wrench` 的计算时间线。数采和推理都复用同一个
 `configs/master_slave_can.yaml` 相机配置；当前 `wrist` 预览默认开启。
 
 在线 runtime 的 state-alignment 参数全部读取 `runtime.collection_config` 的
 `teleop.command.state_alignment_delay_s/sample_rate_hz` 和 `robot_states`，与数采
-`MasterSlaveTeleop.start()` 使用同一组参数。在线不会再从 q 做第二套三点差分；特别是
-PINN/OSC-QP 收到的 `dq/ddq` 就是数采 H5 中 `dq_follower/ddq_follower` 的同源值。
-episode 复位会重建 arm delayed timeline，并清空 tau-f recurrent、三点流和 tau-id filter，
-等待新的 aligned q/dq/ddq/tau 有效后才恢复推理。
-
-当 collection 配置设置 `tau_f_inference.enabled: false` 时，不加载 checkpoint，
-`tau_f_pred` 使用七维全零兼容值，因此 `tau_ext = tau_id - tau - 0`；在线推理、world-model
-wrench 适配和启用中的数采实时力图均保持同一字段与时间线。
+`MasterSlaveTeleop.start()` 使用同一组参数。外力矩 RNEA 不使用普通状态字段 `ddq_follower`，
+而是由与 PINN offline forward pass 一致的因果 Kalman 从 aligned `q/dq` 估计 `ddq_kf_causal`。
+episode 复位会重建 arm delayed timeline，并清空两个固定窗口、Kalman 状态和两条 tau_ext 滤波状态，等待新的 aligned
+`q/dq/tau/q_cmd` 有效后才恢复推理。collection runtime 要求 `tau_ext_inference.enabled: true`
+且同时配置 `tau_f` 与 `tau_next` checkpoint，不再提供七维零预测兼容路径。
 
 DP 的 observation 也按 checkpoint 时间契约取样：只把新相机 timestamp 加入图像时间线，
 以训练配置的 `timestamp_step_sec=0.1` 选择 10 Hz image anchors；每个 anchor 从带时间戳的
 wrench ring buffer 中按 `0.1 / wrench_history_steps` 选择对应高频历史。控制循环重复使用
 同一相机帧时不会再重复写入 DP observation history。
 
-启用 `wrench_visualization` 后，独立窗口显示四张在线曲线：第一行是 Jacobian 反解后的
-原始 wrench 合力和六个分量，第二行是经过 `observation_protection` 低通以及 DP
-checkpoint 接触门控后的物理量合力和六个分量。接触门控参数（阈值、force dims、历史
+启用 `wrench_visualization` 后，独立窗口显示四张在线曲线：第一行是 raw tau_ext 经 Jacobian
+反解后的 wrench 合力和六个分量，第二行是一次 tau_ext 滤波后映射、再经过 DP
+checkpoint 接触门控后的物理量合力和六个分量。启用 `tau_ext_filter` 时，
+`observation_protection` 只负责启动预热，不再重复低通 wrench；关闭 `tau_ext_filter` 后才启用其后备 wrench 滤波。接触门控参数（阈值、force dims、历史
 reducer）从 DP checkpoint 恢复；当前 checkpoint 使用 0.6 N、前三个线性力分量和 mean
 历史 reducer。DP 模型内部仍在归一化之后执行同一个门控，避免把物理零值提前到
 normalizer 之前。

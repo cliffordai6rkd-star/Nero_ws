@@ -9,7 +9,10 @@ from typing import Any, Callable
 
 import numpy as np
 
-from nero_collection.tau_f_inference import OnlineTauFInference, OnlineTauFResult
+from nero_collection.tau_ext_inference import (
+    OnlineTauExtInference,
+    OnlineTauExtResult,
+)
 from nero_collection.time_utils import now_us
 
 
@@ -18,7 +21,7 @@ log = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class ContinuousInferenceSample:
-    """One timestamp-consistent state/tau_f sample produced by the CAN stream."""
+    """One timestamp-consistent state/tau_ext sample produced by the CAN stream."""
 
     timestamp_us: int
     acquired_timestamp_us: int
@@ -26,7 +29,7 @@ class ContinuousInferenceSample:
     dq: np.ndarray
     ddq: np.ndarray
     tau: np.ndarray
-    tau_result: OnlineTauFResult
+    tau_result: OnlineTauExtResult
     raw_wrench: np.ndarray
     wrench: np.ndarray
     processed_wrench: np.ndarray
@@ -38,13 +41,14 @@ class ContinuousInferenceStateStream:
     def __init__(
         self,
         arm: Any,
-        online_tau_f: OnlineTauFInference,
+        online_tau_ext: OnlineTauExtInference,
         wrench_estimator: Any,
         *,
         on_sample: Callable[[ContinuousInferenceSample], None] | None = None,
         wrench_processor: Callable[
-            [np.ndarray, int], tuple[np.ndarray, np.ndarray]
+            [np.ndarray, np.ndarray, int], tuple[np.ndarray, np.ndarray]
         ] | None = None,
+        q_cmd_provider: Callable[[int], np.ndarray | None] | None = None,
         history_size: int = 4096,
         poll_interval_s: float = 0.001,
     ) -> None:
@@ -53,10 +57,11 @@ class ContinuousInferenceStateStream:
         if not np.isfinite(poll_interval_s) or poll_interval_s <= 0.0:
             raise ValueError("state stream poll_interval_s must be positive and finite")
         self.arm = arm
-        self.online_tau_f = online_tau_f
+        self.online_tau_ext = online_tau_ext
         self.wrench_estimator = wrench_estimator
         self.on_sample = on_sample
         self.wrench_processor = wrench_processor
+        self.q_cmd_provider = q_cmd_provider
         self.history_size = int(history_size)
         self.poll_interval_s = float(poll_interval_s)
         self._samples: deque[ContinuousInferenceSample] = deque(maxlen=self.history_size)
@@ -204,7 +209,7 @@ class ContinuousInferenceStateStream:
         candidates: list[tuple[Any, int, int]] = []
         newest_timestamp_us = self._last_timestamp_us
         for state in states:
-            vectors = (state.q, state.dq, state.ddq, state.torque)
+            vectors = (state.q, state.dq, state.torque)
             if not all(
                 np.asarray(value, dtype=np.float64).shape == (7,)
                 and np.all(np.isfinite(value))
@@ -227,40 +232,33 @@ class ContinuousInferenceStateStream:
         if not candidates:
             return ()
 
-        batch_estimate = getattr(
-            self.online_tau_f,
-            "estimate_aligned_raw_batch",
-            None,
+        q_cmds: list[np.ndarray] = []
+        for _, timestamp_us, _ in candidates:
+            q_cmd = (
+                None
+                if self.q_cmd_provider is None
+                else self.q_cmd_provider(timestamp_us)
+            )
+            q_cmd = np.asarray(q_cmd, dtype=np.float64).reshape(-1)
+            if q_cmd.shape != (7,) or not np.all(np.isfinite(q_cmd)):
+                raise RuntimeError(
+                    "tau_ext inference requires a finite seven-joint q_cmd"
+                )
+            q_cmds.append(q_cmd.copy())
+
+        tau_results = tuple(
+            self.online_tau_ext.estimate_aligned(
+                timestamp_us,
+                state.q,
+                state.dq,
+                state.torque,
+                q_cmds[index],
+            )
+            for index, (state, timestamp_us, _) in enumerate(candidates)
         )
-        if callable(batch_estimate):
-            tau_results = tuple(
-                batch_estimate(
-                    tuple(
-                        (
-                            timestamp_us,
-                            state.q,
-                            state.dq,
-                            state.ddq,
-                            state.torque,
-                        )
-                        for state, timestamp_us, _ in candidates
-                    )
-                )
-            )
-        else:
-            tau_results = tuple(
-                self.online_tau_f.estimate_aligned_raw(
-                    timestamp_us,
-                    state.q,
-                    state.dq,
-                    state.ddq,
-                    state.torque,
-                )
-                for state, timestamp_us, _ in candidates
-            )
         if len(tau_results) != len(candidates):
             raise RuntimeError(
-                "tau_f batch result length does not match aligned state batch"
+                "tau_ext result length does not match aligned state batch"
             )
         samples = []
         for (_, timestamp_us, acquired_timestamp_us), tau_result in zip(
@@ -281,24 +279,45 @@ class ContinuousInferenceStateStream:
         self,
         timestamp_us: int,
         acquired_timestamp_us: int,
-        tau_result: OnlineTauFResult,
+        tau_result: OnlineTauExtResult,
     ) -> ContinuousInferenceSample:
         wrench_estimate = self.wrench_estimator.map_joint_torque(
             tau_result.q,
-            tau_result.tau_ext,
+            tau_result.tau_ext_cal,
         )
-        raw_wrench = np.asarray(wrench_estimate.wrench, dtype=np.float64).reshape(-1)
-        if raw_wrench.shape != (6,) or not np.all(np.isfinite(raw_wrench)):
+        wrench_from_filtered_tau = np.asarray(
+            wrench_estimate.wrench,
+            dtype=np.float64,
+        ).reshape(-1)
+        raw_tau_ext = tau_result.tau_ext_cal_raw
+        if raw_tau_ext is None:
+            raw_wrench = wrench_from_filtered_tau.copy()
+        else:
+            raw_estimate = self.wrench_estimator.map_joint_torque(
+                tau_result.q,
+                raw_tau_ext,
+            )
+            raw_wrench = np.asarray(
+                raw_estimate.wrench,
+                dtype=np.float64,
+            ).reshape(-1)
+        if (
+            raw_wrench.shape != (6,)
+            or wrench_from_filtered_tau.shape != (6,)
+            or not np.all(np.isfinite(raw_wrench))
+            or not np.all(np.isfinite(wrench_from_filtered_tau))
+        ):
             raise RuntimeError(
-                "mapped inference wrench must be a finite 6-vector; "
-                f"got {raw_wrench}"
+                "mapped raw/filtered inference wrenches must be finite 6-vectors"
             )
         if self.wrench_processor is None:
-            wrench = raw_wrench.copy()
-            processed_wrench = raw_wrench.copy()
+            wrench = wrench_from_filtered_tau.copy()
+            processed_wrench = wrench_from_filtered_tau.copy()
         else:
             wrench, processed_wrench = self.wrench_processor(
-                raw_wrench.copy(), timestamp_us
+                raw_wrench.copy(),
+                wrench_from_filtered_tau.copy(),
+                timestamp_us,
             )
             wrench = np.asarray(wrench, dtype=np.float64).reshape(-1)
             processed_wrench = np.asarray(processed_wrench, dtype=np.float64).reshape(-1)
@@ -314,7 +333,7 @@ class ContinuousInferenceStateStream:
             acquired_timestamp_us=acquired_timestamp_us,
             q=np.asarray(tau_result.q, dtype=np.float64).copy(),
             dq=np.asarray(tau_result.dq, dtype=np.float64).copy(),
-            ddq=np.asarray(tau_result.ddq, dtype=np.float64).copy(),
+            ddq=np.asarray(tau_result.ddq_kf_causal, dtype=np.float64).copy(),
             tau=np.asarray(tau_result.tau, dtype=np.float64).copy(),
             tau_result=tau_result,
             raw_wrench=raw_wrench.copy(),

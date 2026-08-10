@@ -16,7 +16,7 @@ from nero_collection.state_alignment import (
 class _TauFPredictor:
     metadata = SimpleNamespace(
         horizon=2,
-        input_keys=("q", "dq", "tau"),
+        input_keys=("q", "dq", "delta_q"),
     )
 
     def __init__(self) -> None:
@@ -34,7 +34,7 @@ class _InverseDynamics:
 
     def estimate(self, q, dq, ddq, tau):
         self.calls.append((q, dq, ddq, tau))
-        return SimpleNamespace(tau_residual=np.full(7, 2.0))
+        return SimpleNamespace(tau_id=np.full(7, 2.0))
 
 
 class _WrenchMapper:
@@ -48,7 +48,7 @@ class _WrenchMapper:
 
 def test_world_model_adapter_matches_nero_contact_chain_without_mutating_state() -> None:
     collection = SimpleNamespace(
-        tau_f_inference=SimpleNamespace(enabled=True),
+        tau_ext_inference=SimpleNamespace(enabled=True),
         realtime_plot=SimpleNamespace(
             inverse_dynamics=object(),
             wrench_mapping=object(),
@@ -78,14 +78,15 @@ def test_world_model_adapter_matches_nero_contact_chain_without_mutating_state()
     np.testing.assert_allclose(tau_f.inputs["q"][:2], history["q"][-2:])
     np.testing.assert_allclose(tau_f.inputs["q"][2:], future["q"])
     np.testing.assert_allclose(tau_f.inputs["dq"][2:], future["v"])
+    np.testing.assert_allclose(tau_f.inputs["delta_q"], 0.0)
     np.testing.assert_allclose(wrench, np.full((2, 6), 1.5))
     assert len(inverse_dynamics.calls) == 2
     assert len(mapper.calls) == 2
 
 
-def test_world_model_adapter_uses_zero_tau_f_when_inference_is_disabled() -> None:
+def test_world_model_adapter_requires_tau_ext_inference_when_no_predictor() -> None:
     collection = SimpleNamespace(
-        tau_f_inference=SimpleNamespace(enabled=False),
+        tau_ext_inference=SimpleNamespace(enabled=False),
         realtime_plot=SimpleNamespace(
             inverse_dynamics=object(),
             wrench_mapping=object(),
@@ -93,23 +94,12 @@ def test_world_model_adapter_uses_zero_tau_f_when_inference_is_disabled() -> Non
     )
     inverse_dynamics = _InverseDynamics()
     mapper = _WrenchMapper()
-    adapter = WorldModelWrenchAdapter(
-        collection,
-        inverse_dynamics=inverse_dynamics,
-        wrench_mapper=mapper,
-    )
-    history = {
-        key: np.zeros((2, 7), dtype=np.float64)
-        for key in ("q", "v", "a", "tau")
-    }
-    future = {
-        key: np.zeros((3, 7), dtype=np.float64)
-        for key in ("q", "v", "a", "tau")
-    }
-
-    wrench = adapter.states_to_wrenches(history, future)
-
-    np.testing.assert_allclose(wrench, np.full((3, 6), 2.0))
+    with pytest.raises(ValueError, match="requires tau_ext inference"):
+        WorldModelWrenchAdapter(
+            collection,
+            inverse_dynamics=inverse_dynamics,
+            wrench_mapper=mapper,
+        )
 
 
 def test_v4_torch_state_reconstruction_matches_nero_uniform_recurrence() -> None:

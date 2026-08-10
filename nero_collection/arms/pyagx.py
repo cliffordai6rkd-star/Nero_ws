@@ -11,6 +11,7 @@ import numpy as np
 
 from nero_collection.arms.base import ArmState, GripperState
 from nero_collection.arms.kinematics import pose6_to_matrix
+from nero_collection.coordinates import nero_v120_joint_velocity
 from nero_collection.config import ArmEndpointConfig
 from nero_collection.state_alignment import DelayedStateTimeline, StateTimingError
 from nero_collection.time_utils import now_us
@@ -243,8 +244,8 @@ class PyAgxArmAdapter:
         self._reset_state_alignment_cache()
         log.info(
             "configured delayed state timeline arm=%s delay=%.3fms rate=%.3fHz "
-            "dq_source=V120_motor_velocity q_lpf_for_ddq=%sHz dq_lpf=%sHz "
-            "ddq_fusion_lpf=%sHz "
+            "dq_source=V120_motor_velocity q_lpf_compat=%sHz dq_lpf=%sHz "
+            "ddq_source=d_dq_dt ddq_lpf=%sHz "
             "max_can_gap=%.3fms poll=%.3fms",
             self.name,
             self._alignment_delay_s * 1e3,
@@ -381,9 +382,7 @@ class PyAgxArmAdapter:
                 dq = sample.dq.copy()
                 ddq = sample.ddq.copy()
                 q_timestamp_us = sample.timestamp_us
-                q_component_timestamp_us = np.full(
-                    self.dof, sample.timestamp_us, dtype=np.int64
-                )
+                q_component_timestamp_us = sample.q_source_timestamp_us.copy()
                 q_source_before_timestamp_us = (
                     q_component_timestamp_us.copy()
                 )
@@ -392,7 +391,7 @@ class PyAgxArmAdapter:
                     "velocity": dq.copy(),
                     "torque": sample.torque.copy(),
                     "current": sample.current.copy(),
-                    "timestamp_us": q_component_timestamp_us.copy(),
+                    "timestamp_us": sample.motor_source_timestamp_us.copy(),
                     "acquired_timestamp_us": np.full(
                         self.dof, acquired_timestamp_us, dtype=np.int64
                     ),
@@ -411,7 +410,11 @@ class PyAgxArmAdapter:
             )
             q_source_before_timestamp_us = q_component_timestamp_us.copy()
             q_source_after_timestamp_us = q_component_timestamp_us.copy()
-            motor_states = _read_motor_states(robot, self.dof)
+            motor_states = _read_motor_states(
+                robot,
+                self.dof,
+                firmware=self.config.firmware,
+            )
             dq = motor_states["velocity"]
             ddq = np.full(self.dof, np.nan, dtype=np.float64)
         ee_pose = _read_pose(robot)
@@ -812,6 +815,8 @@ def _capture_async_state(
         if legacy_feedback:
             velocity = 0.0
             current = -current
+        else:
+            velocity = nero_v120_joint_velocity(velocity, joint_index)
         timeline.append_motor(
             joint_index,
             timestamp_us,
@@ -855,7 +860,12 @@ def _empty_motor_states(dof: int) -> dict[str, np.ndarray]:
     }
 
 
-def _read_motor_states(robot: Any, dof: int) -> dict[str, np.ndarray]:
+def _read_motor_states(
+    robot: Any,
+    dof: int,
+    *,
+    firmware: str | None = None,
+) -> dict[str, np.ndarray]:
     velocity = np.full(dof, np.nan, dtype=np.float64)
     torque = np.full(dof, np.nan, dtype=np.float64)
     current = np.full(dof, np.nan, dtype=np.float64)
@@ -880,7 +890,10 @@ def _read_motor_states(robot: Any, dof: int) -> dict[str, np.ndarray]:
         state = _unwrap_message(state_message)
         if state is None:
             continue
-        velocity[idx] = _field_float(state, ("velocity", "vel", "speed"))
+        velocity_value = _field_float(state, ("velocity", "vel", "speed"))
+        if str(firmware).strip().upper() == "V120":
+            velocity_value = nero_v120_joint_velocity(velocity_value, idx)
+        velocity[idx] = velocity_value
         torque[idx] = _field_float(state, ("torque", "tau"))
         current[idx] = _field_float(state, ("current", "iq", "motor_current"))
         timestamp_us[idx] = _message_timestamp_us(state_message)

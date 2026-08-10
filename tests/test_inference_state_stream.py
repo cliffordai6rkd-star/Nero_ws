@@ -7,7 +7,7 @@ import numpy as np
 
 from inference.state_stream import ContinuousInferenceStateStream
 from nero_collection.arms.base import ArmState
-from nero_collection.tau_f_inference import OnlineTauFResult
+from nero_collection.tau_ext_inference import OnlineTauExtResult
 
 
 class _Arm:
@@ -31,23 +31,25 @@ class _Arm:
         )
 
 
-class _TauF:
+class _TauExt:
     def __init__(self) -> None:
         self.count = 0
 
-    def estimate_aligned_raw(self, timestamp_us, q, dq, ddq, tau):
+    def estimate_aligned(self, timestamp_us, q, dq, tau, q_cmd):
         self.count += 1
         zeros = np.zeros(7, dtype=np.float64)
-        return OnlineTauFResult(
+        return OnlineTauExtResult(
             timestamp_us=timestamp_us,
             q=np.asarray(q).copy(),
             dq=np.asarray(dq).copy(),
-            ddq=np.asarray(ddq).copy(),
+            ddq_kf_causal=zeros.copy(),
             tau=np.asarray(tau).copy(),
             tau_id=zeros.copy(),
-            tau_f_cal=zeros.copy(),
+            tau_id_filtered=zeros.copy(),
             tau_f_pred=zeros.copy(),
-            tau_ext=zeros.copy(),
+            tau_next_pred=zeros.copy(),
+            tau_ext_cal=zeros.copy(),
+            tau_ext_pred=zeros.copy(),
         )
 
 
@@ -56,10 +58,100 @@ class _Wrench:
         return SimpleNamespace(wrench=np.zeros(6, dtype=np.float64))
 
 
+def test_continuous_state_stream_passes_zoh_q_cmd_to_dual_tau_ext() -> None:
+    class TauExt:
+        def __init__(self) -> None:
+            self.q_cmds = []
+
+        def estimate_aligned(
+            self,
+            timestamp_us,
+            q,
+            dq,
+            tau,
+            q_cmd,
+        ):
+            self.q_cmds.append(np.asarray(q_cmd).copy())
+            zeros = np.zeros(7)
+            return OnlineTauExtResult(
+                timestamp_us=timestamp_us,
+                q=np.asarray(q),
+                dq=np.asarray(dq),
+                ddq_kf_causal=zeros,
+                tau=np.asarray(tau),
+                tau_id=zeros,
+                tau_id_filtered=zeros,
+                tau_f_pred=zeros,
+                tau_next_pred=zeros,
+                tau_ext_cal=zeros,
+                tau_ext_pred=zeros,
+            )
+
+    arm = _Arm()
+    tau_ext = TauExt()
+    q_cmd = np.linspace(0.1, 0.7, 7)
+    stream = ContinuousInferenceStateStream(
+        arm,
+        tau_ext,
+        _Wrench(),
+        q_cmd_provider=lambda _timestamp_us: q_cmd.copy(),
+    )
+
+    sample = stream.process_state(arm.read_state())
+
+    assert sample is not None
+    assert len(tau_ext.q_cmds) == 1
+    np.testing.assert_allclose(tau_ext.q_cmds[0], q_cmd)
+
+
+def test_state_stream_maps_raw_and_filtered_tau_ext_without_refiltering() -> None:
+    class Wrench:
+        @staticmethod
+        def map_joint_torque(_q, tau):
+            return SimpleNamespace(wrench=np.asarray(tau, dtype=np.float64)[:6])
+
+    processor_inputs = []
+
+    def process(raw_wrench, filtered_wrench, _timestamp_us):
+        processor_inputs.append((raw_wrench.copy(), filtered_wrench.copy()))
+        return filtered_wrench.copy(), filtered_wrench.copy()
+
+    stream = ContinuousInferenceStateStream(
+        _Arm(),
+        _TauExt(),
+        Wrench(),
+        wrench_processor=process,
+        q_cmd_provider=lambda _timestamp_us: np.zeros(7),
+    )
+    zeros = np.zeros(7)
+    result = OnlineTauExtResult(
+        timestamp_us=1_000,
+        q=zeros,
+        dq=zeros,
+        ddq_kf_causal=zeros,
+        tau=zeros,
+        tau_id=zeros,
+        tau_id_filtered=zeros,
+        tau_f_pred=zeros,
+        tau_next_pred=zeros,
+        tau_ext_cal=np.ones(7),
+        tau_ext_pred=np.ones(7),
+        tau_ext_cal_raw=np.full(7, 2.0),
+        tau_ext_pred_raw=np.full(7, 2.0),
+    )
+
+    sample = stream._build_sample(1_000, 1_000, result)
+
+    np.testing.assert_allclose(sample.raw_wrench, 2.0)
+    np.testing.assert_allclose(sample.wrench, 1.0)
+    np.testing.assert_allclose(processor_inputs[0][0], 2.0)
+    np.testing.assert_allclose(processor_inputs[0][1], 1.0)
+
+
 def test_continuous_state_stream_consumes_every_sample_independently() -> None:
     ready = threading.Event()
     seen = []
-    tau_f = _TauF()
+    tau_ext = _TauExt()
 
     def on_sample(sample) -> None:
         seen.append(sample.timestamp_us)
@@ -68,9 +160,10 @@ def test_continuous_state_stream_consumes_every_sample_independently() -> None:
 
     stream = ContinuousInferenceStateStream(
         _Arm(),
-        tau_f,
+        tau_ext,
         _Wrench(),
         on_sample=on_sample,
+        q_cmd_provider=lambda _timestamp_us: np.zeros(7),
         poll_interval_s=0.0001,
     )
 
@@ -79,7 +172,7 @@ def test_continuous_state_stream_consumes_every_sample_independently() -> None:
     stream.stop()
 
     assert stream.fault is None
-    assert tau_f.count >= 5
+    assert tau_ext.count >= 5
     assert seen == sorted(set(seen))
     assert stream.latest() is not None
     drained = stream.drain_after(0)
@@ -93,9 +186,10 @@ def test_continuous_state_stream_reports_bounded_history_rollover() -> None:
     ready = threading.Event()
     stream = ContinuousInferenceStateStream(
         _Arm(),
-        _TauF(),
+        _TauExt(),
         _Wrench(),
         on_sample=lambda _sample: ready.set(),
+        q_cmd_provider=lambda _timestamp_us: np.zeros(7),
         history_size=2,
         poll_interval_s=0.0001,
     )
@@ -134,9 +228,10 @@ def test_continuous_state_stream_drains_all_isolated_process_states() -> None:
     seen = []
     stream = ContinuousInferenceStateStream(
         Arm(),
-        _TauF(),
+        _TauExt(),
         _Wrench(),
         on_sample=lambda sample: (seen.append(sample.timestamp_us), ready.set()),
+        q_cmd_provider=lambda _timestamp_us: np.zeros(7),
         poll_interval_s=0.0001,
     )
 
@@ -161,8 +256,9 @@ def test_continuous_state_stream_fails_closed_on_hardware_ring_overrun() -> None
 
     stream = ContinuousInferenceStateStream(
         Arm(),
-        _TauF(),
+        _TauExt(),
         _Wrench(),
+        q_cmd_provider=lambda _timestamp_us: np.zeros(7),
         poll_interval_s=0.0001,
     )
 
@@ -177,7 +273,7 @@ def test_continuous_state_stream_fails_closed_on_hardware_ring_overrun() -> None
     assert "2 aligned states were overwritten" in str(stream.fault)
 
 
-def test_continuous_state_stream_uses_one_tau_f_batch_for_ring_backlog() -> None:
+def test_continuous_state_stream_processes_every_ring_backlog_sample() -> None:
     class Arm:
         def __init__(self) -> None:
             source = _Arm()
@@ -191,25 +287,14 @@ def test_continuous_state_stream_uses_one_tau_f_batch_for_ring_backlog() -> None
             states, self.states = self.states, ()
             return SimpleNamespace(states=states, dropped=0)
 
-    class BatchTauF(_TauF):
-        def __init__(self) -> None:
-            super().__init__()
-            self.batch_sizes = []
-
-        def estimate_aligned_raw_batch(self, samples):
-            self.batch_sizes.append(len(samples))
-            return tuple(
-                self.estimate_aligned_raw(timestamp_us, q, dq, ddq, tau)
-                for timestamp_us, q, dq, ddq, tau in samples
-            )
-
     ready = threading.Event()
-    tau_f = BatchTauF()
+    tau_ext = _TauExt()
     stream = ContinuousInferenceStateStream(
         Arm(),
-        tau_f,
+        tau_ext,
         _Wrench(),
         on_sample=lambda sample: ready.set(),
+        q_cmd_provider=lambda _timestamp_us: np.zeros(7),
         poll_interval_s=0.0001,
     )
 
@@ -218,5 +303,5 @@ def test_continuous_state_stream_uses_one_tau_f_batch_for_ring_backlog() -> None
     stream.stop()
 
     assert stream.fault is None
-    assert tau_f.batch_sizes == [3]
+    assert tau_ext.count == 3
     assert len(stream.drain_after(0)) == 3

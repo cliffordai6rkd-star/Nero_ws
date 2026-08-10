@@ -15,7 +15,10 @@ from nero_collection.teleop.bilateral import (
     BilateralJointController,
     JointMitCommand,
 )
-from nero_collection.tau_f_inference import OnlineTauFInference, OnlineTauFResult
+from nero_collection.tau_ext_inference import (
+    OnlineTauExtInference,
+    OnlineTauExtResult,
+)
 from nero_collection.time_utils import now_us
 
 log = logging.getLogger(__name__)
@@ -53,18 +56,18 @@ class MasterSlaveTeleop:
             )
             for pair in config.teleop.master_slave
         )
-        if config.tau_f_inference.enabled and len(self.pairs) != 1:
+        if config.tau_ext_inference.enabled and len(self.pairs) != 1:
             raise RuntimeError(
-                "Learned tau_f inference currently requires exactly one arm pair"
+                "tau_ext inference currently requires exactly one arm pair"
             )
-        self.online_tau_f = (
-            OnlineTauFInference(
-                config.tau_f_inference,
+        self.online_tau_ext = (
+            OnlineTauExtInference(
+                config.tau_ext_inference,
                 config.realtime_plot.inverse_dynamics,
                 config.dynamics_processing,
                 config.robot_states,
             )
-            if config.tau_f_inference.enabled
+            if config.tau_ext_inference.enabled
             else None
         )
         self.arm_names = tuple(pair.name for pair in self.pairs)
@@ -187,7 +190,7 @@ class MasterSlaveTeleop:
                 timestamp_us=time.monotonic_ns() // 1000,
                 **(
                     {"tau_ext_override": np.zeros(7, dtype=np.float64)}
-                    if getattr(self, "online_tau_f", None) is not None
+                    if getattr(self, "online_tau_ext", None) is not None
                     else {}
                 ),
             )
@@ -343,36 +346,42 @@ class MasterSlaveTeleop:
         leader_states: list[ArmState] = []
         follower_states: list[ArmState] = []
         q_cmds: list[np.ndarray] = []
-        inference_results: list[OnlineTauFResult] = []
+        inference_results: list[OnlineTauExtResult] = []
         control_timestamp_us = time.monotonic_ns() // 1000
         for pair in self.pairs:
             leader_state = pair.leader.read_state()
             follower_state = pair.follower.read_state()
             self._check_bilateral_step_deadline(step_started_t, "CAN state read")
             inference_result = None
-            online_tau_f = getattr(self, "online_tau_f", None)
-            if online_tau_f is not None:
-                inference_result = online_tau_f.estimate_aligned_raw(
-                    control_timestamp_us,
+            q_cmd = _limit_joint_step(
+                pair.controller.follower_target(leader_state, follower_state),
+                follower_state.q,
+                self.config.teleop.command.joint_step_limit_rad,
+            )
+            online_tau_ext = getattr(self, "online_tau_ext", None)
+            if online_tau_ext is not None:
+                inference_result = online_tau_ext.estimate_aligned(
+                    follower_state.timestamp_us,
                     follower_state.q,
                     follower_state.dq,
-                    follower_state.ddq,
                     follower_state.torque,
+                    q_cmd,
                 )
             result = pair.controller.compute(
                 leader_state,
                 follower_state,
                 timestamp_us=control_timestamp_us,
                 **(
-                    {"tau_ext_override": inference_result.tau_ext}
+                    {
+                        "tau_ext_override": (
+                            inference_result.tau_ext_pred
+                            if inference_result.history_ready
+                            else np.zeros(7, dtype=np.float64)
+                        )
+                    }
                     if inference_result is not None
                     else {}
                 ),
-            )
-            q_cmd = _limit_joint_step(
-                result.follower.q,
-                follower_state.q,
-                self.config.teleop.command.joint_step_limit_rad,
             )
             self._check_bilateral_step_deadline(step_started_t, "bilateral compute")
             self._send_bilateral_commands(pair, result, q_cmd)
@@ -389,6 +398,7 @@ class MasterSlaveTeleop:
                 follower_states,
                 q_cmds,
                 inference_results,
+                control_timestamp_us,
             )
             if build_values
             else {}
@@ -745,7 +755,8 @@ class MasterSlaveTeleop:
         leader_states: list[ArmState],
         follower_states: list[ArmState],
         q_cmds: list[np.ndarray],
-        inference_results: list[OnlineTauFResult] | None = None,
+        inference_results: list[OnlineTauExtResult] | None = None,
+        control_timestamp_us: int | None = None,
     ) -> dict[str, tuple[str, np.ndarray]]:
         values: dict[str, tuple[str, np.ndarray]] = {}
         states = self.config.robot_states
@@ -778,45 +789,95 @@ class MasterSlaveTeleop:
             values["current_leader"] = ("current", _concat([state.current for state in leader_states]))
             values["current_follower"] = ("current", _concat([state.current for state in follower_states]))
 
+        if follower_states:
+            values["control_timestamp_us"] = (
+                "timestamp",
+                np.asarray(control_timestamp_us or 0, dtype=np.int64),
+            )
+            values["state_acquired_timestamp_follower_us"] = (
+                "timestamp",
+                np.asarray(
+                    [state.acquired_timestamp_us for state in follower_states],
+                    dtype=np.int64,
+                ),
+            )
+            q_sources = [
+                _timestamp_vector(state.q_component_timestamp_us, state.timestamp_us, state.q.size)
+                for state in follower_states
+            ]
+            motor_sources = [
+                _timestamp_vector(state.motor_timestamp_us, state.timestamp_us, state.q.size)
+                for state in follower_states
+            ]
+            values["q_source_timestamp_follower_us"] = (
+                "timestamp",
+                np.concatenate(q_sources),
+            )
+            values["motor_source_timestamp_follower_us"] = (
+                "timestamp",
+                np.concatenate(motor_sources),
+            )
+            values["state_source_skew_follower_us"] = (
+                "duration",
+                np.asarray(
+                    [
+                        _source_timestamp_skew_us(q_source, motor_source)
+                        for q_source, motor_source in zip(q_sources, motor_sources)
+                    ],
+                    dtype=np.int64,
+                ),
+            )
+
         if inference_results:
-            values["tau_f_cal"] = (
+            values["ddq_kf_causal"] = (
+                "acceleration",
+                _concat([result.ddq_kf_causal for result in inference_results]),
+            )
+            values["tau_id"] = (
                 "torque",
-                _concat([result.tau_f_cal for result in inference_results]),
+                _concat([result.tau_id for result in inference_results]),
             )
-            prediction_name = (
-                "tau_bg_pred"
-                if self.config.tau_f_inference.mode == "tau_bg"
-                else "tau_f_pred"
-            )
-            values[prediction_name] = (
+            values["tau_id_filtered"] = (
                 "torque",
-                _concat([result.model_prediction for result in inference_results]),
+                _concat([result.tau_id_filtered for result in inference_results]),
             )
-            values["tau_ext_raw"] = (
+            values["tau_f_pred"] = (
+                "torque",
+                _concat([result.tau_f_pred for result in inference_results]),
+            )
+            values["tau_next_pred"] = (
+                "torque",
+                _concat([result.tau_next_pred for result in inference_results]),
+            )
+            values["tau_ext_cal_raw"] = (
                 "torque",
                 _concat(
                     [
-                        result.tau_ext_raw
-                        if result.tau_ext_raw is not None
-                        else result.tau_ext
+                        result.tau_ext_cal
+                        if result.tau_ext_cal_raw is None
+                        else result.tau_ext_cal_raw
                         for result in inference_results
                     ]
                 ),
             )
-            values["tau_ext_filtered"] = (
+            values["tau_ext_pred_raw"] = (
                 "torque",
                 _concat(
                     [
-                        result.tau_ext_filtered
-                        if result.tau_ext_filtered is not None
-                        else result.tau_ext
+                        result.tau_ext_pred
+                        if result.tau_ext_pred_raw is None
+                        else result.tau_ext_pred_raw
                         for result in inference_results
                     ]
                 ),
             )
-            values["tau_ext"] = (
+            values["tau_ext_cal"] = (
                 "torque",
-                _concat([result.tau_ext for result in inference_results]),
+                _concat([result.tau_ext_cal for result in inference_results]),
+            )
+            values["tau_ext_pred"] = (
+                "torque",
+                _concat([result.tau_ext_pred for result in inference_results]),
             )
 
         return values
@@ -845,6 +906,21 @@ def _concat(values: list[np.ndarray]) -> np.ndarray:
     if not values:
         return np.empty((0,), dtype=np.float64)
     return np.concatenate([np.asarray(value, dtype=np.float64).reshape(-1) for value in values], axis=0)
+
+
+def _timestamp_vector(value: np.ndarray, fallback: int, size: int) -> np.ndarray:
+    timestamps = np.asarray(value, dtype=np.int64).reshape(-1)
+    if timestamps.size == size and np.all(timestamps > 0):
+        return timestamps.copy()
+    return np.full(size, int(fallback), dtype=np.int64)
+
+
+def _source_timestamp_skew_us(q_source: np.ndarray, motor_source: np.ndarray) -> int:
+    timestamps = np.concatenate((q_source, motor_source))
+    timestamps = timestamps[timestamps > 0]
+    if timestamps.size == 0:
+        return 0
+    return int(np.max(timestamps) - np.min(timestamps))
 
 
 def _pose_stack(poses: list[np.ndarray]) -> np.ndarray:

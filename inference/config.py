@@ -65,7 +65,7 @@ class SafetyConfig:
 @dataclass(frozen=True)
 class RobotConfig:
     urdf_path: Path
-    frame_name: str = "gripper_base"
+    frame_name: str = "gripper_tcp"
     action_frame_name: str | None = None
     locked_joint_names: tuple[str, ...] = (
         "gripper",

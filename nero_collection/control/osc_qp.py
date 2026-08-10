@@ -119,7 +119,7 @@ class PinocchioDynamicsModel:
     def __init__(
         self,
         urdf_path: str | Path,
-        frame_name: str = "gripper_base",
+        frame_name: str = "gripper_tcp",
         locked_joint_names: tuple[str, ...] = (
             "gripper",
             "gripper_joint1",

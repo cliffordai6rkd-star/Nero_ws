@@ -11,8 +11,10 @@ from nero_collection.arms.pyagx import (
     PyAgxArmAdapter,
     _capture_async_state,
     _component_version,
+    _read_motor_states,
 )
 from nero_collection.arms.base import ArmState
+from nero_collection.coordinates import NERO_V120_MOTOR_VELOCITY_TO_JOINT_SIGN
 from nero_collection.config import (
     ArmEndpointConfig,
     BilateralMitConfig,
@@ -122,20 +124,18 @@ def test_master_slave_config_has_valid_control_parameters() -> None:
     assert config.robot_states["tau_id"].lowpass is False
 
 
-def test_collection_config_allows_zero_tau_f_with_realtime_plot(tmp_path) -> None:
+def test_collection_config_requires_tau_ext_inference_for_realtime_plot(tmp_path) -> None:
     config_path = tmp_path / "master_slave_can.yaml"
     source_path = Path(__file__).resolve().parents[1] / "configs/master_slave_can.yaml"
     text = source_path.read_text(encoding="utf-8")
     text = text.replace(
-        "tau_f_inference:\n  enabled: true",
-        "tau_f_inference:\n  enabled: false",
+        "tau_ext_inference:\n  enabled: true",
+        "tau_ext_inference:\n  enabled: false",
     )
     config_path.write_text(text, encoding="utf-8")
 
-    config = load_config(config_path)
-
-    assert config.realtime_plot.enabled is True
-    assert config.tau_f_inference.enabled is False
+    with pytest.raises(ValueError, match="requires tau_ext_inference"):
+        load_config(config_path)
 
 
 def test_bilateral_controller_uses_preprocessed_learned_external_torque() -> None:
@@ -288,7 +288,7 @@ def test_can_frame_gap_fails_before_updating_joint_derivatives() -> None:
         timeline.append_q_group("joint_12", 130_001, np.ones(2))
 
 
-def test_v120_velocity_is_used_for_dq_and_fused_for_ddq() -> None:
+def test_v120_velocity_is_the_only_source_for_dq_and_ddq() -> None:
     timeline = DelayedStateTimeline(
         dof=1,
         q_groups=(("joint_1", (0,)),),
@@ -300,11 +300,13 @@ def test_v120_velocity_is_used_for_dq_and_fused_for_ddq() -> None:
         ddq_lowpass_cutoff_hz=None,
     )
 
-    # Keep q fixed so a position-derived dq would be zero. The V120 motor
-    # velocity stream carries a constant acceleration of 2 rad/s^2.
+    # Deliberately make q imply a different acceleration. The V120 motor
+    # velocity stream alone carries a constant acceleration of 2 rad/s^2.
     for index, velocity in enumerate((0.0, 0.02, 0.04), start=1):
         timestamp_us = index * 10_000
-        timeline.append_q_group("joint_1", timestamp_us, np.zeros(1))
+        timeline.append_q_group(
+            "joint_1", timestamp_us, np.asarray([float(index * index)])
+        )
         timeline.append_motor(
             0,
             timestamp_us,
@@ -316,11 +318,111 @@ def test_v120_velocity_is_used_for_dq_and_fused_for_ddq() -> None:
     sample = timeline.aligned_sample(40_000)
     assert sample is not None
     assert sample.dq == pytest.approx([0.04])
-    # ddq is mean(d(dq_official)/dt=2, d2(q)/dt2=0).
-    assert sample.ddq == pytest.approx([1.0])
+    assert sample.ddq == pytest.approx([2.0])
+    np.testing.assert_array_equal(sample.q_source_timestamp_us, [30_000])
+    np.testing.assert_array_equal(sample.motor_source_timestamp_us, [30_000])
 
 
-def test_v120_async_capture_preserves_official_motor_velocity() -> None:
+def test_q_motion_cannot_change_ddq_when_motor_velocity_is_constant() -> None:
+    timeline = DelayedStateTimeline(
+        dof=1,
+        q_groups=(("joint_1", (0,)),),
+        delay_s=0.01,
+        output_rate_hz=100.0,
+        q_lowpass_cutoff_hz=None,
+        dq_lowpass_cutoff_hz=None,
+        ddq_lowpass_cutoff_hz=None,
+    )
+
+    for index, q in enumerate((0.0, 1.0, -2.0, 4.0), start=1):
+        timestamp_us = index * 10_000
+        timeline.append_q_group("joint_1", timestamp_us, np.asarray([q]))
+        timeline.append_motor(
+            0,
+            timestamp_us,
+            velocity=0.25,
+            torque=0.0,
+            current=0.0,
+        )
+
+    sample = timeline.aligned_sample(50_000)
+    assert sample is not None
+    assert sample.ddq == pytest.approx([0.0])
+
+
+def test_motor_velocity_derivative_filters_match_training_preprocessing() -> None:
+    timeline = DelayedStateTimeline(
+        dof=1,
+        q_groups=(("joint_1", (0,)),),
+        delay_s=0.001,
+        output_rate_hz=1000.0,
+        q_lowpass_cutoff_hz=10.0,
+        dq_lowpass_cutoff_hz=6.0,
+        ddq_lowpass_cutoff_hz=3.0,
+    )
+    timestamps_us = (10_000, 20_000, 32_000, 42_000)
+    velocities = (0.0, 0.5, -0.25, 0.75)
+
+    expected_dq = velocities[0]
+    expected_ddq = 0.0
+    previous_timestamp_us = timestamps_us[0]
+    for index, (timestamp_us, velocity) in enumerate(
+        zip(timestamps_us, velocities)
+    ):
+        timeline.append_q_group(
+            "joint_1", timestamp_us, np.asarray([float(index * index)])
+        )
+        timeline.append_motor(
+            0,
+            timestamp_us,
+            velocity=velocity,
+            torque=0.0,
+            current=0.0,
+        )
+        if index == 0:
+            continue
+        dt = (timestamp_us - previous_timestamp_us) * 1.0e-6
+        previous_dq = expected_dq
+        dq_alpha = 1.0 - np.exp(-2.0 * np.pi * 6.0 * dt)
+        expected_dq += dq_alpha * (velocity - expected_dq)
+        ddq_raw = (expected_dq - previous_dq) / dt
+        ddq_alpha = 1.0 - np.exp(-2.0 * np.pi * 3.0 * dt)
+        expected_ddq += ddq_alpha * (ddq_raw - expected_ddq)
+        previous_timestamp_us = timestamp_us
+
+    sample = timeline.aligned_sample(43_000)
+    assert sample is not None
+    assert sample.dq == pytest.approx([expected_dq])
+    assert sample.ddq == pytest.approx([expected_ddq])
+
+
+def test_aligned_timeline_freezes_a_completed_target_snapshot() -> None:
+    timeline = DelayedStateTimeline(
+        dof=1,
+        q_groups=(("joint_1", (0,)),),
+        delay_s=0.01,
+        output_rate_hz=100.0,
+        q_lowpass_cutoff_hz=None,
+        dq_lowpass_cutoff_hz=None,
+        ddq_lowpass_cutoff_hz=None,
+    )
+    timeline.append_q_group("joint_1", 10_000, np.asarray([1.0]))
+    timeline.append_motor(0, 10_000, velocity=2.0, torque=3.0, current=4.0)
+
+    first = timeline.aligned_sample(30_000)
+    assert first is not None
+    timeline.append_q_group("joint_1", 19_000, np.asarray([10.0]))
+    timeline.append_motor(0, 19_000, velocity=20.0, torque=30.0, current=40.0)
+    repeated = timeline.aligned_sample(30_000)
+
+    assert repeated is first
+    np.testing.assert_allclose(repeated.q, [1.0])
+    np.testing.assert_allclose(repeated.dq, [2.0])
+    np.testing.assert_array_equal(repeated.q_source_timestamp_us, [10_000])
+    np.testing.assert_array_equal(repeated.motor_source_timestamp_us, [10_000])
+
+
+def test_v120_async_capture_converts_motor_velocity_to_joint_coordinates() -> None:
     def message(**fields):
         return SimpleNamespace(timestamp=0.01, msg=SimpleNamespace(**fields))
 
@@ -362,8 +464,38 @@ def test_v120_async_capture_preserves_official_motor_velocity() -> None:
 
     sample = timeline.aligned_sample(20_000)
     assert sample is not None
-    np.testing.assert_allclose(sample.dq, expected_velocity)
+    expected_joint_velocity = expected_velocity * np.asarray(
+        NERO_V120_MOTOR_VELOCITY_TO_JOINT_SIGN
+    )
+    np.testing.assert_allclose(sample.dq, expected_joint_velocity)
+    np.testing.assert_allclose(sample.torque, np.arange(1.0, 8.0))
     np.testing.assert_allclose(sample.current, np.arange(11.0, 18.0))
+
+
+def test_v120_direct_motor_read_uses_the_same_velocity_signs() -> None:
+    def get_motor_states(joint_number: int):
+        return SimpleNamespace(
+            timestamp=0.01,
+            msg=SimpleNamespace(
+                velocity=0.1 * joint_number,
+                torque=10.0 + joint_number,
+                current=20.0 + joint_number,
+            ),
+        )
+
+    states = _read_motor_states(
+        SimpleNamespace(get_motor_states=get_motor_states),
+        7,
+        firmware="V120",
+    )
+
+    raw_velocity = np.arange(1.0, 8.0) * 0.1
+    np.testing.assert_allclose(
+        states["velocity"],
+        raw_velocity * np.asarray(NERO_V120_MOTOR_VELOCITY_TO_JOINT_SIGN),
+    )
+    np.testing.assert_allclose(states["torque"], np.arange(11.0, 18.0))
+    np.testing.assert_allclose(states["current"], np.arange(21.0, 28.0))
 
 
 def test_pyagx_adapter_rejects_sdk_without_move_mit() -> None:

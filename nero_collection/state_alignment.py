@@ -21,6 +21,8 @@ class AlignedArmSample:
     ddq: np.ndarray
     torque: np.ndarray
     current: np.ndarray
+    q_source_timestamp_us: np.ndarray
+    motor_source_timestamp_us: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -123,11 +125,7 @@ class DelayedStateTimeline:
         ]
         self._motor_previous_timestamp_us: list[int | None] = [None] * self.dof
         self._motor_previous_dq: list[float | None] = [None] * self.dof
-        self._joint_group_for_index = {
-            joint_index: (name, offset)
-            for name, indices in self.q_groups
-            for offset, joint_index in enumerate(indices)
-        }
+        self._last_aligned_sample: AlignedArmSample | None = None
         output_period_us = int(np.ceil(1_000_000.0 / self.output_rate_hz))
         self._max_nearest_age_us = max(self.delay_us, 2 * output_period_us)
         self._lock = Lock()
@@ -197,12 +195,10 @@ class DelayedStateTimeline:
             self._motor_previous_timestamp_us[joint_index] = timestamp_us
             self._motor_previous_dq[joint_index] = velocity_filtered
 
-            ddq_from_q = self._q_second_derivative_at(joint_index, timestamp_us)
-            ddq_fused = _fuse_acceleration(ddq_from_dq, ddq_from_q)
             ddq_filtered = float(
                 _apply_lowpass(
                     self._motor_ddq_filters[joint_index],
-                    np.asarray([ddq_fused], dtype=np.float64),
+                    np.asarray([ddq_from_dq], dtype=np.float64),
                     timestamp_us,
                 )[0]
             )
@@ -216,20 +212,6 @@ class DelayedStateTimeline:
                 )
             )
 
-    def _q_second_derivative_at(
-        self,
-        joint_index: int,
-        timestamp_us: int,
-    ) -> float:
-        group_name, offset = self._joint_group_for_index[joint_index]
-        state = _nearest(self._q_state_history[group_name], timestamp_us)
-        if (
-            state is None
-            or abs(state.timestamp_us - timestamp_us) > self._max_nearest_age_us
-        ):
-            return float("nan")
-        return float(state.ddq[offset])
-
     def aligned_sample(self, now_timestamp_us: int) -> AlignedArmSample | None:
         target_us = self._target_timestamp_us(int(now_timestamp_us))
         q = np.empty(self.dof, dtype=np.float64)
@@ -237,13 +219,21 @@ class DelayedStateTimeline:
         ddq = np.empty(self.dof, dtype=np.float64)
         torque = np.empty(self.dof, dtype=np.float64)
         current = np.empty(self.dof, dtype=np.float64)
+        q_source_timestamp_us = np.empty(self.dof, dtype=np.int64)
+        motor_source_timestamp_us = np.empty(self.dof, dtype=np.int64)
         with self._lock:
+            if (
+                self._last_aligned_sample is not None
+                and self._last_aligned_sample.timestamp_us == target_us
+            ):
+                return self._last_aligned_sample
             for name, indices in self.q_groups:
                 state = _nearest(self._q_state_history[name], target_us)
                 if state is None or abs(state.timestamp_us - target_us) > self._max_nearest_age_us:
                     return None
                 joint_indices = list(indices)
                 q[joint_indices] = state.q
+                q_source_timestamp_us[joint_indices] = state.timestamp_us
             for joint_index, history in enumerate(self._motor_history):
                 motor = _nearest(history, target_us)
                 if motor is None or abs(motor.timestamp_us - target_us) > self._max_nearest_age_us:
@@ -252,14 +242,18 @@ class DelayedStateTimeline:
                 ddq[joint_index] = motor.ddq
                 torque[joint_index] = motor.torque
                 current[joint_index] = motor.current
-        return AlignedArmSample(
-            timestamp_us=target_us,
-            q=q,
-            dq=dq,
-            ddq=ddq,
-            torque=torque,
-            current=current,
-        )
+                motor_source_timestamp_us[joint_index] = motor.timestamp_us
+            self._last_aligned_sample = AlignedArmSample(
+                timestamp_us=target_us,
+                q=q,
+                dq=dq,
+                ddq=ddq,
+                torque=torque,
+                current=current,
+                q_source_timestamp_us=q_source_timestamp_us,
+                motor_source_timestamp_us=motor_source_timestamp_us,
+            )
+            return self._last_aligned_sample
 
     def _target_timestamp_us(self, now_timestamp_us: int) -> int:
         delayed_us = now_timestamp_us - self.delay_us
@@ -405,15 +399,6 @@ def _apply_lowpass(
     timestamp_us: int,
 ) -> np.ndarray:
     return filt.apply(value, timestamp_us) if filt is not None else value.copy()
-
-
-def _fuse_acceleration(ddq_from_dq: float, ddq_from_q: float) -> float:
-    """Fuse two independent acceleration estimates with a least-squares mean."""
-    estimates = np.asarray((ddq_from_dq, ddq_from_q), dtype=np.float64)
-    finite = estimates[np.isfinite(estimates)]
-    if finite.size == 0:
-        return 0.0
-    return float(np.mean(finite))
 
 
 def _nearest(history: deque, target_us: int):

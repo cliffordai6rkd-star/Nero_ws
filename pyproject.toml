@@ -29,7 +29,7 @@ nero-free-space = "calibration.free_space_cli:main"
 nero-inference = "inference.cli:main"
 
 [project.optional-dependencies]
-tau-f-inference = [
+tau-ext-inference = [
     "torch>=2.3,<3",
 ]
 gpu-identification = [

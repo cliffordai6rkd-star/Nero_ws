@@ -24,7 +24,7 @@ teleop:
       force_feedback_sign: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
       force_feedback_deadband_nm: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
       # force_feedback_limit_nm: [5, 5, 5, 5, 5, 5, 5]
-      force_feedback_limit_nm: [10, 10, 10, 10, 10, 10, 10]
+      force_feedback_limit_nm: [5, 5, 5, 5, 5, 5, 5]
       force_feedback_lowpass_hz: 10.0
     joint_step_limit_rad: 0.3
     reset_on_start: true
@@ -48,43 +48,59 @@ teleop:
           rest_q: [+0.00000, -0.14689, -0.01138, +1.80020, -0.02033, +0.02744, +1.50378]
 output:
   # directory: ../runs/insert_usb
-  directory: ../runs/tau_refinement
+  directory: ../runs/test
   prefix: episode
   # 每个 episode 开始后先运行控制和滤波，但不保存或可视化这段数据。
   discard_initial_s: 0.2
 
-# checkpoint 内的 config 会自动恢复训练 horizon、输入顺序、输出、网络结构和归一化参数。
-# 在线推理逐帧携带 GRU/LSTM 状态；每个 episode 会创建新状态。
-# horizon/input_keys/output_key 仅用于显式校验，通常无需配置。
-tau_f_inference:
-  enabled: false
-  # tau_f: tau_ext_raw=(tau_id-tau)-tau_f_pred
-  # tau_bg: tau_ext_raw=tau-tau_bg_pred；切换后将 output_key 改成 checkpoint 的实际 target_key。
-  mode: tau_f
-  # checkpoint_path: tau_refinment_ckpt/gru_h50_final/checkpoints/epoch_481_val_loss_0.001716.pt
-  checkpoint_path: ../../PINN/outputs/tau_f_sequence/gru_h50_qt2tf/checkpoints/epoch_032_val_loss_0.046836.pt
-  device: cuda:0
-  torch_num_threads: 1
-  horizon: 50
-  input_keys: [q, tau]
-  output_key: tau_f
-  # tau_ext_raw 先做因果低通，再逐关节硬门控；最终 tau_ext 同时用于反馈和 H5/wrench_ext。
-  tau_ext_lowpass_hz: 10.0
-  tau_ext_gate_threshold_nm: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+# 两个模型在同一个对齐时刻共享 [q, dq, q_cmd-q]，各自维护 50 帧固定窗口。
+# episode 开始后先采满 50 个真实样本；预热期间不执行模型前向，力反馈保持为零。
+# checkpoint_path 可指向具体 .pt 或 checkpoints 目录；目录会选择最低 val_loss。
+tau_ext_inference:
+  enabled: true
+  tau_f:
+    # This path intentionally targets the matched-filter label contract. Old
+    # tau_f checkpoints are rejected by runtime metadata validation.
+    checkpoint_path: model/epoch_234_val_loss_0.016139.pt
+    device: cpu
+    horizon: 50
+    input_keys: [q, dq, delta_q]
+    output_key: tau_f
+  tau_next:
+    checkpoint_path: model/epoch_185_val_tau_mse_nm2_0.004962.pt
+    device: cpu
+    horizon: 50
+    input_keys: [q, dq, delta_q]
+    output_key: tau
+  # 与 PINN offline_tau_labels 的 forward Kalman 参数一致；RTS 仅用于离线标签。
+  state_estimator:
+    position_std: 5.0e-4
+    velocity_std: 3.0e-2
+    jerk_std: 2.0
+    initial_position_std: 1.0e-2
+    initial_velocity_std: 2.0e-1
+    initial_acceleration_std: 5.0
+    max_gap_s: 0.1
+  # 与 PINN 数据推理一致：tau_ext 只在残差生成后处理一次。
+  # 先做 21 点因果滑动均值，再做 20 Hz 一阶因果低通；原始残差另存为 *_raw。
+  tau_ext_filter:
+    enabled: true
+    mode: moving_average
+    window: 21
+    cutoff_hz: 20.0
 
-# 显示在线对齐的 tau_f_cal、末端 wrench_ext、tau 和 tau_ext。
+# 左列显示 tau_ext_cal/tau_ext_pred，右列显示 wrench_cal/wrench_pred。
 realtime_plot:
   enabled: true
   window_s: 20.0
   update_rate_hz: 20.0
   inverse_dynamics:
     urdf_path: ../urdf/nero/nero_with_gripper.urdf
-    # urdf_path: ../urdf/nero/nero_with_gripper_identified.urdf
     delay_s: 0.0
     locked_joint_names: [gripper, gripper_joint1, gripper_joint2]
     gravity_m_s2: [0.0, 0.0, -9.81]
   wrench_mapping:
-    frame_name: gripper_base
+    frame_name: gripper_tcp
     reference_frame: local
     damping: 0.02
 
@@ -145,7 +161,7 @@ gripper:
 robot_states:
   q:
     enabled: true
-    # q 保存原始观测值；不再用滑动均值生成 dq。q 低通仅用于 ddq 的二阶导估计。
+    # q 保存原始观测值；mean_window/lowpass 为兼容字段，不参与在线 dq/ddq 计算。
     mean_window: 1
     lowpass: true
     lowpass_cutoff_hz: 10.0
@@ -168,16 +184,24 @@ robot_states:
 
   torque:
     enabled: true
-    # 因果一阶 IIR；H5 保存和实时预览使用同一类在线滤波
+    # measured tau 的唯一源端滤波：10 Hz 因果一阶 IIR；tau_ext_filter 从其残差
+    # 输出继续处理，不会再次调用这一级 source filter。
     lowpass: true
     lowpass_cutoff_hz: 10
     median_window: 1
 
   tau_id:
     enabled: true
-    # q/dq/ddq 已在关节组状态估计器内低通；tau_id 不再追加 IIR。
+    # Raw RNEA output retained for diagnostics.
     lowpass: false
-    lowpass_cutoff_hz: 5
+    lowpass_cutoff_hz: 10
+    median_window: 1
+
+  tau_id_filtered:
+    enabled: true
+    # Already filtered inside tau_ext_inference with the torque checkpoint contract.
+    lowpass: false
+    lowpass_cutoff_hz: 10
     median_window: 1
 
   current:
@@ -194,7 +218,7 @@ robot_states:
 
 
 
-# q 保存原始值；dq 使用 V120 motor_state velocity，ddq 融合 dq 一阶导和 q 二阶导。
+# q 保存原始值；dq 使用 V120 motor_state velocity，ddq 仅由滤波后 dq 的一阶导得到。
 dynamics_processing:
   enabled: false
   state_method: finite_difference

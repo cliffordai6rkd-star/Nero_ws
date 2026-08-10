@@ -20,7 +20,7 @@ from inference.config import (
 from inference.runtime import NeroInferenceRuntime
 from nero_collection.arms.base import ArmState
 from nero_collection.cameras import CameraFrame
-from nero_collection.tau_f_inference import OnlineTauFResult
+from nero_collection.tau_ext_inference import OnlineTauExtResult
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -123,7 +123,7 @@ class _Cameras:
         ]
 
 
-class _TauF:
+class _TauExt:
     def __init__(self):
         self.reset_count = 0
         self.estimate_count = 0
@@ -137,22 +137,21 @@ class _TauF:
     def reset_episode(self):
         self.reset_count += 1
 
-    def estimate_centered(self, timestamp_us, q, dq, ddq, tau):
-        return OnlineTauFResult(
+    def estimate_aligned(self, timestamp_us, q, dq, tau, q_cmd):
+        self.estimate_count += 1
+        return OnlineTauExtResult(
             timestamp_us=timestamp_us,
             q=np.asarray(q).copy(),
             dq=np.asarray(dq).copy(),
-            ddq=np.asarray(ddq).copy(),
+            ddq_kf_causal=np.zeros(7),
             tau=np.asarray(tau).copy(),
             tau_id=np.zeros(7),
-            tau_f_cal=np.zeros(7),
+            tau_id_filtered=np.zeros(7),
             tau_f_pred=np.zeros(7),
-            tau_ext=np.zeros(7),
+            tau_next_pred=np.zeros(7),
+            tau_ext_cal=np.zeros(7),
+            tau_ext_pred=np.zeros(7),
         )
-
-    def estimate_aligned_raw(self, timestamp_us, q, dq, ddq, tau):
-        self.estimate_count += 1
-        return self.estimate_centered(timestamp_us, q, dq, ddq, tau)
 
 
 class _Wrench:
@@ -280,7 +279,7 @@ def test_runtime_waits_for_consumer_only_when_hardware_ring_is_fresh() -> None:
         pipeline=_Pipeline(),
         arm=arm,
         cameras=_Cameras(),
-        online_tau_f=_TauF(),
+        online_tau_ext=_TauExt(),
         wrench_estimator=_Wrench(),
         continuous_state_stream=True,
     )
@@ -326,7 +325,7 @@ def test_runtime_waits_for_consumer_only_when_hardware_ring_is_fresh() -> None:
 
 
 def test_observation_warmup_samples_tau_f_and_wrench_without_inference() -> None:
-    arm, pipeline, tau_f, wrench = _Arm(), _Pipeline(), _TauF(), _Wrench()
+    arm, pipeline, tau_ext, wrench = _Arm(), _Pipeline(), _TauExt(), _Wrench()
     runtime = NeroInferenceRuntime(
         _protected_config(warmup_duration_s=0.002),
         backend="mock",
@@ -334,7 +333,7 @@ def test_observation_warmup_samples_tau_f_and_wrench_without_inference() -> None
         pipeline=pipeline,
         arm=arm,
         cameras=_Cameras(),
-        online_tau_f=tau_f,
+        online_tau_ext=tau_ext,
         wrench_estimator=wrench,
     )
     _use_fast_reset(runtime)
@@ -347,7 +346,7 @@ def test_observation_warmup_samples_tau_f_and_wrench_without_inference() -> None
     assert first is None
     assert second is None
     assert ready is not None
-    assert tau_f.estimate_count == 3
+    assert tau_ext.estimate_count == 3
     assert wrench.map_count == 3
     assert len(pipeline.inputs) == 1
     assert arm.commands == []
@@ -367,7 +366,7 @@ def test_observation_wrench_filter_rejects_an_isolated_spike() -> None:
         pipeline=pipeline,
         arm=_Arm(),
         cameras=_Cameras(),
-        online_tau_f=_TauF(),
+        online_tau_ext=_TauExt(),
         wrench_estimator=_Wrench([1.0, 1000.0, 1.0]),
     )
     _use_fast_reset(runtime)
@@ -398,7 +397,7 @@ def test_observation_wrench_lowpass_smooths_step_input() -> None:
         pipeline=pipeline,
         arm=_Arm(),
         cameras=_Cameras(),
-        online_tau_f=_TauF(),
+        online_tau_ext=_TauExt(),
         wrench_estimator=_Wrench([0.0, 10.0]),
     )
     _use_fast_reset(runtime)
@@ -412,6 +411,36 @@ def test_observation_wrench_lowpass_smooths_step_input() -> None:
         pipeline.inputs[-1].wrench_ext,
         np.full(6, alpha * 10.0),
     )
+    runtime.stop()
+
+
+def test_tau_ext_post_filter_bypasses_second_wrench_lowpass() -> None:
+    pipeline = _Pipeline()
+    tau_ext = _TauExt()
+    tau_ext.config = SimpleNamespace(
+        tau_ext_filter=SimpleNamespace(enabled=True),
+    )
+    runtime = NeroInferenceRuntime(
+        _protected_config(
+            warmup_duration_s=0.0,
+            median_window=1,
+            cutoff_hz=5.0,
+        ),
+        backend="mock",
+        command_enabled=False,
+        pipeline=pipeline,
+        arm=_Arm(),
+        cameras=_Cameras(),
+        online_tau_ext=tau_ext,
+        wrench_estimator=_Wrench([0.0, 10.0]),
+    )
+    _use_fast_reset(runtime)
+    runtime.start()
+
+    runtime.step()
+    runtime.step()
+
+    np.testing.assert_allclose(pipeline.inputs[-1].wrench_ext, 10.0)
     runtime.stop()
 
 
@@ -429,7 +458,7 @@ def test_episode_reset_restarts_warmup_and_clears_wrench_filter() -> None:
         pipeline=pipeline,
         arm=_Arm(),
         cameras=_Cameras(),
-        online_tau_f=_TauF(),
+        online_tau_ext=_TauExt(),
         wrench_estimator=_Wrench([10.0, 10.0, 10.0, 0.0, 0.0, 0.0]),
     )
     _use_fast_reset(runtime)
@@ -457,7 +486,7 @@ def test_predictor_control_mode_and_commands_wait_for_observation_warmup() -> No
         pipeline=pipeline,
         arm=arm,
         cameras=_Cameras(),
-        online_tau_f=_TauF(),
+        online_tau_ext=_TauExt(),
         wrench_estimator=_Wrench(),
     )
     _use_fast_reset(runtime)
@@ -486,7 +515,7 @@ def test_runtime_computes_wrench_and_requires_explicit_command_enable() -> None:
         pipeline=pipeline,
         arm=arm,
         cameras=_Cameras(),
-        online_tau_f=_TauF(),
+        online_tau_ext=_TauExt(),
         wrench_estimator=_Wrench(),
     )
     _use_fast_reset(runtime)
@@ -500,7 +529,7 @@ def test_runtime_computes_wrench_and_requires_explicit_command_enable() -> None:
     assert pipeline.closed
 
 
-def test_runtime_matches_collection_state_alignment_and_uses_aligned_derivatives() -> None:
+def test_runtime_uses_aligned_dq_and_tau_ext_kalman_acceleration() -> None:
     arm, pipeline = _Arm(), _Pipeline()
     arm.dq = np.linspace(0.1, 0.7, 7)
     arm.ddq = np.linspace(-0.7, -0.1, 7)
@@ -511,7 +540,7 @@ def test_runtime_matches_collection_state_alignment_and_uses_aligned_derivatives
         pipeline=pipeline,
         arm=arm,
         cameras=_Cameras(),
-        online_tau_f=_TauF(),
+        online_tau_ext=_TauExt(),
         wrench_estimator=_Wrench(),
     )
     _use_fast_reset(runtime)
@@ -534,7 +563,8 @@ def test_runtime_matches_collection_state_alignment_and_uses_aligned_derivatives
         command.maximum_can_frame_gap_s,
     )
     np.testing.assert_allclose(pipeline.inputs[-1].dq, arm.dq)
-    np.testing.assert_allclose(pipeline.inputs[-1].ddq, arm.ddq)
+    np.testing.assert_allclose(pipeline.inputs[-1].ddq, 0.0)
+    assert not np.allclose(pipeline.inputs[-1].ddq, arm.ddq)
 
 
 def test_runtime_skips_transient_incomplete_aligned_state() -> None:
@@ -546,7 +576,7 @@ def test_runtime_skips_transient_incomplete_aligned_state() -> None:
         pipeline=pipeline,
         arm=arm,
         cameras=_Cameras(),
-        online_tau_f=_TauF(),
+        online_tau_ext=_TauExt(),
         wrench_estimator=_Wrench(),
     )
     _use_fast_reset(runtime)
@@ -586,7 +616,7 @@ def test_open_loop_camera_staleness_waits_while_sampling_but_not_while_executing
         pipeline=pipeline,
         arm=arm,
         cameras=_Cameras(),
-        online_tau_f=_TauF(),
+        online_tau_ext=_TauExt(),
         wrench_estimator=_Wrench(),
     )
     monkeypatch.setattr("inference.runtime.now_us", lambda: 202_500)
@@ -614,7 +644,7 @@ def test_runtime_sends_qp_torque_only_when_explicitly_enabled() -> None:
         pipeline=pipeline,
         arm=arm,
         cameras=_Cameras(),
-        online_tau_f=_TauF(),
+        online_tau_ext=_TauExt(),
         wrench_estimator=_Wrench(),
     )
     _use_fast_reset(runtime)
@@ -643,7 +673,7 @@ def test_startup_reset_waits_through_transient_nan_verification_state() -> None:
         pipeline=_Pipeline(),
         arm=arm,
         cameras=_Cameras(),
-        online_tau_f=_TauF(),
+        online_tau_ext=_TauExt(),
         wrench_estimator=_Wrench(),
     )
     _use_fast_reset(runtime)
@@ -679,7 +709,7 @@ def test_runtime_sends_joint_positions_when_predictor_is_disabled() -> None:
         pipeline=pipeline,
         arm=arm,
         cameras=_Cameras(),
-        online_tau_f=_TauF(),
+        online_tau_ext=_TauExt(),
         wrench_estimator=_Wrench(),
     )
     _use_fast_reset(runtime)
@@ -692,7 +722,7 @@ def test_runtime_sends_joint_positions_when_predictor_is_disabled() -> None:
 
 
 def test_runtime_maximum_steps_resets_and_final_quit_preserves_enabled_arm() -> None:
-    arm, pipeline, tau_f = _Arm(), _Pipeline(), _TauF()
+    arm, pipeline, tau_ext = _Arm(), _Pipeline(), _TauExt()
     config = replace(
         _config(),
         runtime=replace(_config().runtime, maximum_inference_steps=2),
@@ -704,7 +734,7 @@ def test_runtime_maximum_steps_resets_and_final_quit_preserves_enabled_arm() -> 
         pipeline=pipeline,
         arm=arm,
         cameras=_Cameras(),
-        online_tau_f=tau_f,
+        online_tau_ext=tau_ext,
         wrench_estimator=_Wrench(),
     )
     _use_fast_reset(runtime)
@@ -715,7 +745,7 @@ def test_runtime_maximum_steps_resets_and_final_quit_preserves_enabled_arm() -> 
     assert cycles == 2
     assert len(arm.reset_commands) == 3  # startup, step limit, final shutdown
     assert pipeline.reset_count == 3
-    assert tau_f.reset_count == 3
+    assert tau_ext.reset_count == 3
     assert arm.enabled
     assert arm.disable_count == 0
     assert not arm.connected
@@ -730,7 +760,7 @@ def test_runtime_i_resets_current_episode_before_q_exits() -> None:
         pipeline=pipeline,
         arm=arm,
         cameras=_Cameras(),
-        online_tau_f=_TauF(),
+        online_tau_ext=_TauExt(),
         wrench_estimator=_Wrench(),
     )
     _use_fast_reset(runtime)
@@ -753,7 +783,7 @@ def test_runtime_ctrl_c_resets_and_preserves_follower_enabled_state() -> None:
         pipeline=_Pipeline(),
         arm=arm,
         cameras=_Cameras(),
-        online_tau_f=_TauF(),
+        online_tau_ext=_TauExt(),
         wrench_estimator=_Wrench(),
     )
     _use_fast_reset(runtime)
@@ -784,7 +814,7 @@ def test_runtime_exception_immediately_resets_and_preserves_enabled_arm() -> Non
         pipeline=pipeline,
         arm=arm,
         cameras=_Cameras(),
-        online_tau_f=_TauF(),
+        online_tau_ext=_TauExt(),
         wrench_estimator=_Wrench(),
     )
     _use_fast_reset(runtime)
@@ -813,7 +843,7 @@ def test_runtime_never_disables_when_exception_reset_also_fails() -> None:
         pipeline=pipeline,
         arm=arm,
         cameras=_Cameras(),
-        online_tau_f=_TauF(),
+        online_tau_ext=_TauExt(),
         wrench_estimator=_Wrench(),
     )
     _use_fast_reset(runtime)

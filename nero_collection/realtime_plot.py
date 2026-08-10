@@ -20,9 +20,8 @@ log = logging.getLogger(__name__)
 class _RealtimeSample:
     timestamp_us: int
     q: np.ndarray
-    tau_f_cal: np.ndarray
-    tau: np.ndarray
-    tau_ext: np.ndarray
+    tau_ext_cal: np.ndarray
+    tau_ext_pred: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -34,72 +33,71 @@ class SlidingJointBuffer:
     def __init__(self, window_s: float) -> None:
         self.window_s = float(window_s)
         self._timestamps_s: deque[float] = deque()
-        self._tau_f_cal: deque[np.ndarray] = deque()
-        self._wrench_ext: deque[np.ndarray] = deque()
-        self._tau: deque[np.ndarray] = deque()
-        self._tau_ext: deque[np.ndarray] = deque()
+        self._tau_ext_cal: deque[np.ndarray] = deque()
+        self._tau_ext_pred: deque[np.ndarray] = deque()
+        self._wrench_cal: deque[np.ndarray] = deque()
+        self._wrench_pred: deque[np.ndarray] = deque()
 
     def append(
         self,
         timestamp_us: int,
-        tau_f_cal: np.ndarray,
-        wrench_ext: np.ndarray,
-        tau: np.ndarray,
-        tau_ext: np.ndarray,
+        tau_ext_cal: np.ndarray,
+        tau_ext_pred: np.ndarray,
+        wrench_cal: np.ndarray,
+        wrench_pred: np.ndarray,
     ) -> None:
-        tau_f_cal = _plot_vector("tau_f_cal", tau_f_cal, 7)
-        wrench_ext = _plot_vector("wrench_ext", wrench_ext, 6)
-        tau = _plot_vector("tau", tau, 7)
-        tau_ext = _plot_vector("tau_ext", tau_ext, 7)
+        tau_ext_cal = _plot_vector("tau_ext_cal", tau_ext_cal, 7)
+        tau_ext_pred = _plot_vector("tau_ext_pred", tau_ext_pred, 7)
+        wrench_cal = _plot_vector("wrench_cal", wrench_cal, 6)
+        wrench_pred = _plot_vector("wrench_pred", wrench_pred, 6)
         timestamp_s = int(timestamp_us) / 1_000_000.0
         if self._timestamps_s and timestamp_s <= self._timestamps_s[-1]:
             return
         self._timestamps_s.append(timestamp_s)
-        self._tau_f_cal.append(tau_f_cal)
-        self._wrench_ext.append(wrench_ext)
-        self._tau.append(tau)
-        self._tau_ext.append(tau_ext)
+        self._tau_ext_cal.append(tau_ext_cal)
+        self._tau_ext_pred.append(tau_ext_pred)
+        self._wrench_cal.append(wrench_cal)
+        self._wrench_pred.append(wrench_pred)
 
         cutoff_s = timestamp_s - self.window_s
         while self._timestamps_s and self._timestamps_s[0] < cutoff_s:
             self._timestamps_s.popleft()
-            self._tau_f_cal.popleft()
-            self._wrench_ext.popleft()
-            self._tau.popleft()
-            self._tau_ext.popleft()
+            self._tau_ext_cal.popleft()
+            self._tau_ext_pred.popleft()
+            self._wrench_cal.popleft()
+            self._wrench_pred.popleft()
 
     def arrays(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         if not self._timestamps_s:
             return (
                 np.empty((0,), dtype=np.float64),
                 np.empty((0, 7), dtype=np.float64),
+                np.empty((0, 7), dtype=np.float64),
                 np.empty((0, 6), dtype=np.float64),
-                np.empty((0, 7), dtype=np.float64),
-                np.empty((0, 7), dtype=np.float64),
+                np.empty((0, 6), dtype=np.float64),
             )
         timestamps = np.asarray(self._timestamps_s, dtype=np.float64)
         return (
             timestamps - timestamps[-1],
-            np.stack(self._tau_f_cal, axis=0),
-            np.stack(self._wrench_ext, axis=0),
-            np.stack(self._tau, axis=0),
-            np.stack(self._tau_ext, axis=0),
+            np.stack(self._tau_ext_cal, axis=0),
+            np.stack(self._tau_ext_pred, axis=0),
+            np.stack(self._wrench_cal, axis=0),
+            np.stack(self._wrench_pred, axis=0),
         )
 
     def clear(self) -> None:
         self._timestamps_s.clear()
-        self._tau_f_cal.clear()
-        self._wrench_ext.clear()
-        self._tau.clear()
-        self._tau_ext.clear()
+        self._tau_ext_cal.clear()
+        self._tau_ext_pred.clear()
+        self._wrench_cal.clear()
+        self._wrench_pred.clear()
 
 
 class RealtimeJointPlotter:
     _REQUIRED_DATASETS = (
         "q_follower",
-        "tau_f_cal",
-        "tau_follower",
-        "tau_ext",
+        "tau_ext_cal",
+        "tau_ext_pred",
     )
 
     def __init__(
@@ -134,7 +132,8 @@ class RealtimeJointPlotter:
         )
         self._process.start()
         log.info(
-            "realtime plot process started datasets=tau_f_cal,wrench_ext,tau_follower,tau_ext "
+            "realtime plot process started datasets=tau_ext_cal,tau_ext_pred,"
+            "wrench_cal,wrench_pred "
             "window=%.1fs update=%.1fHz",
             self.config.window_s,
             self.config.update_rate_hz,
@@ -158,9 +157,8 @@ class RealtimeJointPlotter:
         sample = _RealtimeSample(
             timestamp_us=int(timestamp_us),
             q=_plot_vector("q_follower", values["q_follower"][1], 7),
-            tau_f_cal=_plot_vector("tau_f_cal", values["tau_f_cal"][1], 7),
-            tau=_plot_vector("tau", values["tau_follower"][1], 7),
-            tau_ext=_plot_vector("tau_ext", values["tau_ext"][1], 7),
+            tau_ext_cal=_plot_vector("tau_ext_cal", values["tau_ext_cal"][1], 7),
+            tau_ext_pred=_plot_vector("tau_ext_pred", values["tau_ext_pred"][1], 7),
         )
         try:
             self._queue.put_nowait(sample)
@@ -224,17 +222,17 @@ class RealtimeJointPlotter:
 
 class _MatplotlibPlotWindow:
     _PLOTS = (
-        ("tau_f_cal", "tau_id - tau [N.m]", tuple(f"J{index}" for index in range(1, 8))),
+        ("tau_ext_cal", "external torque [N.m]", tuple(f"J{index}" for index in range(1, 8))),
         (
-            "wrench_ext (tool frame)",
+            "wrench_cal",
             "force [N] / moment [N.m]",
             ("Fx", "Fy", "Fz", "Mx", "My", "Mz"),
         ),
-        ("tau", "tau [N.m]", tuple(f"J{index}" for index in range(1, 8))),
+        ("tau_ext_pred", "external torque [N.m]", tuple(f"J{index}" for index in range(1, 8))),
         (
-            "tau_ext",
-            "filtered and gated external torque [N.m]",
-            tuple(f"J{index}" for index in range(1, 8)),
+            "wrench_pred",
+            "force [N] / moment [N.m]",
+            ("Fx", "Fy", "Fz", "Mx", "My", "Mz"),
         ),
     )
 
@@ -258,9 +256,9 @@ class _MatplotlibPlotWindow:
                 axis.plot([], [], color=colors[index], linewidth=1.1, label=label)[0]
                 for index, label in enumerate(labels)
             )
-            if title == "wrench_ext (tool frame)":
+            if title.startswith("wrench_"):
                 mapping = config.wrench_mapping
-                title = f"wrench_ext ({mapping.frame_name}/{mapping.reference_frame})"
+                title = f"{title} ({mapping.frame_name}/{mapping.reference_frame})"
             axis.set_title(title)
             axis.set_xlabel("time [s], live")
             axis.set_ylabel(ylabel)
@@ -281,12 +279,14 @@ class _MatplotlibPlotWindow:
         self.buffer.append(*sample)
 
     def render(self) -> None:
-        relative_time, tau_f_cal, wrench_ext, tau, tau_ext = self.buffer.arrays()
+        relative_time, tau_ext_cal, tau_ext_pred, wrench_cal, wrench_pred = (
+            self.buffer.arrays()
+        )
         if relative_time.size:
             for axis, lines, data in zip(
                 self.axes,
                 self.lines,
-                (tau_f_cal, wrench_ext, tau, tau_ext),
+                (tau_ext_cal, wrench_cal, tau_ext_pred, wrench_pred),
             ):
                 for index, line in enumerate(lines):
                     line.set_data(relative_time, data[:, index])
@@ -355,26 +355,32 @@ def _plot_worker(
                         log.debug("realtime plot history cleared")
                         continue
                     sample = queued_item
-                    wrench_estimate = wrench_estimator.map_joint_torque(
+                    wrench_cal = wrench_estimator.map_joint_torque(
                         sample.q,
-                        sample.tau_ext,
+                        sample.tau_ext_cal,
+                    )
+                    wrench_pred = wrench_estimator.map_joint_torque(
+                        sample.q,
+                        sample.tau_ext_pred,
                     )
                     window.append(
                         (
                             sample.timestamp_us,
-                            sample.tau_f_cal,
-                            wrench_estimate.wrench,
-                            sample.tau,
-                            sample.tau_ext,
+                            sample.tau_ext_cal,
+                            sample.tau_ext_pred,
+                            wrench_cal.wrench,
+                            wrench_pred.wrench,
                         )
                     )
                     now = time.monotonic()
                     if now >= next_diagnostic_t:
                         log.debug(
-                            "tau_ext max_abs=%.4fNm wrench_error=%.4f condition=%.3g",
-                            float(np.max(np.abs(sample.tau_ext))),
-                            wrench_estimate.reconstruction_error,
-                            wrench_estimate.condition_number,
+                            "tau_ext cal/pred max_abs=%.4f/%.4fNm "
+                            "wrench_error=%.4f/%.4f",
+                            float(np.max(np.abs(sample.tau_ext_cal))),
+                            float(np.max(np.abs(sample.tau_ext_pred))),
+                            wrench_cal.reconstruction_error,
+                            wrench_pred.reconstruction_error,
                         )
                         next_diagnostic_t = now + 2.0
 

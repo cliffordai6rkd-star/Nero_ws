@@ -14,12 +14,10 @@ from nero_collection.config import (
 from nero_collection.filters import OnePoleLowPass
 from nero_collection.h5_writer import EpisodeBuffer
 from nero_collection.dynamics_processing import (
-    filter_torque_causal,
     finite_difference_state,
     resample_columns,
     three_point_centered_sample,
 )
-from nero_collection.contact_wrench import JointTorqueResidualEstimate
 
 
 def test_three_point_state_is_exact_for_quadratic_with_timestamp_jitter() -> None:
@@ -137,26 +135,7 @@ def test_episode_buffer_preserves_aligned_q_dq_ddq_without_redifferentiating() -
 
 def test_finalize_teleop_data_preserves_aligned_derivatives_without_h5py(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class FakeEstimator:
-        def __init__(self, _config) -> None:
-            pass
-
-        def estimate(self, q, dq, ddq, tau):
-            tau_model = dq + ddq
-            return JointTorqueResidualEstimate(
-                tau_id=tau_model,
-                tau_friction=dq,
-                tau_bias=ddq,
-                tau_model=tau_model,
-                tau_residual=tau_model - tau,
-            )
-
-    monkeypatch.setattr(
-        "nero_collection.h5_writer.PinocchioJointTorqueResidualEstimator",
-        FakeEstimator,
-    )
     config = CollectionConfig(
         teleop=TeleopConfig(),
         output=OutputConfig(directory=tmp_path),
@@ -207,50 +186,35 @@ def test_finalize_teleop_data_preserves_aligned_derivatives_without_h5py(
 
     assert state_names["dq_follower"] == "velocity"
     assert attrs["dq_follower"]["derivative_method"] == (
-        "official_motor_velocity_with_causal_lowpass"
+        "sign_corrected_official_motor_velocity_with_causal_lowpass"
+    )
+    assert attrs["dq_follower"]["coordinate_sign_correction_json"] == (
+        "[-1, -1, -1, -1, -1, 1, -1]"
+    )
+    assert attrs["dq_follower"]["coordinate_frame"] == (
+        "nero_joint_position_coordinates"
     )
     assert attrs["ddq_follower"]["derivative_method"] == (
-        "fused_dq_first_derivative_and_q_second_derivative"
+        "causal_first_derivative_of_sign_corrected_filtered_official_velocity"
+    )
+    assert attrs["ddq_follower"]["derived_from_json"] == '["dq_follower"]'
+    assert attrs["ddq_follower"]["formula"] == (
+        "ddq_raw[k]=(dq[k]-dq[k-1])/measured_dt"
     )
     assert data["q_follower"] == pytest.approx(q)
     assert data["dq_follower"] == pytest.approx(dq)
     assert data["ddq_follower"] == pytest.approx(ddq)
-    assert "tau_f" in data
-    assert attrs["tau_f"]["definition"] == "tau_id - tau_follower"
-    assert attrs["tau_f"]["lowpass"]
-    assert attrs["tau_f"]["dq_lowpass"]
-    assert attrs["tau_f"]["ddq_lowpass"]
-    assert attrs["tau_f"]["tau_id_lowpass"]
-    assert attrs["tau_f"]["tau_id_filter_method"] == "causal_median_then_one_pole_iir"
+    assert "tau_f" not in data
 
 
 def test_episode_save_preserves_aligned_derivatives_and_filters_torque(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     try:
         import h5py
     except Exception as exc:
         pytest.skip(f"h5py is unavailable: {exc}")
 
-    class FakeEstimator:
-        def __init__(self, _config) -> None:
-            pass
-
-        def estimate(self, q, dq, ddq, tau):
-            tau_model = dq + ddq
-            return JointTorqueResidualEstimate(
-                tau_id=tau_model,
-                tau_friction=np.zeros(7),
-                tau_bias=ddq,
-                tau_model=tau_model,
-                tau_residual=tau_model - tau,
-            )
-
-    monkeypatch.setattr(
-        "nero_collection.h5_writer.PinocchioJointTorqueResidualEstimator",
-        FakeEstimator,
-    )
     config = CollectionConfig(
         teleop=TeleopConfig(),
         output=OutputConfig(directory=tmp_path),
@@ -304,7 +268,7 @@ def test_episode_save_preserves_aligned_derivatives_and_filters_torque(
 
     with h5py.File(output, "r") as h5:
         teleop = h5["teleop"]
-        assert h5.attrs["format"] == "factr_multimodal_episode/v7"
+        assert h5.attrs["format"] == "factr_multimodal_episode/v9"
         assert np.allclose(teleop["dq_follower"][:], 0.0)
         assert np.allclose(teleop["ddq_follower"][:], 999.0)
         assert "dq_follower_firmware_raw" not in teleop
@@ -314,24 +278,13 @@ def test_episode_save_preserves_aligned_derivatives_and_filters_torque(
         assert abs(teleop["tau_follower"][50, 3]) < abs(tau[50, 3])
         assert "tau_ext_follower" not in teleop
         assert teleop["q_follower"].shape == (100, 7)
-        assert teleop["tau_f"].shape == (100, 7)
+        assert "tau_f" not in teleop
         assert np.allclose(teleop["timestamp_us"][:], timestamps)
-        assert np.allclose(teleop["tau_f_timestamp_us"][:], timestamps)
-        tau_filtered = filter_torque_causal(
-            timestamps,
-            tau,
-            median_window=1,
-            lowpass_hz=20.0,
-        )
-        assert teleop["tau_f"][0] == pytest.approx(999.0 - tau_filtered[0])
-        assert teleop["tau_f"].attrs["processing_method"] == (
-            "per_joint_group_state_rnea"
-        )
         assert teleop["dq_follower"].attrs["derivative_method"] == (
-            "official_motor_velocity_with_causal_lowpass"
+            "sign_corrected_official_motor_velocity_with_causal_lowpass"
         )
         assert teleop["ddq_follower"].attrs["derivative_method"] == (
-            "fused_dq_first_derivative_and_q_second_derivative"
+            "causal_first_derivative_of_sign_corrected_filtered_official_velocity"
         )
         assert teleop["dq_follower"].attrs["timestamp_path"] == "teleop/timestamp_us"
         assert bool(teleop["tau_follower"].attrs["zero_phase"]) is False

@@ -75,10 +75,10 @@ def run_collection(
                     config=config,
                     arm_names=teleop.arm_names,
                     sample_rate_hz=config.teleop.command.sample_rate_hz,
-                    online_tau_f=getattr(teleop, "online_tau_f", None),
+                    online_tau_ext=getattr(teleop, "online_tau_ext", None),
                 )
                 if buffer.warm_up_online_inference():
-                    log.info("online tau_f inference warmed up before bilateral control")
+                    log.info("online tau_ext inference warmed up before bilateral control")
                 _wait_for_record_start(
                     teleop,
                     keys,

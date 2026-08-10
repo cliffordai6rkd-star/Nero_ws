@@ -27,7 +27,7 @@ dp_sampling:
 
 robot:
   urdf_path: ../../urdf/nero/nero_with_gripper.urdf
-  frame_name: gripper_base
+  frame_name: gripper_tcp
   action_frame_name: link7
   locked_joint_names: [gripper, gripper_joint1, gripper_joint2]
 
@@ -44,6 +44,7 @@ observation_protection:
   # 启动及每次 episode 复位后保持静止，持续采样 tau_f/wrench，满 2 秒才允许策略推理。
   enabled: true
   warmup_duration_s: 2.0
+  # tau_ext_filter 已启用时不再重复滤波 wrench；仅在关闭它时使用。
   wrench_median_window: 5
   wrench_lowpass_cutoff_hz: 5.0
 
