@@ -370,6 +370,7 @@ class EpisodeBuffer:
         metadata = self.online_tau_ext.metadata
         kalman = self.config.tau_ext_inference.state_estimator
         tau_ext_filter = metadata.tau_ext_filter
+        source_filter = self.config.tau_ext_inference.source_butterworth_filter
         sample_rates = {
             name: model_metadata.sample_rate_hz
             for name, model_metadata in (
@@ -389,6 +390,15 @@ class EpisodeBuffer:
             "observation_gap_warning_s": (
                 self.config.tau_ext_inference.observation_gap_warning_s
             ),
+            "source_butterworth_filter_enabled": source_filter.enabled,
+            "source_butterworth_filter_features_json": json.dumps(
+                ["q", "dq", "tau"] if source_filter.enabled else []
+            ),
+            "source_butterworth_filter_cutoff_hz": source_filter.cutoff_hz,
+            "source_butterworth_filter_sample_rate_hz": source_filter.sample_rate_hz,
+            "source_butterworth_filter_order": source_filter.order,
+            "source_butterworth_filter_causal": True,
+            "source_butterworth_filter_initialization": "steady_first_sample",
             "dq_coordinate_sign_correction_json": json.dumps(
                 NERO_V120_MOTOR_VELOCITY_TO_JOINT_SIGN
             ),

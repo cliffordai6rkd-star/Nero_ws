@@ -20,6 +20,7 @@ from nero_collection.config import (
 )
 from nero_collection.contact_wrench import PinocchioJointTorqueResidualEstimator
 from nero_collection.filters import (
+    ButterworthLowPass,
     CausalFilterPipeline,
     CausalHampelButterworth,
     CausalTrailingMovingAverage,
@@ -654,6 +655,19 @@ class OnlineTauExtInference:
             if self._tau_next_sample_rate_hz is None
             else _FixedPhaseCausalObservationGrid(self._tau_next_sample_rate_hz)
         )
+        source_filter = config.source_butterworth_filter
+        self.source_butterworth_filters = (
+            {
+                key: ButterworthLowPass(
+                    cutoff_hz=source_filter.cutoff_hz,
+                    sample_rate_hz=source_filter.sample_rate_hz,
+                    order=source_filter.order,
+                )
+                for key in ("q", "dq", "tau")
+            }
+            if source_filter.enabled
+            else {}
+        )
 
         self.estimator = None
         self.state_estimator = None
@@ -783,6 +797,8 @@ class OnlineTauExtInference:
             self.state_estimator.reset()
         _reset_filter_bank(self.tau_f_input_filters)
         _reset_filter_bank(self.tau_next_input_filters)
+        for source_filter in self.source_butterworth_filters.values():
+            source_filter.reset()
         if self.tau_filter is not None:
             self.tau_filter.reset()
         if self.tau_id_filter is not None:
@@ -845,11 +861,23 @@ class OnlineTauExtInference:
                 )
         self._last_input_timestamp_us = timestamp_us
 
+        filtered_source = {
+            key: (
+                self.source_butterworth_filters[key].apply(value, timestamp_us)
+                if key in self.source_butterworth_filters
+                else value.copy()
+            )
+            for key, value in (
+                ("q", q_value),
+                ("dq", dq_value),
+                ("tau", raw_tau_value),
+            )
+        }
         source = _SourceObservation(
             timestamp_us=timestamp_us,
-            q=q_value.copy(),
-            dq=dq_value.copy(),
-            tau=raw_tau_value.copy(),
+            q=filtered_source["q"],
+            dq=filtered_source["dq"],
+            tau=filtered_source["tau"],
             q_cmd=q_cmd_value.copy(),
         )
         if self._last_source_timestamp_us is not None:

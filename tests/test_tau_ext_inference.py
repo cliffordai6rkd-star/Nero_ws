@@ -14,12 +14,14 @@ from nero_collection.config import (
     DynamicsProcessingConfig,
     InverseDynamicsConfig,
     SequenceCheckpointConfig,
+    SourceButterworthFilterConfig,
     StateParamConfig,
     TauExtInferenceConfig,
     _parse_tau_ext_inference,
     load_config,
 )
 from nero_collection.filters import (
+    ButterworthLowPass,
     CausalFilterPipeline,
     CausalHampelButterworth,
     CausalWindowLowPass,
@@ -240,6 +242,77 @@ def test_each_active_checkpoint_uses_its_own_observation_rate() -> None:
 
     assert len(tau_f.features) == 11
     assert len(tau_next.features) == 6
+
+
+def test_source_butterworth_filters_q_dq_tau_once_before_both_model_grids() -> None:
+    tau_f = _Predictor("tau_f", np.zeros(7))
+    tau_next = _Predictor("tau", np.zeros(7))
+    inverse_dynamics = _InverseDynamics(np.zeros(7))
+    state_estimator = _StateEstimator(np.zeros(7))
+    inference = OnlineTauExtInference(
+        TauExtInferenceConfig(
+            enabled=True,
+            tau_f=SequenceCheckpointConfig(observation_sample_rate_hz=100.0),
+            tau_next=SequenceCheckpointConfig(observation_sample_rate_hz=100.0),
+            source_butterworth_filter=SourceButterworthFilterConfig(
+                enabled=True,
+                cutoff_hz=15.0,
+                sample_rate_hz=117.0,
+                order=2,
+            ),
+        ),
+        InverseDynamicsConfig(),
+        DynamicsProcessingConfig(),
+        {"torque": StateParamConfig(lowpass=True, lowpass_cutoff_hz=10.0)},
+        tau_f_predictor=tau_f,
+        tau_next_predictor=tau_next,
+        estimator=inverse_dynamics,
+        state_estimator=state_estimator,
+    )
+    zeros = np.zeros(7)
+    ones = np.ones(7)
+
+    inference.estimate_aligned(1_000_000, zeros, zeros, zeros, zeros)
+    inference.estimate_aligned(
+        1_010_000,
+        ones,
+        2.0 * ones,
+        3.0 * ones,
+        4.0 * ones,
+    )
+
+    q_reference = ButterworthLowPass(15.0, 117.0, 2)
+    dq_reference = ButterworthLowPass(15.0, 117.0, 2)
+    tau_reference = ButterworthLowPass(15.0, 117.0, 2)
+    q_reference.apply(zeros, 1_000_000)
+    dq_reference.apply(zeros, 1_000_000)
+    tau_reference.apply(zeros, 1_000_000)
+    expected_q = q_reference.apply(ones, 1_010_000)
+    expected_dq = dq_reference.apply(2.0 * ones, 1_010_000)
+    expected_tau = tau_reference.apply(3.0 * ones, 1_010_000)
+
+    np.testing.assert_allclose(tau_f.features[1]["q"], expected_q)
+    np.testing.assert_allclose(tau_next.features[1]["q"], expected_q)
+    np.testing.assert_allclose(tau_f.features[1]["dq"], expected_dq)
+    np.testing.assert_allclose(tau_next.features[1]["dq"], expected_dq)
+    # q_cmd remains an event/ZOH signal, so delta_q subtracts filtered q only.
+    np.testing.assert_allclose(tau_f.features[1]["delta_q"], 4.0 - expected_q)
+    np.testing.assert_allclose(tau_next.features[1]["delta_q"], 4.0 - expected_q)
+    source_tau_filter = OnePoleLowPass(10.0, 1)
+    source_tau_filter.apply(zeros, 1_000_000)
+    expected_tau_after_checkpoint_filter = source_tau_filter.apply(
+        expected_tau,
+        1_010_000,
+    )
+    np.testing.assert_allclose(
+        inverse_dynamics.calls[1][3],
+        expected_tau_after_checkpoint_filter,
+    )
+
+    inference.reset_episode()
+    inference.estimate_aligned(2_000_000, 7.0 * ones, zeros, zeros, 8.0 * ones)
+    np.testing.assert_allclose(tau_f.features[-1]["q"], 7.0)
+    np.testing.assert_allclose(tau_next.features[-1]["q"], 7.0)
 
 
 def test_tau_id_uses_the_same_causal_filter_as_measured_torque() -> None:
@@ -799,6 +872,44 @@ def test_tau_ext_config_allows_independent_or_empty_checkpoints(tmp_path: Path) 
     assert config.tau_ext_filter.hampel_n_sigma == pytest.approx(3.0)
     assert config.tau_ext_filter.order == 4
     assert config.tau_ext_filter.sample_rate_hz == pytest.approx(100.0)
+
+
+def test_source_butterworth_config_is_explicit_and_validated(tmp_path: Path) -> None:
+    config = _parse_tau_ext_inference(
+        {
+            "enabled": True,
+            "source_butterworth_filter": {
+                "enabled": True,
+                "cutoff_hz": 15.0,
+                "sample_rate_hz": 117.0,
+                "order": 2,
+            },
+        },
+        tmp_path,
+    )
+    assert config.source_butterworth_filter.enabled
+    assert config.source_butterworth_filter.cutoff_hz == pytest.approx(15.0)
+    assert config.source_butterworth_filter.sample_rate_hz == pytest.approx(117.0)
+    assert config.source_butterworth_filter.order == 2
+
+    with pytest.raises(ValueError, match="Nyquist"):
+        _parse_tau_ext_inference(
+            {
+                "source_butterworth_filter": {
+                    "enabled": True,
+                    "cutoff_hz": 60.0,
+                    "sample_rate_hz": 117.0,
+                    "order": 2,
+                }
+            },
+            tmp_path,
+        )
+
+    with pytest.raises(ValueError, match="order must be 2"):
+        _parse_tau_ext_inference(
+            {"source_butterworth_filter": {"order": 4}},
+            tmp_path,
+        )
 
 
 @pytest.mark.parametrize("value", (0, -1, float("nan"), float("inf"), True))

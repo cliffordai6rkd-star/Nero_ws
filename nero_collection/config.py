@@ -109,12 +109,25 @@ class TauExtFilterConfig:
 
 
 @dataclass(frozen=True)
+class SourceButterworthFilterConfig:
+    """Anti-alias filter applied to raw q/dq/tau before model resampling."""
+
+    enabled: bool = False
+    cutoff_hz: float = 15.0
+    sample_rate_hz: float = 117.0
+    order: int = 2
+
+
+@dataclass(frozen=True)
 class TauExtInferenceConfig:
     enabled: bool = False
     observation_gap_warning_s: float = 0.06
     maximum_prediction_age_s: float = 0.06
     tau_f: SequenceCheckpointConfig = field(default_factory=SequenceCheckpointConfig)
     tau_next: SequenceCheckpointConfig = field(default_factory=SequenceCheckpointConfig)
+    source_butterworth_filter: SourceButterworthFilterConfig = field(
+        default_factory=SourceButterworthFilterConfig
+    )
     state_estimator: CausalKalmanConfig = field(default_factory=CausalKalmanConfig)
     tau_ext_filter: TauExtFilterConfig = field(default_factory=TauExtFilterConfig)
 
@@ -812,6 +825,7 @@ def _parse_tau_ext_inference(
         "maximum_prediction_age_s",
         "tau_f",
         "tau_next",
+        "source_butterworth_filter",
         "state_estimator",
         "tau_ext_filter",
     }
@@ -839,6 +853,9 @@ def _parse_tau_ext_inference(
         "tau_ext_inference.tau_next",
         config_dir,
     )
+    source_butterworth_filter = _parse_source_butterworth_filter(
+        data.get("source_butterworth_filter", {})
+    )
     state_estimator = _parse_causal_kalman(
         data.get("state_estimator", {}),
         "tau_ext_inference.state_estimator",
@@ -850,8 +867,55 @@ def _parse_tau_ext_inference(
         maximum_prediction_age_s=maximum_prediction_age_s,
         tau_f=tau_f,
         tau_next=tau_next,
+        source_butterworth_filter=source_butterworth_filter,
         state_estimator=state_estimator,
         tau_ext_filter=tau_ext_filter,
+    )
+
+
+def _parse_source_butterworth_filter(
+    data: dict[str, Any],
+) -> SourceButterworthFilterConfig:
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        raise ValueError(
+            "tau_ext_inference.source_butterworth_filter must be a mapping"
+        )
+    allowed = {"enabled", "cutoff_hz", "sample_rate_hz", "order"}
+    unknown = set(data) - allowed
+    if unknown:
+        raise ValueError(
+            "tau_ext_inference.source_butterworth_filter contains unknown "
+            f"options: {sorted(unknown)}"
+        )
+    enabled = bool(data.get("enabled", False))
+    cutoff_hz = float(data.get("cutoff_hz", 15.0))
+    sample_rate_hz = float(data.get("sample_rate_hz", 117.0))
+    order = int(data.get("order", 2))
+    if not isfinite(sample_rate_hz) or sample_rate_hz <= 0.0:
+        raise ValueError(
+            "tau_ext_inference.source_butterworth_filter.sample_rate_hz "
+            "must be positive and finite"
+        )
+    if (
+        not isfinite(cutoff_hz)
+        or cutoff_hz <= 0.0
+        or cutoff_hz >= 0.5 * sample_rate_hz
+    ):
+        raise ValueError(
+            "tau_ext_inference.source_butterworth_filter.cutoff_hz must be "
+            "positive and below the Nyquist frequency"
+        )
+    if order != 2:
+        raise ValueError(
+            "tau_ext_inference.source_butterworth_filter.order must be 2"
+        )
+    return SourceButterworthFilterConfig(
+        enabled=enabled,
+        cutoff_hz=cutoff_hz,
+        sample_rate_hz=sample_rate_hz,
+        order=order,
     )
 
 

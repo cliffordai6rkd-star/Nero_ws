@@ -75,6 +75,13 @@ tau_ext_inference:
     checkpoint_path: model/tau_free/epoch_095_val_tau_mse_nm2_0.006872.pt
     # Unix epoch 固定相位；每个 20 ms tick 只用 tick 前最新完整帧推进 tau-free。
     observation_sample_rate_hz: 50.0
+  # 在 tau_f/tau_next 各自二次采样前，共享同一份原始帧因果抗混叠结果。
+  # 只处理 q、dq、tau；q_cmd 保持事件/ZOH 信号，不参与低通。
+  source_butterworth_filter:
+    enabled: true
+    cutoff_hz: 15.0
+    sample_rate_hz: 117.0
+    order: 2
   # 与 PINN offline_tau_labels 的 forward Kalman 参数一致；RTS 仅用于离线标签。
   state_estimator:
     position_std: 5.0e-4
