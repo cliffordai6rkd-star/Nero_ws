@@ -187,6 +187,79 @@ class ButterworthLowPass:
 
 
 @dataclass
+class VariableStepButterworthLowPass:
+    """Causal second-order Butterworth filter for irregular timestamps.
+
+    The continuous Butterworth state equation is integrated with a trapezoidal
+    (Tustin) step using each measured timestamp interval. This keeps one
+    continuous filter state without assuming a fixed source sample rate.
+    """
+
+    cutoff_hz: float
+    state: np.ndarray | None = None
+    previous_value: np.ndarray | None = None
+    previous_timestamp_us: int | None = None
+
+    def __post_init__(self) -> None:
+        if not np.isfinite(self.cutoff_hz) or self.cutoff_hz <= 0.0:
+            raise ValueError("cutoff_hz must be positive and finite")
+        omega = 2.0 * np.pi * float(self.cutoff_hz)
+        self._a = np.asarray(
+            [[0.0, 1.0], [-omega * omega, -np.sqrt(2.0) * omega]],
+            dtype=np.float64,
+        )
+        self._b = np.asarray([0.0, omega * omega], dtype=np.float64)
+        self._identity = np.eye(2, dtype=np.float64)
+
+    def apply(self, value: np.ndarray, timestamp_us: int) -> np.ndarray:
+        value = np.asarray(value, dtype=np.float64)
+        timestamp_us = int(timestamp_us)
+        if value.ndim != 1 or not np.all(np.isfinite(value)):
+            raise ValueError(
+                "variable-step Butterworth filter expects one finite feature vector"
+            )
+        if self.state is None:
+            self.state = np.stack(
+                (value.copy(), np.zeros_like(value)),
+                axis=0,
+            )
+            self.previous_value = value.copy()
+            self.previous_timestamp_us = timestamp_us
+            return value.copy()
+
+        assert self.previous_value is not None
+        assert self.previous_timestamp_us is not None
+        if value.shape != self.previous_value.shape:
+            raise ValueError(
+                f"filter shape changed from {self.previous_value.shape} to {value.shape}"
+            )
+        dt = (timestamp_us - self.previous_timestamp_us) * 1.0e-6
+        if not np.isfinite(dt) or dt <= 0.0:
+            raise ValueError(
+                "filter timestamps must be strictly increasing: "
+                f"{timestamp_us} <= {self.previous_timestamp_us}"
+            )
+
+        left = self._identity - 0.5 * dt * self._a
+        right = (
+            (self._identity + 0.5 * dt * self._a) @ self.state
+            + 0.5
+            * dt
+            * self._b[:, np.newaxis]
+            * (self.previous_value + value)[np.newaxis, :]
+        )
+        self.state = np.linalg.solve(left, right)
+        self.previous_value = value.copy()
+        self.previous_timestamp_us = timestamp_us
+        return self.state[0].copy()
+
+    def reset(self) -> None:
+        self.state = None
+        self.previous_value = None
+        self.previous_timestamp_us = None
+
+
+@dataclass
 class CausalHampelButterworth:
     """Hampel outlier rejection followed once by a Butterworth low-pass."""
 

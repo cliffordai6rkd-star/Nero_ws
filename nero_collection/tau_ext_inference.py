@@ -20,13 +20,13 @@ from nero_collection.config import (
 )
 from nero_collection.contact_wrench import PinocchioJointTorqueResidualEstimator
 from nero_collection.filters import (
-    ButterworthLowPass,
     CausalFilterPipeline,
     CausalHampelButterworth,
     CausalTrailingMovingAverage,
     CausalTrailingMedian,
     CausalWindowLowPass,
     OnePoleLowPass,
+    VariableStepButterworthLowPass,
 )
 
 
@@ -658,10 +658,8 @@ class OnlineTauExtInference:
         source_filter = config.source_butterworth_filter
         self.source_butterworth_filters = (
             {
-                key: ButterworthLowPass(
+                key: VariableStepButterworthLowPass(
                     cutoff_hz=source_filter.cutoff_hz,
-                    sample_rate_hz=source_filter.sample_rate_hz,
-                    order=source_filter.order,
                 )
                 for key in ("q", "dq", "tau")
             }

@@ -80,9 +80,8 @@ tau_ext_inference:
   source_butterworth_filter:
     enabled: true
     cutoff_hz: 15.0
-    sample_rate_hz: 117.0
     order: 2
-  # 与 PINN offline_tau_labels 的 forward Kalman 参数一致；RTS 仅用于离线标签。
+  # 与 PINN offline_tau_labels 的 forward Kalman 参数一致；RTS 仅用于生成ddq离线标签。
   state_estimator:
     position_std: 5.0e-4
     velocity_std: 3.0e-2

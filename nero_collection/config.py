@@ -110,11 +110,10 @@ class TauExtFilterConfig:
 
 @dataclass(frozen=True)
 class SourceButterworthFilterConfig:
-    """Anti-alias filter applied to raw q/dq/tau before model resampling."""
+    """Variable-dt anti-alias filter applied before model resampling."""
 
     enabled: bool = False
     cutoff_hz: float = 15.0
-    sample_rate_hz: float = 117.0
     order: int = 2
 
 
@@ -882,7 +881,7 @@ def _parse_source_butterworth_filter(
         raise ValueError(
             "tau_ext_inference.source_butterworth_filter must be a mapping"
         )
-    allowed = {"enabled", "cutoff_hz", "sample_rate_hz", "order"}
+    allowed = {"enabled", "cutoff_hz", "order"}
     unknown = set(data) - allowed
     if unknown:
         raise ValueError(
@@ -891,21 +890,11 @@ def _parse_source_butterworth_filter(
         )
     enabled = bool(data.get("enabled", False))
     cutoff_hz = float(data.get("cutoff_hz", 15.0))
-    sample_rate_hz = float(data.get("sample_rate_hz", 117.0))
     order = int(data.get("order", 2))
-    if not isfinite(sample_rate_hz) or sample_rate_hz <= 0.0:
-        raise ValueError(
-            "tau_ext_inference.source_butterworth_filter.sample_rate_hz "
-            "must be positive and finite"
-        )
-    if (
-        not isfinite(cutoff_hz)
-        or cutoff_hz <= 0.0
-        or cutoff_hz >= 0.5 * sample_rate_hz
-    ):
+    if not isfinite(cutoff_hz) or cutoff_hz <= 0.0:
         raise ValueError(
             "tau_ext_inference.source_butterworth_filter.cutoff_hz must be "
-            "positive and below the Nyquist frequency"
+            "positive and finite"
         )
     if order != 2:
         raise ValueError(
@@ -914,7 +903,6 @@ def _parse_source_butterworth_filter(
     return SourceButterworthFilterConfig(
         enabled=enabled,
         cutoff_hz=cutoff_hz,
-        sample_rate_hz=sample_rate_hz,
         order=order,
     )
 

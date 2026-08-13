@@ -395,9 +395,11 @@ class EpisodeBuffer:
                 ["q", "dq", "tau"] if source_filter.enabled else []
             ),
             "source_butterworth_filter_cutoff_hz": source_filter.cutoff_hz,
-            "source_butterworth_filter_sample_rate_hz": source_filter.sample_rate_hz,
             "source_butterworth_filter_order": source_filter.order,
             "source_butterworth_filter_causal": True,
+            "source_butterworth_filter_variable_dt": True,
+            "source_butterworth_filter_timestamp_path": "teleop/timestamp_us",
+            "source_butterworth_filter_discretization": "trapezoidal_tustin",
             "source_butterworth_filter_initialization": "steady_first_sample",
             "dq_coordinate_sign_correction_json": json.dumps(
                 NERO_V120_MOTOR_VELOCITY_TO_JOINT_SIGN
