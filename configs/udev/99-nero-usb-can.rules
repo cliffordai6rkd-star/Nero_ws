@@ -1,0 +1,4 @@
+# Stable Nero USB-CAN names. These serials identify the adapters physically
+# wired to the master and slave arms; kernel can0/can1 enumeration is unstable.
+ACTION=="add", SUBSYSTEM=="net", KERNEL=="can*", ATTRS{idVendor}=="1d50", ATTRS{idProduct}=="606f", ATTRS{serial}=="004300304148570D20343133", NAME="can_master"
+ACTION=="add", SUBSYSTEM=="net", KERNEL=="can*", ATTRS{idVendor}=="1d50", ATTRS{idProduct}=="606f", ATTRS{serial}=="004400424148570A20343133", NAME="can_slave"

@@ -1,6 +1,58 @@
 from __future__ import annotations
 
+from pathlib import Path
 import subprocess
+
+
+SYS_CLASS_NET = Path("/sys/class/net")
+
+
+def interface_usb_serial(interface: str, sys_class_net: Path = SYS_CLASS_NET) -> str | None:
+    """Return the USB parent serial for a SocketCAN network interface."""
+
+    device = sys_class_net / interface / "device"
+    try:
+        current = device.resolve(strict=True)
+    except FileNotFoundError:
+        return None
+    for parent in (current, *current.parents):
+        serial_path = parent / "serial"
+        try:
+            serial = serial_path.read_text(encoding="ascii").strip()
+        except (FileNotFoundError, OSError, UnicodeError):
+            continue
+        if serial:
+            return serial
+    return None
+
+
+def interface_for_usb_serial(
+    usb_serial: str,
+    sys_class_net: Path = SYS_CLASS_NET,
+) -> str:
+    """Resolve one stable USB-CAN serial to its current kernel interface name."""
+
+    expected = str(usb_serial).strip()
+    if not expected:
+        raise ValueError("USB-CAN serial must not be empty")
+    matches = sorted(
+        path.name
+        for path in sys_class_net.glob("can*")
+        if interface_usb_serial(path.name, sys_class_net) == expected
+    )
+    if not matches:
+        available = {
+            path.name: interface_usb_serial(path.name, sys_class_net)
+            for path in sorted(sys_class_net.glob("can*"))
+        }
+        raise RuntimeError(
+            f"USB-CAN adapter serial {expected!r} is not present; available={available}"
+        )
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"USB-CAN adapter serial {expected!r} matched multiple interfaces: {matches}"
+        )
+    return matches[0]
 
 
 def configure_interface(interface: str, bitrate: int) -> None:

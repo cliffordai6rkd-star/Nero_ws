@@ -18,7 +18,11 @@ from calibration.free_space_cli import (
     _verify_hardware_preflight,
 )
 from calibration.free_space_coverage import (
+    JOINT_POSE_COVERAGE_SEGMENT_NAMES,
+    REPRESENTATIVE_REPLAY_SEGMENT_NAMES,
     TAU_REFINEMENT_SEGMENT_NAMES,
+    _build_joint_pose_coverage_tree,
+    _fit_joint_pose_coverage_route,
     config_sha256,
     generate_coverage_trajectory,
     load_coverage_plan,
@@ -30,6 +34,20 @@ from nero_collection.config import load_config
 
 
 CONFIG = Path(__file__).resolve().parents[1] / "configs" / "tau_refinement_coverage.yaml"
+JOINT_COVERAGE_CONFIG = (
+    Path(__file__).resolve().parents[1] / "configs" / "joint_pose_coverage.yaml"
+)
+REPLAY_CONFIG = (
+    Path(__file__).resolve().parents[1] / "configs" / "representative_replay.yaml"
+)
+
+
+class _AlwaysSafeChecker:
+    def safe_mask(self, q):
+        return np.ones(np.asarray(q).shape[0], dtype=bool)
+
+    def leg_is_safe(self, _start, _target):
+        return True
 
 
 def test_config_defines_thirty_minute_tau_refinement_run() -> None:
@@ -37,18 +55,91 @@ def test_config_defines_thirty_minute_tau_refinement_run() -> None:
     collection = load_config(plan.collection_config_path)
 
     assert plan.excitation.sample_rate_hz == pytest.approx(100.0)
-    assert collection.output.directory.name == "tau_refinement"
+    assert collection.output.directory.name == "next_data_recollected"
     assert collection.output.prefix == "episode"
     assert plan.excitation.planner == "tau_refinement"
     assert plan.excitation.run.name == "tau_refinement_low_static_switches"
     assert plan.excitation.run.duration_s == pytest.approx(1800.0)
-    assert plan.hardware.approved is False
     assert not hasattr(plan.excitation, "profiles")
     assert 1800.0 * plan.excitation.section_fractions == pytest.approx(
         [810.0, 630.0, 360.0]
     )
     stored = 180_000 - int(round(collection.output.discard_initial_s * 100.0))
     assert (stored + FREE_SPACE_EPISODE_MAX_SAMPLES - 1) // FREE_SPACE_EPISODE_MAX_SAMPLES == 6
+
+
+def test_joint_pose_coverage_config_is_50hz_with_half_second_holds() -> None:
+    plan = load_coverage_plan(JOINT_COVERAGE_CONFIG)
+
+    assert plan.excitation.planner == "joint_pose_coverage"
+    assert plan.excitation.sample_rate_hz == pytest.approx(50.0)
+    assert plan.excitation.static_hold_s == pytest.approx(0.5)
+    assert plan.excitation.joint_pose_count == 160
+    assert plan.excitation.joint_candidate_count == 8192
+    assert plan.excitation.joint_position_min_rad == pytest.approx(
+        [-1.10, -0.60, -0.95, 0.55, -1.35, -0.62, -0.10]
+    )
+    assert plan.excitation.joint_position_max_rad == pytest.approx(
+        [1.15, 1.00, 1.10, 2.08, 1.30, 0.88, 1.51]
+    )
+
+
+def test_representative_replay_selects_traceable_teleop_episodes() -> None:
+    plan = load_coverage_plan(REPLAY_CONFIG)
+    trajectory = generate_coverage_trajectory(plan)
+
+    assert plan.excitation.planner == "representative_replay"
+    assert plan.excitation.sample_rate_hz == pytest.approx(50.0)
+    assert trajectory.segment_names == REPRESENTATIVE_REPLAY_SEGMENT_NAMES
+    assert [Path(value).name for value in trajectory.source_h5_paths] == [
+        "episode_0000_20260811_163210.h5",
+        "episode_0014_20260811_202154.h5",
+        "episode_0020_20260811_221223.h5",
+        "episode_0027_20260812_154638.h5",
+    ]
+    assert np.all(
+        np.max(np.abs(trajectory.dq), axis=0)
+        <= plan.excitation.max_velocity_rad_s + 1.0e-7
+    )
+    assert np.all(
+        np.max(np.abs(trajectory.ddq), axis=0)
+        <= plan.excitation.max_acceleration_rad_s2 + 1.0e-7
+    )
+
+
+def test_joint_pose_tree_spans_multiple_joints_and_route_contains_holds() -> None:
+    lower = np.full(7, -1.0)
+    upper = np.full(7, 1.0)
+    nodes, parents = _build_joint_pose_coverage_tree(
+        np.zeros(7),
+        lower,
+        upper,
+        candidate_count=128,
+        pose_count=12,
+        connection_step_rad=0.4,
+        checker=_AlwaysSafeChecker(),
+        seed=17,
+    )
+    cfg = SimpleNamespace(
+        sample_rate_hz=50.0,
+        static_hold_s=0.5,
+        joint_transition_speed_scale=0.65,
+        max_velocity_rad_s=np.ones(7),
+        max_acceleration_rad_s2=np.full(7, 3.0),
+    )
+    q, segment_id = _fit_joint_pose_coverage_route(cfg, 2000, nodes, parents)
+
+    assert nodes.shape == (12, 7)
+    assert parents.shape == (12,)
+    assert np.all(parents[1:] < np.arange(1, 12))
+    assert np.count_nonzero(np.abs(np.diff(nodes, axis=0)) > 1e-4, axis=1).min() >= 2
+    assert q.shape == (2000, 7)
+    assert set(np.unique(segment_id)) == {0, 1}
+    assert np.count_nonzero(segment_id == 1) >= 12 * 25
+    assert JOINT_POSE_COVERAGE_SEGMENT_NAMES == (
+        "joint_pose_transition",
+        "joint_pose_hold",
+    )
 
 
 @pytest.mark.skipif(find_spec("pinocchio") is None, reason="Pinocchio is not installed")

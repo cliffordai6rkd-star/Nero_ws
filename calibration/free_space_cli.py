@@ -4,8 +4,10 @@ import argparse
 import gc
 import json
 import logging
+import re
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,6 +18,7 @@ from calibration.free_space_coverage import (
     CoveragePlan,
     CoverageTrajectory,
     config_sha256,
+    effective_joint_position_limits,
     generate_coverage_trajectory,
     load_coverage_plan,
     load_coverage_trajectory,
@@ -35,6 +38,7 @@ from nero_collection.cameras import CameraManager
 from nero_collection.config import ArmEndpointConfig, load_config
 from nero_collection.episode_output import episode_path, next_episode_index
 from nero_collection.h5_writer import EpisodeBuffer
+from nero_collection.time_utils import now_us
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +54,21 @@ class _SampleTiming:
     append_s: float
     camera_s: float
     total_s: float
+
+
+@dataclass(frozen=True)
+class _CollectionResume:
+    episode_paths: tuple[Path, ...]
+    next_chunk_index: int
+    next_trajectory_index: int
+
+
+@dataclass(frozen=True)
+class _CompletedChunk:
+    path: Path
+    chunk_index: int
+    trajectory_from_index: int
+    trajectory_to_index: int
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -80,6 +99,7 @@ def main(argv: list[str] | None = None) -> int:
             skip_can_setup=args.skip_can_setup,
             assume_yes=args.yes,
             overwrite=args.overwrite,
+            fresh=args.fresh,
         )
     if args.command == "run":
         return _run_pipeline(
@@ -135,6 +155,7 @@ def _simulate(plan, *, reuse_existing, headless, playback_speed):
         "trajectory_sha256": trajectory_sha256(trajectory),
         "reference_h5_path": trajectory.reference_h5_path,
         "reference_h5_sha256": trajectory.reference_h5_sha256,
+        "source_h5_paths": list(trajectory.source_h5_paths),
         "workspace_min_m": np.asarray(trajectory.workspace_min_m).tolist(),
         "workspace_max_m": np.asarray(trajectory.workspace_max_m).tolist(),
         "workspace_convex_hull_volume_m3": trajectory.workspace_convex_hull_volume_m3,
@@ -172,6 +193,29 @@ def _simulate(plan, *, reuse_existing, headless, playback_speed):
                     plan.excitation.jump_min_delta_rad,
                     plan.excitation.jump_max_delta_rad,
                 ],
+            }
+        )
+    elif plan.excitation.planner == "joint_pose_coverage":
+        report["trajectory"].update(
+            {
+                "joint_candidate_count": plan.excitation.joint_candidate_count,
+                "joint_pose_count": plan.excitation.joint_pose_count,
+                "joint_connection_step_rad": (
+                    plan.excitation.joint_connection_step_rad
+                ),
+                "joint_transition_speed_scale": (
+                    plan.excitation.joint_transition_speed_scale
+                ),
+                "static_hold_s": plan.excitation.static_hold_s,
+            }
+        )
+    elif plan.excitation.planner == "representative_replay":
+        report["trajectory"].update(
+            {
+                "selected_episode_count": len(trajectory.source_h5_paths),
+                "source_h5_paths": list(trajectory.source_h5_paths),
+                "replay_speed_scale": plan.excitation.replay_speed_scale,
+                "replay_path_min_delta_rad": plan.excitation.replay_path_min_delta_rad,
             }
         )
     report["passed"] = passed
@@ -230,6 +274,7 @@ def _run_pipeline(
         skip_can_setup=skip_can_setup,
         assume_yes=assume_yes,
         overwrite=overwrite,
+        fresh=False,
     )
 
 
@@ -240,6 +285,7 @@ def _collect(
     skip_can_setup,
     assume_yes,
     overwrite,
+    fresh=False,
 ):
     run = plan.excitation.run
     trajectory = _load_and_validate(plan)
@@ -249,9 +295,62 @@ def _collect(
             "hardware.approved is false; review the passing preflight and set it true"
         )
     collection = load_config(plan.collection_config_path)
+    log.info(
+        "online tau_ext inference disabled for free-space collection; "
+        "recording raw state, command, and torque datasets only"
+    )
     output_dir = collection.output.directory
     output_dir.mkdir(parents=True, exist_ok=True)
-    episode_index = next_episode_index(output_dir, collection.output.prefix)
+    first_stored_index = int(
+        np.searchsorted(
+            trajectory.time_s,
+            collection.output.discard_initial_s,
+            side="left",
+        )
+    )
+    trajectory_digest = trajectory_sha256(trajectory)
+    coverage_config_digest = config_sha256(plan.source_path)
+    resume = None
+    if fresh:
+        log.info(
+            "fresh free-space collection requested trajectory=%s; existing "
+            "episodes remain untouched and will not be used for resume",
+            run.name,
+        )
+    else:
+        resume = _find_free_space_resume(
+            output_dir,
+            collection.output.prefix,
+            trajectory_name=run.name,
+            trajectory_digest=trajectory_digest,
+            coverage_config_digest=coverage_config_digest,
+            first_stored_index=first_stored_index,
+            trajectory_sample_count=trajectory.time_s.size,
+        )
+    start_index = 0 if resume is None else resume.next_trajectory_index
+    initial_chunk_index = 0 if resume is None else resume.next_chunk_index
+    if resume is not None:
+        log.info(
+            "resuming free-space trajectory=%s completed_episodes=%d "
+            "next_chunk=%d next_trajectory_index=%d remaining=%.1fs",
+            run.name,
+            len(resume.episode_paths),
+            initial_chunk_index,
+            start_index,
+            (trajectory.time_s.size - start_index)
+            / plan.excitation.sample_rate_hz,
+        )
+    if start_index >= trajectory.time_s.size:
+        print(
+            f"Trajectory {run.name} is already fully collected in "
+            f"{len(resume.episode_paths)} episodes; nothing to resume.",
+            flush=True,
+        )
+        return 0
+    next_output_episode_index = next_episode_index(
+        output_dir,
+        collection.output.prefix,
+    )
     endpoint = _follower_endpoint(collection, plan.pair_name)
     backend = backend_override or collection.teleop.backend
     if backend == "pyagxarm" and not skip_can_setup:
@@ -264,17 +363,14 @@ def _collect(
         collection.cameras if plan.hardware.record_cameras else ()
     )
     _, model = build_reduced_model(plan.model)
-    lower = np.asarray(model.lowerPositionLimit) + plan.excitation.joint_limit_margin_rad
-    upper = np.asarray(model.upperPositionLimit) - plan.excitation.joint_limit_margin_rad
+    lower, upper = effective_joint_position_limits(model, plan.excitation)
     arm.connect()
     try:
         q_state = collection.robot_states["q"]
         dq_state = collection.robot_states["velocity"]
         ddq_state = collection.robot_states["acceleration"]
-        arm.configure_state_alignment(
-            collection.teleop.command.state_alignment_delay_s,
-            plan.excitation.sample_rate_hz,
-            q_state.mean_window,
+        arm.configure_state_capture(
+            collection.teleop.command.maximum_state_source_skew_s,
             q_state.lowpass_cutoff_hz if q_state.lowpass else None,
             dq_state.lowpass_cutoff_hz if dq_state.lowpass else None,
             ddq_state.lowpass_cutoff_hz if ddq_state.lowpass else None,
@@ -285,31 +381,19 @@ def _collect(
         arm.enable()
         _wait_for_follower_role(arm, collection.teleop.command.role_switch_timeout_s)
         cameras.start()
-        _move_to_start(arm, trajectory.q[0], plan)
-        first_stored_index = int(
-            np.searchsorted(
-                trajectory.time_s,
-                collection.output.discard_initial_s,
-                side="left",
-            )
-        )
-        stored_sample_capacity = max(0, trajectory.time_s.size - first_stored_index)
-        episode_count = max(
-            1,
-            (stored_sample_capacity + FREE_SPACE_EPISODE_MAX_SAMPLES - 1)
-            // FREE_SPACE_EPISODE_MAX_SAMPLES,
-        )
+        _move_to_start(arm, trajectory.q[start_index], plan)
         base_episode_metadata = {
             "source": "free_space_coverage",
             "coverage_config_path": str(plan.source_path),
-            "coverage_config_sha256": config_sha256(plan.source_path),
+            "coverage_config_sha256": coverage_config_digest,
             "trajectory_name": run.name,
             "trajectory_planner": plan.excitation.planner,
             "trajectory_seed": run.seed,
             "trajectory_path": str(run.trajectory_path),
-            "trajectory_sha256": trajectory_sha256(trajectory),
+            "trajectory_sha256": trajectory_digest,
             "reference_h5_path": trajectory.reference_h5_path,
             "reference_h5_sha256": trajectory.reference_h5_sha256,
+            "source_h5_paths": list(trajectory.source_h5_paths),
             "workspace_min_m": np.asarray(trajectory.workspace_min_m).tolist(),
             "workspace_max_m": np.asarray(trajectory.workspace_max_m).tolist(),
             "workspace_convex_hull_volume_m3": trajectory.workspace_convex_hull_volume_m3,
@@ -319,7 +403,15 @@ def _collect(
                 minlength=len(trajectory.segment_names),
             ).astype(int).tolist(),
             "sample_rate_hz": plan.excitation.sample_rate_hz,
-            "trajectory_episode_count": episode_count,
+            "command_sample_rate_hz": plan.excitation.sample_rate_hz,
+            "state_capture_policy": "all_complete_CAN_aligned_events",
+            "state_capture_fixed_rate": False,
+            "online_tau_ext_inference_enabled": False,
+            "online_tau_ext_inference_policy": "disabled_for_free_space_collection",
+            "collection_resumed": resume is not None,
+            "collection_fresh": bool(fresh),
+            "collection_resume_from_trajectory_index": start_index,
+            "collection_resume_prior_episode_count": initial_chunk_index,
             "trajectory_episode_max_samples": FREE_SPACE_EPISODE_MAX_SAMPLES,
         }
         if plan.excitation.planner == "tau_refinement":
@@ -334,21 +426,37 @@ def _collect(
                     ],
                 }
             )
+        elif plan.excitation.planner == "joint_pose_coverage":
+            base_episode_metadata.update(
+                {
+                    "joint_candidate_count": plan.excitation.joint_candidate_count,
+                    "joint_pose_count": plan.excitation.joint_pose_count,
+                    "joint_connection_step_rad": (
+                        plan.excitation.joint_connection_step_rad
+                    ),
+                    "joint_transition_speed_scale": (
+                        plan.excitation.joint_transition_speed_scale
+                    ),
+                    "static_hold_s": plan.excitation.static_hold_s,
+                }
+            )
+        elif plan.excitation.planner == "representative_replay":
+            base_episode_metadata.update(
+                {
+                    "selected_episode_count": len(trajectory.source_h5_paths),
+                    "source_h5_paths": list(trajectory.source_h5_paths),
+                    "replay_speed_scale": plan.excitation.replay_speed_scale,
+                    "replay_path_min_delta_rad": plan.excitation.replay_path_min_delta_rad,
+                }
+            )
 
         def new_buffer():
             episode_buffer = EpisodeBuffer(
                 config=collection,
                 arm_names=(plan.pair_name,),
-                sample_rate_hz=plan.excitation.sample_rate_hz,
                 episode_metadata=base_episode_metadata.copy(),
+                enable_online_tau_ext=False,
             )
-            warm_up_started = time.monotonic()
-            if episode_buffer.warm_up_online_inference():
-                log.info(
-                    "online tau_f warm-up complete elapsed=%.3fms samples=%d",
-                    (time.monotonic() - warm_up_started) * 1e3,
-                    episode_buffer.sample_count,
-                )
             return episode_buffer
 
         def save_episode(
@@ -357,6 +465,7 @@ def _collect(
             trajectory_from_index,
             trajectory_to_index,
         ):
+            nonlocal next_output_episode_index
             episode_buffer.episode_metadata.update(
                 {
                     "trajectory_episode_index": int(chunk_index),
@@ -368,14 +477,15 @@ def _collect(
             output = episode_path(
                 output_dir,
                 collection.output.prefix,
-                episode_index + chunk_index,
+                next_output_episode_index,
             )
             if output.exists() and not overwrite:
                 raise RuntimeError(f"episode already exists: {output}; use --overwrite")
             saved = episode_buffer.save(output)
+            next_output_episode_index += 1
             print(
                 f"Saved trajectory {run.name} episode "
-                f"{chunk_index + 1}/{episode_count}: {saved} "
+                f"{chunk_index + 1}: {saved} "
                 f"samples={episode_buffer.sample_count}",
                 flush=True,
             )
@@ -396,12 +506,15 @@ def _collect(
 
         buffer = new_buffer()
         log.info(
-            "starting hardware trajectory=%s duration=%.1fs samples=%d episodes=%d "
-            "episode_max_samples=%d",
+            "starting hardware trajectory=%s start_index=%d remaining_duration=%.1fs "
+            "command_rate=%.1fHz command_samples=%d state_capture=complete_CAN_events "
+            "state_episode_max_samples=%d",
             run.name,
-            trajectory.duration_s,
+            start_index,
+            (trajectory.time_s.size - start_index)
+            / plan.excitation.sample_rate_hz,
+            plan.excitation.sample_rate_hz,
             trajectory.time_s.size,
-            episode_count,
             FREE_SPACE_EPISODE_MAX_SAMPLES,
         )
         buffer, chunk_index, chunk_from_index = _execute_trajectory(
@@ -414,6 +527,8 @@ def _collect(
             upper,
             max_episode_samples=FREE_SPACE_EPISODE_MAX_SAMPLES,
             rotate_episode=rotate_episode,
+            start_index=start_index,
+            initial_chunk_index=initial_chunk_index,
         )
         if buffer.sample_count:
             save_episode(
@@ -429,6 +544,122 @@ def _collect(
     return 0
 
 
+def _find_free_space_resume(
+    output_dir,
+    prefix,
+    *,
+    trajectory_name,
+    trajectory_digest,
+    coverage_config_digest,
+    first_stored_index,
+    trajectory_sample_count,
+):
+    try:
+        import h5py
+    except Exception as exc:
+        raise RuntimeError(
+            "h5py is required to inspect free-space resume files"
+        ) from exc
+
+    pattern = re.compile(rf"^{re.escape(prefix)}_(\d+)_.*\.h5$")
+    indexed_paths = []
+    for path in output_dir.glob(f"{prefix}_*.h5"):
+        match = pattern.match(path.name)
+        if match:
+            indexed_paths.append((int(match.group(1)), path))
+    indexed_paths.sort(key=lambda item: item[0])
+
+    def read_chunk(path):
+        try:
+            with h5py.File(path, "r") as h5:
+                raw_metadata = h5["metadata/episode_json"][()]
+                if isinstance(raw_metadata, bytes):
+                    raw_metadata = raw_metadata.decode("utf-8")
+                metadata = json.loads(str(raw_metadata))
+                sample_count = int(h5["teleop/timestamp_us"].shape[0])
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            log.warning(
+                "ignoring unreadable episode during resume scan path=%s: %s",
+                path,
+                exc,
+            )
+            return None
+        if (
+            metadata.get("source") != "free_space_coverage"
+            or metadata.get("trajectory_name") != trajectory_name
+            or metadata.get("trajectory_sha256") != trajectory_digest
+            or metadata.get("coverage_config_sha256") != coverage_config_digest
+        ):
+            return None
+        try:
+            chunk = _CompletedChunk(
+                path=path,
+                chunk_index=int(metadata["trajectory_episode_index"]),
+                trajectory_from_index=int(metadata["trajectory_sample_from_index"]),
+                trajectory_to_index=int(metadata["trajectory_sample_to_index"]),
+            )
+            metadata_sample_count = int(metadata["trajectory_episode_sample_count"])
+        except (KeyError, TypeError, ValueError):
+            log.warning("ignoring incomplete free-space metadata path=%s", path)
+            return None
+        if metadata_sample_count != sample_count or sample_count <= 0:
+            log.warning(
+                "ignoring inconsistent free-space episode path=%s metadata_samples=%d "
+                "stored_samples=%d",
+                path,
+                metadata_sample_count,
+                sample_count,
+            )
+            return None
+        if (
+            chunk.chunk_index < 0
+            or chunk.trajectory_from_index < first_stored_index
+            or chunk.trajectory_to_index <= chunk.trajectory_from_index
+            or chunk.trajectory_to_index > trajectory_sample_count
+        ):
+            log.warning("ignoring invalid free-space episode range path=%s", path)
+            return None
+        return chunk
+
+    groups = []
+    current = []
+    for _, path in indexed_paths:
+        chunk = read_chunk(path)
+        starts_new_group = (
+            chunk is not None
+            and chunk.chunk_index == 0
+            and chunk.trajectory_from_index == first_stored_index
+        )
+        extends_group = (
+            chunk is not None
+            and current
+            and chunk.chunk_index == current[-1].chunk_index + 1
+            and chunk.trajectory_from_index == current[-1].trajectory_to_index
+        )
+        if starts_new_group:
+            if current:
+                groups.append(tuple(current))
+            current = [chunk]
+        elif extends_group:
+            current.append(chunk)
+        else:
+            if current:
+                groups.append(tuple(current))
+            current = []
+    if current:
+        groups.append(tuple(current))
+    if not groups:
+        return None
+
+    latest = groups[-1]
+    last = latest[-1]
+    return _CollectionResume(
+        episode_paths=tuple(chunk.path for chunk in latest),
+        next_chunk_index=last.chunk_index + 1,
+        next_trajectory_index=last.trajectory_to_index,
+    )
+
+
 def _execute_trajectory(
     arm,
     cameras,
@@ -440,41 +671,72 @@ def _execute_trajectory(
     *,
     max_episode_samples=FREE_SPACE_EPISODE_MAX_SAMPLES,
     rotate_episode=None,
+    start_index=0,
+    initial_chunk_index=0,
 ):
     if max_episode_samples <= 0:
         raise ValueError("max_episode_samples must be positive")
+    if start_index < 0 or start_index >= trajectory.time_s.size:
+        raise ValueError("start_index must select a trajectory sample")
+    if initial_chunk_index < 0:
+        raise ValueError("initial_chunk_index must be non-negative")
     period = 1.0 / plan.excitation.sample_rate_hz
+    state_reader = _PendingStateReader(arm)
+    command_history = deque(
+        [(now_us(), np.asarray(trajectory.q[start_index], dtype=np.float64).copy())],
+        maxlen=64,
+    )
     start = time.monotonic()
     discard_initial_s = buffer.config.output.discard_initial_s
-    discard_complete_logged = discard_initial_s <= 0.0
-    if discard_initial_s > 0.0:
+    discard_complete_logged = (
+        discard_initial_s <= 0.0
+        or float(trajectory.time_s[start_index]) >= discard_initial_s
+    )
+    if discard_initial_s > 0.0 and start_index == 0:
         log.info(
             "discarding initial trajectory data duration=%.3fs; motion, safety and filters remain active",
             discard_initial_s,
         )
-    previous_timestamp_us = None
     previous_segment_id = None
     timings = []
-    chunk_index = 0
+    captured_state_count = 0
+    first_state_timestamp_us = None
+    last_state_timestamp_us = None
+    chunk_index = initial_chunk_index
     chunk_from_index = None
-    for index, q_cmd in enumerate(trajectory.q):
-        deadline = start + index * period
+    for index in range(start_index, trajectory.time_s.size):
+        q_cmd = trajectory.q[index]
+        deadline = start + (index - start_index) * period
         remaining = deadline - time.monotonic()
         if remaining > 0:
             time.sleep(remaining)
-        elif -remaining > max(2.0 * period, 0.03):
-            timing_detail = _format_timing_diagnostics(timings)
-            raise RuntimeError(
-                f"100 Hz trajectory missed deadline by {-remaining:.4f}s at sample {index}; "
-                f"{timing_detail}"
-            )
+        else:
+            lateness_s = -remaining
+            warning_threshold_s = max(2.0 * period, 0.03)
+            if lateness_s > plan.hardware.max_timestamp_gap_s:
+                timing_detail = _format_timing_diagnostics(timings)
+                raise RuntimeError(
+                    f"trajectory missed deadline by {lateness_s:.4f}s at "
+                    f"sample {index}; limit={plan.hardware.max_timestamp_gap_s:.4f}s; "
+                    f"{timing_detail}"
+                )
+            if lateness_s > warning_threshold_s:
+                log.warning(
+                    "trajectory recovering from scheduling jitter "
+                    "lateness=%.4fs sample=%d",
+                    lateness_s,
+                    index,
+                )
 
         sample_started = time.monotonic()
         arm.command_joint_positions(q_cmd)
+        command_history.append((now_us(), np.asarray(q_cmd, dtype=np.float64).copy()))
         command_finished = time.monotonic()
-        state = _read_finite_arm_state(
-            arm,
-            timeout_s=max(2.0 * period, 0.03),
+        states = state_reader.read_batch(
+            timeout_s=max(
+                2.0 * period,
+                plan.hardware.max_timestamp_gap_s,
+            ),
             context=f"trajectory sample {index}",
         )
         read_finished = time.monotonic()
@@ -488,8 +750,9 @@ def _execute_trajectory(
                 float(trajectory.time_s[index]),
             )
             previous_segment_id = segment_id
+        latest_state = states[-1]
         _check_measurement(
-            state,
+            latest_state,
             q_cmd,
             plan,
             lower,
@@ -499,11 +762,6 @@ def _execute_trajectory(
             segment_name=segment_name,
             dq_cmd=trajectory.dq[index],
         )
-        timestamp_us = int(state.q_timestamp_us or state.timestamp_us)
-        if previous_timestamp_us is not None and timestamp_us > previous_timestamp_us:
-            gap_s = (timestamp_us - previous_timestamp_us) * 1e-6
-            if gap_s > plan.hardware.max_timestamp_gap_s:
-                raise RuntimeError(f"follower timestamp gap exceeded limit: {gap_s:.6f}s")
         safety_finished = time.monotonic()
         store = float(trajectory.time_s[index]) >= discard_initial_s
         if store and not discard_complete_logged:
@@ -513,15 +771,32 @@ def _execute_trajectory(
                 float(trajectory.time_s[index]),
             )
             discard_complete_logged = True
-        buffer.append_teleop(
-            timestamp_us,
-            _follower_values(state, q_cmd),
-            store=store,
-        )
+        for state in states:
+            timestamp_us = int(state.q_timestamp_us or state.timestamp_us)
+            captured_state_count += 1
+            if first_state_timestamp_us is None:
+                first_state_timestamp_us = timestamp_us
+            last_state_timestamp_us = timestamp_us
+            state_q_cmd = _command_for_state(command_history, state)
+            _check_measurement(
+                state,
+                state_q_cmd,
+                plan,
+                lower,
+                upper,
+                sample_index=index,
+                trajectory_time_s=trajectory.time_s[index],
+                segment_name=segment_name,
+                dq_cmd=trajectory.dq[index],
+            )
+            buffer.append_teleop(
+                timestamp_us,
+                _follower_values(state, state_q_cmd),
+                store=store,
+            )
         if store and chunk_from_index is None and buffer.sample_count:
             chunk_from_index = index
         append_finished = time.monotonic()
-        previous_timestamp_us = timestamp_us
         for frame in cameras.poll():
             if store:
                 buffer.append_camera(frame.camera_name, frame.timestamp_us, frame.frame)
@@ -536,8 +811,8 @@ def _execute_trajectory(
             total_s=sample_finished - sample_started,
         )
         timings.append(timing)
-        if index == 0:
-            log.info("100 Hz first-sample timing: %s", _format_sample_timing(timing))
+        if index == start_index:
+            log.info("trajectory first-sample timing: %s", _format_sample_timing(timing))
         if (
             buffer.sample_count >= max_episode_samples
             and index + 1 < trajectory.time_s.size
@@ -561,20 +836,105 @@ def _execute_trajectory(
             )
             chunk_index += 1
             chunk_from_index = None
-            previous_timestamp_us = None
             timings = []
             gc.collect()
-            _read_finite_arm_state(
-                arm,
-                timeout_s=plan.hardware.max_timestamp_gap_s,
-                context=f"episode boundary after trajectory sample {index}",
-            )
             start += time.monotonic() - pause_started
-    log.info("100 Hz trajectory timing summary: %s", _format_timing_diagnostics(timings))
+    state_duration_s = (
+        0.0
+        if first_state_timestamp_us is None or last_state_timestamp_us is None
+        else (last_state_timestamp_us - first_state_timestamp_us) * 1.0e-6
+    )
+    state_rate_hz = (
+        (captured_state_count - 1) / state_duration_s
+        if captured_state_count > 1 and state_duration_s > 0.0
+        else 0.0
+    )
+    log.info(
+        "trajectory capture summary command_rate=%.1fHz commands=%d "
+        "complete_CAN_states=%d measured_state_rate=%.2fHz; %s",
+        plan.excitation.sample_rate_hz,
+        trajectory.time_s.size - start_index,
+        captured_state_count,
+        state_rate_hz,
+        _format_timing_diagnostics(timings),
+    )
     if chunk_from_index is None:
         chunk_from_index = trajectory.time_s.size
     return buffer, chunk_index, chunk_from_index
 
+
+class _PendingStateReader:
+    def __init__(self, arm) -> None:
+        self.arm = arm
+        self.pending = deque()
+        self.last_timestamp_us: int | None = None
+
+    def read_next(self, *, timeout_s: float, context: str):
+        deadline = time.monotonic() + float(timeout_s)
+        invalid_fields = ()
+        while True:
+            if not self.pending:
+                states = self._drain_available(context=context)
+                self.pending.extend(states)
+            while self.pending:
+                state = self.pending.popleft()
+                invalid_fields = tuple(
+                    name
+                    for name in ("q", "dq", "ddq", "torque")
+                    if not _is_finite_joint_vector(getattr(state, name, None))
+                )
+                timestamp_us = int(state.q_timestamp_us or state.timestamp_us)
+                if invalid_fields:
+                    continue
+                if self.last_timestamp_us is not None and timestamp_us <= self.last_timestamp_us:
+                    continue
+                self.last_timestamp_us = timestamp_us
+                return state
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"follower state alignment did not produce a new finite state within "
+                    f"{timeout_s:.3f}s at {context}; invalid fields={invalid_fields}"
+                )
+            time.sleep(0.001)
+
+    def _drain_available(self, *, context: str):
+        drain_states = getattr(self.arm, "drain_states", None)
+        if callable(drain_states):
+            result = drain_states()
+            dropped = int(getattr(result, "dropped", 0))
+            if dropped > 0:
+                raise RuntimeError(
+                    "free-space aligned state ring overrun at "
+                    f"{context}: dropped={dropped}"
+                )
+            return tuple(getattr(result, "states", ()))
+
+        read_pending = getattr(self.arm, "read_pending_states", None)
+        if callable(read_pending):
+            return tuple(read_pending())
+        return (self.arm.read_state(),)
+
+    def read_batch(self, *, timeout_s: float, context: str):
+        first = self.read_next(timeout_s=timeout_s, context=context)
+        states = [first]
+        # read_next() already drained one complete producer batch and left its
+        # remaining states in self.pending. Do not drain again here, otherwise
+        # states that arrive for the next command period can be pulled forward.
+        while self.pending:
+            state = self.pending.popleft()
+            if not all(
+                _is_finite_joint_vector(getattr(state, name, None))
+                for name in ("q", "dq", "ddq", "torque")
+            ):
+                continue
+            timestamp_us = int(state.q_timestamp_us or state.timestamp_us)
+            if timestamp_us <= int(
+                states[-1].q_timestamp_us or states[-1].timestamp_us
+            ):
+                continue
+            self.last_timestamp_us = timestamp_us
+            states.append(state)
+        return tuple(states)
 
 def _read_finite_arm_state(arm, *, timeout_s, context):
     deadline = time.monotonic() + float(timeout_s)
@@ -594,8 +954,6 @@ def _read_finite_arm_state(arm, *, timeout_s, context):
                 f"at {context}; invalid fields={invalid_fields}"
             )
         time.sleep(0.001)
-
-
 def _is_finite_joint_vector(value) -> bool:
     vector = np.asarray(value, dtype=np.float64).reshape(-1)
     return vector.size == 7 and np.isfinite(vector).all()
@@ -668,6 +1026,17 @@ def _check_measurement(
 
 
 def _follower_values(state, q_cmd):
+    dof = int(np.asarray(state.q).size)
+    q_sources = _timestamp_vector(
+        state.q_component_timestamp_us,
+        state.timestamp_us,
+        dof,
+    )
+    motor_sources = _timestamp_vector(
+        state.motor_timestamp_us,
+        state.timestamp_us,
+        dof,
+    )
     return {
         "q_follower": ("q", np.asarray(state.q, dtype=np.float64)),
         "q_cmd": ("q", np.asarray(q_cmd, dtype=np.float64)),
@@ -676,7 +1045,44 @@ def _follower_values(state, q_cmd):
         "ee_pose_follower": ("ee_pose", np.asarray(state.ee_pose, dtype=np.float64)),
         "tau_follower": ("torque", np.asarray(state.torque, dtype=np.float64)),
         "current_follower": ("current", np.asarray(state.current, dtype=np.float64)),
+        "state_acquired_timestamp_follower_us": (
+            "timestamp",
+            np.asarray(state.acquired_timestamp_us, dtype=np.int64),
+        ),
+        "q_source_timestamp_follower_us": ("timestamp", q_sources),
+        "motor_source_timestamp_follower_us": ("timestamp", motor_sources),
+        "state_source_skew_follower_us": (
+            "duration",
+            np.asarray(
+                int(
+                    np.max(np.concatenate((q_sources, motor_sources)))
+                    - np.min(np.concatenate((q_sources, motor_sources)))
+                ),
+                dtype=np.int64,
+            ),
+        ),
     }
+
+
+def _timestamp_vector(value, fallback_us, size):
+    array = np.asarray(value, dtype=np.int64).reshape(-1)
+    if array.shape != (size,) or np.any(array <= 0):
+        return np.full(size, int(fallback_us), dtype=np.int64)
+    return array.copy()
+
+
+def _command_for_state(command_history, state):
+    acquired_us = int(
+        getattr(state, "q_acquired_timestamp_us", 0)
+        or getattr(state, "acquired_timestamp_us", 0)
+        or now_us()
+    )
+    selected = command_history[0][1]
+    for command_us, q_cmd in command_history:
+        if command_us > acquired_us:
+            break
+        selected = q_cmd
+    return np.asarray(selected, dtype=np.float64).copy()
 
 
 def _verify_hardware_preflight(plan, trajectory):
@@ -789,9 +1195,10 @@ def _follower_endpoint(collection, pair_name) -> ArmEndpointConfig:
 
 
 def _confirm_hardware_motion(endpoint, trajectory):
+    rate = trajectory.time_s.size / trajectory.duration_s
     message = (
         f"WARNING: {endpoint.name} on {endpoint.channel} will execute "
-        f"{trajectory.name!r} for {trajectory.duration_s:.1f}s at 100 Hz. "
+        f"{trajectory.name!r} for {trajectory.duration_s:.1f}s at {rate:.1f} Hz. "
         "Clear the workcell, remove external "
         "contacts and payloads, and keep the emergency stop ready."
     )
@@ -863,6 +1270,14 @@ def _parse_args(argv):
     collect.add_argument("--skip-can-setup", action="store_true")
     collect.add_argument("--yes", action="store_true")
     collect.add_argument("--overwrite", action="store_true")
+    collect.add_argument(
+        "--fresh",
+        action="store_true",
+        help=(
+            "start this trajectory from index zero and allocate new episode "
+            "numbers instead of resuming existing trajectory episodes"
+        ),
+    )
     run = subparsers.add_parser(
         "run",
         help="generate, preflight and execute the trajectory with the existing collector",

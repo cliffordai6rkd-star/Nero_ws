@@ -22,7 +22,11 @@ from nero_collection.config import (
     _parse_command,
     load_config,
 )
-from nero_collection.state_alignment import DelayedStateTimeline, StateTimingError
+from nero_collection.state_alignment import (
+    AlignedArmSample,
+    CanStateAssembler,
+    StateTimingError,
+)
 from nero_collection.teleop.bilateral import BilateralJointController
 
 
@@ -114,7 +118,7 @@ def test_master_slave_config_has_valid_control_parameters() -> None:
     assert all(value == 0.0 for value in command.bilateral_mit.leader_kp)
     assert all(0.0 <= value <= 500.0 for value in command.bilateral_mit.follower_kp)
     assert config.robot_states["velocity"].lowpass_cutoff_hz > 0.0
-    assert config.robot_states["acceleration"].lowpass is True
+    assert config.robot_states["acceleration"].lowpass is False
     assert config.gripper.teleop_enabled is True
     assert config.gripper.attach_to == "both"
     if config.realtime_plot.inverse_dynamics.manifest_path is not None:
@@ -129,8 +133,9 @@ def test_collection_config_requires_tau_ext_inference_for_realtime_plot(tmp_path
     source_path = Path(__file__).resolve().parents[1] / "configs/master_slave_can.yaml"
     text = source_path.read_text(encoding="utf-8")
     text = text.replace(
-        "tau_ext_inference:\n  enabled: true",
-        "tau_ext_inference:\n  enabled: false",
+        "realtime_plot:\n  # 当前图中预测量依赖 PINN/NEXT；新模型可用前必须关闭。\n  enabled: false",
+        "realtime_plot:\n  enabled: true",
+        1,
     )
     config_path.write_text(text, encoding="utf-8")
 
@@ -230,13 +235,10 @@ def test_command_config_rejects_unknown_follower_control_mode() -> None:
         _parse_command({"control_mode": "torque"})
 
 
-@pytest.mark.parametrize(
-    "field",
-    ("maximum_can_frame_gap_s", "control_watchdog_timeout_s"),
-)
-def test_command_config_rejects_watchdogs_shorter_than_control_period(field: str) -> None:
-    with pytest.raises(ValueError, match=field):
-        _parse_command({"sample_rate_hz": 100.0, field: 0.01})
+@pytest.mark.parametrize("field", ("sample_rate_hz", "state_alignment_delay_s"))
+def test_command_config_rejects_removed_fixed_grid_timing(field: str) -> None:
+    with pytest.raises(ValueError, match="fixed-grid"):
+        _parse_command({field: 100.0})
 
 
 def test_pyagx_adapter_sends_all_seven_mit_commands() -> None:
@@ -275,11 +277,10 @@ def test_pyagx_adapter_rejects_torque_above_v111_limit_before_sdk_call() -> None
 
 
 def test_can_frame_gap_fails_before_updating_joint_derivatives() -> None:
-    timeline = DelayedStateTimeline(
+    timeline = CanStateAssembler(
         dof=2,
         q_groups=(("joint_12", (0, 1)),),
-        delay_s=0.015,
-        output_rate_hz=100.0,
+        maximum_source_skew_s=0.015,
         maximum_input_gap_s=0.03,
     )
     timeline.append_q_group("joint_12", 100_000, np.zeros(2))
@@ -289,11 +290,10 @@ def test_can_frame_gap_fails_before_updating_joint_derivatives() -> None:
 
 
 def test_v120_velocity_is_the_only_source_for_dq_and_ddq() -> None:
-    timeline = DelayedStateTimeline(
+    timeline = CanStateAssembler(
         dof=1,
         q_groups=(("joint_1", (0,)),),
-        delay_s=0.01,
-        output_rate_hz=100.0,
+        maximum_source_skew_s=0.015,
         q_mean_window_samples=10,
         q_lowpass_cutoff_hz=None,
         dq_lowpass_cutoff_hz=None,
@@ -315,8 +315,9 @@ def test_v120_velocity_is_the_only_source_for_dq_and_ddq() -> None:
             current=0.0,
         )
 
-    sample = timeline.aligned_sample(40_000)
-    assert sample is not None
+    samples = timeline.drain_completed()
+    assert len(samples) == 3
+    sample = samples[-1]
     assert sample.dq == pytest.approx([0.04])
     assert sample.ddq == pytest.approx([2.0])
     np.testing.assert_array_equal(sample.q_source_timestamp_us, [30_000])
@@ -324,11 +325,10 @@ def test_v120_velocity_is_the_only_source_for_dq_and_ddq() -> None:
 
 
 def test_q_motion_cannot_change_ddq_when_motor_velocity_is_constant() -> None:
-    timeline = DelayedStateTimeline(
+    timeline = CanStateAssembler(
         dof=1,
         q_groups=(("joint_1", (0,)),),
-        delay_s=0.01,
-        output_rate_hz=100.0,
+        maximum_source_skew_s=0.015,
         q_lowpass_cutoff_hz=None,
         dq_lowpass_cutoff_hz=None,
         ddq_lowpass_cutoff_hz=None,
@@ -345,17 +345,15 @@ def test_q_motion_cannot_change_ddq_when_motor_velocity_is_constant() -> None:
             current=0.0,
         )
 
-    sample = timeline.aligned_sample(50_000)
-    assert sample is not None
+    sample = timeline.drain_completed()[-1]
     assert sample.ddq == pytest.approx([0.0])
 
 
 def test_motor_velocity_derivative_filters_match_training_preprocessing() -> None:
-    timeline = DelayedStateTimeline(
+    timeline = CanStateAssembler(
         dof=1,
         q_groups=(("joint_1", (0,)),),
-        delay_s=0.001,
-        output_rate_hz=1000.0,
+        maximum_source_skew_s=0.015,
         q_lowpass_cutoff_hz=10.0,
         dq_lowpass_cutoff_hz=6.0,
         ddq_lowpass_cutoff_hz=3.0,
@@ -390,18 +388,16 @@ def test_motor_velocity_derivative_filters_match_training_preprocessing() -> Non
         expected_ddq += ddq_alpha * (ddq_raw - expected_ddq)
         previous_timestamp_us = timestamp_us
 
-    sample = timeline.aligned_sample(43_000)
-    assert sample is not None
+    sample = timeline.drain_completed()[-1]
     assert sample.dq == pytest.approx([expected_dq])
     assert sample.ddq == pytest.approx([expected_ddq])
 
 
-def test_aligned_timeline_freezes_a_completed_target_snapshot() -> None:
-    timeline = DelayedStateTimeline(
+def test_event_timeline_drains_each_complete_snapshot_once() -> None:
+    timeline = CanStateAssembler(
         dof=1,
         q_groups=(("joint_1", (0,)),),
-        delay_s=0.01,
-        output_rate_hz=100.0,
+        maximum_source_skew_s=0.015,
         q_lowpass_cutoff_hz=None,
         dq_lowpass_cutoff_hz=None,
         ddq_lowpass_cutoff_hz=None,
@@ -409,17 +405,112 @@ def test_aligned_timeline_freezes_a_completed_target_snapshot() -> None:
     timeline.append_q_group("joint_1", 10_000, np.asarray([1.0]))
     timeline.append_motor(0, 10_000, velocity=2.0, torque=3.0, current=4.0)
 
-    first = timeline.aligned_sample(30_000)
-    assert first is not None
+    first = timeline.drain_completed()
+    assert len(first) == 1
     timeline.append_q_group("joint_1", 19_000, np.asarray([10.0]))
     timeline.append_motor(0, 19_000, velocity=20.0, torque=30.0, current=40.0)
-    repeated = timeline.aligned_sample(30_000)
+    second = timeline.drain_completed()
 
-    assert repeated is first
-    np.testing.assert_allclose(repeated.q, [1.0])
-    np.testing.assert_allclose(repeated.dq, [2.0])
-    np.testing.assert_array_equal(repeated.q_source_timestamp_us, [10_000])
-    np.testing.assert_array_equal(repeated.motor_source_timestamp_us, [10_000])
+    assert len(second) == 1
+    assert second[0].timestamp_us == 19_000
+    np.testing.assert_allclose(first[0].q, [1.0])
+    np.testing.assert_allclose(second[0].q, [10.0])
+
+
+def test_event_timeline_preserves_irregular_real_timestamps() -> None:
+    timeline = CanStateAssembler(
+        dof=1,
+        q_groups=(("joint_1", (0,)),),
+        maximum_source_skew_s=0.015,
+        q_lowpass_cutoff_hz=None,
+        dq_lowpass_cutoff_hz=None,
+        ddq_lowpass_cutoff_hz=None,
+    )
+    for timestamp_us in (10_000, 19_700, 30_500, 40_200, 51_100):
+        value = float(timestamp_us) * 1.0e-4
+        timeline.append_q_group("joint_1", timestamp_us, np.asarray([value]))
+        timeline.append_motor(
+            0,
+            timestamp_us,
+            velocity=value,
+            torque=value + 1.0,
+            current=value + 2.0,
+        )
+
+    samples = timeline.drain_completed()
+
+    assert [sample.timestamp_us for sample in samples] == [
+        10_000, 19_700, 30_500, 40_200, 51_100
+    ]
+    assert timeline.drain_completed() == ()
+
+
+def test_complete_state_skips_excessive_source_skew_and_recovers() -> None:
+    timeline = CanStateAssembler(
+        dof=1,
+        q_groups=(("joint_1", (0,)),),
+        maximum_source_skew_s=0.015,
+        q_lowpass_cutoff_hz=None,
+        dq_lowpass_cutoff_hz=None,
+        ddq_lowpass_cutoff_hz=None,
+        maximum_input_gap_s=0.06,
+    )
+    timeline.append_q_group("joint_1", 10_000, np.asarray([1.0]))
+    timeline.append_motor(0, 26_000, velocity=1.0, torque=1.0, current=1.0)
+
+    assert timeline.drain_completed() == ()
+
+    timeline.append_q_group("joint_1", 20_000, np.asarray([2.0]))
+    samples = timeline.drain_completed()
+
+    assert len(samples) == 1
+    assert samples[0].timestamp_us == 20_000
+    np.testing.assert_allclose(samples[0].q, [2.0])
+    np.testing.assert_array_equal(samples[0].q_source_timestamp_us, [20_000])
+    np.testing.assert_array_equal(samples[0].motor_source_timestamp_us, [26_000])
+
+
+def test_pyagx_pending_state_batch_reads_pose_only_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def sample(timestamp_us: int) -> AlignedArmSample:
+        values = np.arange(7, dtype=np.float64)
+        timestamps = np.full(7, timestamp_us, dtype=np.int64)
+        return AlignedArmSample(
+            timestamp_us=timestamp_us,
+            q=values.copy(),
+            dq=values.copy(),
+            ddq=values.copy(),
+            torque=values.copy(),
+            current=values.copy(),
+            q_source_timestamp_us=timestamps.copy(),
+            motor_source_timestamp_us=timestamps.copy(),
+        )
+
+    class Timeline:
+        drained = False
+
+        def drain_completed(self):
+            if not self.drained:
+                self.drained = True
+                return (sample(10_000), sample(20_000), sample(30_000))
+            return ()
+
+    pose_reads = []
+    monkeypatch.setattr(
+        "nero_collection.arms.pyagx._read_pose",
+        lambda _robot: (pose_reads.append(1), np.eye(4))[1],
+    )
+    adapter = PyAgxArmAdapter(ArmEndpointConfig(name="follower"))
+    adapter._robot = object()
+    adapter._state_timeline = Timeline()
+
+    states = adapter.read_pending_states()
+    repeated = adapter.read_pending_states()
+
+    assert [state.timestamp_us for state in states] == [10_000, 20_000, 30_000]
+    assert repeated == ()
+    assert len(pose_reads) == 1
 
 
 def test_v120_async_capture_converts_motor_velocity_to_joint_coordinates() -> None:
@@ -439,7 +530,7 @@ def test_v120_async_capture_converts_motor_velocity_to_joint_coordinates() -> No
             f"motor_state_{joint_index}",
             message(velocity=velocity, torque=joint_index, current=joint_index + 10),
         )
-    timeline = DelayedStateTimeline(
+    timeline = CanStateAssembler(
         dof=7,
         q_groups=(
             ("joint_12", (0, 1)),
@@ -447,8 +538,7 @@ def test_v120_async_capture_converts_motor_velocity_to_joint_coordinates() -> No
             ("joint_56", (4, 5)),
             ("joint_7", (6,)),
         ),
-        delay_s=0.01,
-        output_rate_hz=100.0,
+        maximum_source_skew_s=0.015,
         q_lowpass_cutoff_hz=None,
         dq_lowpass_cutoff_hz=None,
         ddq_lowpass_cutoff_hz=None,
@@ -462,8 +552,7 @@ def test_v120_async_capture_converts_motor_velocity_to_joint_coordinates() -> No
         last_timestamps_us={},
     )
 
-    sample = timeline.aligned_sample(20_000)
-    assert sample is not None
+    sample = timeline.drain_completed()[-1]
     expected_joint_velocity = expected_velocity * np.asarray(
         NERO_V120_MOTOR_VELOCITY_TO_JOINT_SIGN
     )
@@ -548,7 +637,7 @@ def test_pyagx_adapter_restarts_sampler_after_watchdog_fault(monkeypatch) -> Non
     monkeypatch.setattr("nero_collection.arms.pyagx._capture_async_state", capture)
     adapter = PyAgxArmAdapter(ArmEndpointConfig(name="follower"))
     adapter._robot = Robot()
-    adapter.configure_state_alignment(0.015, 100.0, 1, None, None, None, 0.06)
+    adapter.configure_state_capture(0.015, None, None, None, 0.06)
     deadline = time.monotonic() + 1.0
     while adapter._state_sampler_fault is None and time.monotonic() < deadline:
         time.sleep(0.001)

@@ -96,7 +96,7 @@ def test_episode_buffer_preserves_aligned_q_dq_ddq_without_redifferentiating() -
             "acceleration": StateParamConfig(enabled=True, lowpass=False),
         },
     )
-    buffer = EpisodeBuffer(config=config, arm_names=("main",), sample_rate_hz=100.0)
+    buffer = EpisodeBuffer(config=config, arm_names=("main",))
 
     first = buffer.append_teleop(
         1_000_000,
@@ -158,7 +158,7 @@ def test_finalize_teleop_data_preserves_aligned_derivatives_without_h5py(
             "torque": StateParamConfig(enabled=True),
         },
     )
-    buffer = EpisodeBuffer(config=config, arm_names=("main",), sample_rate_hz=100.0)
+    buffer = EpisodeBuffer(config=config, arm_names=("main",))
     timestamps = np.asarray(
         [1_000_000, 1_010_000, 1_020_000, 1_030_000, 1_040_000], dtype=np.int64
     )
@@ -186,7 +186,7 @@ def test_finalize_teleop_data_preserves_aligned_derivatives_without_h5py(
 
     assert state_names["dq_follower"] == "velocity"
     assert attrs["dq_follower"]["derivative_method"] == (
-        "sign_corrected_official_motor_velocity_with_causal_lowpass"
+        "sign_corrected_official_motor_velocity_unfiltered"
     )
     assert attrs["dq_follower"]["coordinate_sign_correction_json"] == (
         "[-1, -1, -1, -1, -1, 1, -1]"
@@ -195,7 +195,7 @@ def test_finalize_teleop_data_preserves_aligned_derivatives_without_h5py(
         "nero_joint_position_coordinates"
     )
     assert attrs["ddq_follower"]["derivative_method"] == (
-        "causal_first_derivative_of_sign_corrected_filtered_official_velocity"
+        "causal_first_derivative_of_sign_corrected_raw_official_velocity"
     )
     assert attrs["ddq_follower"]["derived_from_json"] == '["dq_follower"]'
     assert attrs["ddq_follower"]["formula"] == (
@@ -207,7 +207,7 @@ def test_finalize_teleop_data_preserves_aligned_derivatives_without_h5py(
     assert "tau_f" not in data
 
 
-def test_episode_save_preserves_aligned_derivatives_and_filters_torque(
+def test_episode_save_preserves_raw_aligned_state_and_torque(
     tmp_path: Path,
 ) -> None:
     try:
@@ -233,7 +233,7 @@ def test_episode_save_preserves_aligned_derivatives_and_filters_torque(
             "torque": StateParamConfig(enabled=True),
         },
     )
-    buffer = EpisodeBuffer(config=config, arm_names=("main",), sample_rate_hz=100.0)
+    buffer = EpisodeBuffer(config=config, arm_names=("main",))
     time_s = np.arange(100, dtype=np.float64) * 0.01
     timestamps = (1_000_000 + time_s * 1e6).astype(np.int64)
     phases = np.linspace(0.0, 0.6, 7)
@@ -275,16 +275,18 @@ def test_episode_save_preserves_aligned_derivatives_and_filters_torque(
         assert "ddq_follower_adapter_raw" not in teleop
         assert "q_follower_raw" not in teleop
         assert "tau_follower_raw" not in teleop
-        assert abs(teleop["tau_follower"][50, 3]) < abs(tau[50, 3])
+        np.testing.assert_allclose(teleop["tau_follower"][:], tau)
+        assert not bool(teleop["tau_follower"].attrs["lowpass"])
+        assert teleop["tau_follower"].attrs["median_window"] == 1
         assert "tau_ext_follower" not in teleop
         assert teleop["q_follower"].shape == (100, 7)
         assert "tau_f" not in teleop
         assert np.allclose(teleop["timestamp_us"][:], timestamps)
         assert teleop["dq_follower"].attrs["derivative_method"] == (
-            "sign_corrected_official_motor_velocity_with_causal_lowpass"
+            "sign_corrected_official_motor_velocity_unfiltered"
         )
         assert teleop["ddq_follower"].attrs["derivative_method"] == (
-            "causal_first_derivative_of_sign_corrected_filtered_official_velocity"
+            "causal_first_derivative_of_sign_corrected_raw_official_velocity"
         )
         assert teleop["dq_follower"].attrs["timestamp_path"] == "teleop/timestamp_us"
         assert bool(teleop["tau_follower"].attrs["zero_phase"]) is False

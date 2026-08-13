@@ -6,6 +6,7 @@ import subprocess
 from types import SimpleNamespace
 
 import h5py
+import pytest
 
 from nero_collection import socketcan
 from scripts import inspect_free_space_h5, open_rerun_recording, setup_can, setup_env
@@ -14,7 +15,7 @@ from scripts import inspect_free_space_h5, open_rerun_recording, setup_can, setu
 def test_setup_can_defaults_to_both_interfaces() -> None:
     args = setup_can._parse_args([])
 
-    assert args.interfaces == ["can0", "can1"]
+    assert args.interfaces == ["can_master", "can_slave"]
     assert args.bitrate == 1_000_000
 
 
@@ -37,6 +38,28 @@ def test_socketcan_configures_interface_with_argument_lists(monkeypatch) -> None
     assert calls[0][1]["check"] is False
     assert calls[1][1]["check"] is True
     assert calls[2][1]["check"] is True
+
+
+def test_socketcan_resolves_current_interface_from_usb_serial(tmp_path: Path) -> None:
+    sys_class_net = tmp_path / "sys" / "class" / "net"
+    usb_device = tmp_path / "devices" / "usb1" / "1-2"
+    usb_interface = usb_device / "1-2:1.0"
+    usb_interface.mkdir(parents=True)
+    (usb_device / "serial").write_text("MASTER-SERIAL\n", encoding="ascii")
+    interface_dir = sys_class_net / "can7"
+    interface_dir.mkdir(parents=True)
+    (interface_dir / "device").symlink_to(usb_interface, target_is_directory=True)
+
+    assert socketcan.interface_usb_serial("can7", sys_class_net) == "MASTER-SERIAL"
+    assert (
+        socketcan.interface_for_usb_serial("MASTER-SERIAL", sys_class_net)
+        == "can7"
+    )
+
+
+def test_socketcan_rejects_missing_usb_serial(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="is not present"):
+        socketcan.interface_for_usb_serial("MISSING", tmp_path)
 
 
 def test_inspect_free_space_h5_finds_latest_matching_episode(tmp_path: Path) -> None:

@@ -74,11 +74,9 @@ class ArmInterface(Protocol):
     def read_state(self) -> ArmState:
         ...
 
-    def configure_state_alignment(
+    def configure_state_capture(
         self,
-        delay_s: float,
-        output_rate_hz: float,
-        q_mean_window_samples: int,
+        maximum_source_skew_s: float,
         q_lowpass_cutoff_hz: float | None,
         dq_lowpass_cutoff_hz: float | None,
         ddq_lowpass_cutoff_hz: float | None,

@@ -43,7 +43,7 @@ def main() -> int:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Read real Nero joint enable/driver status from one CAN channel.")
-    parser.add_argument("--channel", default="can0")
+    parser.add_argument("--channel", default="can_master")
     parser.add_argument("--firmware", default="V120", choices=("DEFAULT", "V111", "V112", "V120"))
     parser.add_argument("--interface", default="socketcan")
     parser.add_argument("--bitrate", type=int, default=1_000_000)

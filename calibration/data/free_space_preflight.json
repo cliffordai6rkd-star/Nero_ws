@@ -1,31 +1,40 @@
 {
   "config_path": "/mnt/code/lcx/nero_ws/configs/free_space_coverage.yaml",
-  "config_sha256": "a22ae8a8cd2ddef4ea816213e4175b1485176124a25635677189a60b0cae417d",
+  "config_sha256": "8f4707814ae00fe921124597788e37bcce655f31271ed6344f29c639e1b3345a",
   "format": "nero_free_space_preflight/v2",
   "passed": true,
   "sample_rate_hz": 100.0,
   "trajectory": {
     "contact_events": [],
-    "contact_samples_checked": 180000,
-    "duration_s": 1800.0,
+    "contact_samples_checked": 150000,
+    "duration_s": 1500.0,
     "name": "empirical_workspace_low_static",
     "passed": true,
-    "reference_h5_path": "/mnt/code/lcx/nero_ws/runs/nero_refinement/episode_0000_20260726_194959.h5",
-    "reference_h5_sha256": "08843c66ade5b692e2ba77afdcc5f66ba28ba88fa1a6a2dd7ce684e48eb80847",
-    "samples": 180000,
+    "planner": "empirical",
+    "reference_h5_path": "/mnt/code/lcx/nero_ws/runs/test/episode_0021_20260811_221518.h5",
+    "reference_h5_sha256": "517268b9c4311b518c5ccdd6c1ebe60f8246dbbedd69585b56a8fee72cb2241c",
+    "samples": 150000,
     "scene_path": "/mnt/code/lcx/nero_ws/calibration/data/empirical_workspace_low_static.scene.xml",
+    "segment_names": [
+      "empirical_workspace_low_speed",
+      "empirical_workspace_static"
+    ],
+    "segment_sample_counts": [
+      90000,
+      60000
+    ],
     "trajectory_path": "/mnt/code/lcx/nero_ws/calibration/data/empirical_workspace_low_static.npz",
-    "trajectory_sha256": "73bc1e6d33970319a9495fb20a7867db74eda2a3e401f3d11f50486abe1b6079",
-    "workspace_convex_hull_volume_m3": 0.06068047493601163,
+    "trajectory_sha256": "959da9eb2bc5eee63763cf05491c9255ae810dc685548d5117c573c7371481f3",
+    "workspace_convex_hull_volume_m3": 0.01643633150057772,
     "workspace_max_m": [
-      -0.05495566801825909,
-      0.374802237232757,
-      0.5040214565641533
+      -0.12502276410905383,
+      0.2721133385162425,
+      0.5452463112370222
     ],
     "workspace_min_m": [
-      -0.5022312455725542,
-      -0.3141288515324658,
-      0.1365144244958473
+      -0.43568172824164275,
+      -0.14978069000101774,
+      0.1395995631385193
     ],
     "workspace_violation_count": 0
   }

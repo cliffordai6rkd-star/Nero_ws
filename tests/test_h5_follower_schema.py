@@ -22,6 +22,12 @@ from nero_collection.tau_ext_inference import (
 
 
 def _model_metadata(path: Path, output_key: str) -> SequenceCheckpointMetadata:
+    filters = {
+        "tau": {
+            "enabled": True,
+            "operations": [{"type": "lowpass", "cutoff_hz": 10.0}],
+        }
+    }
     return SequenceCheckpointMetadata(
         checkpoint_path=path,
         horizon=50,
@@ -31,6 +37,8 @@ def _model_metadata(path: Path, output_key: str) -> SequenceCheckpointMetadata:
         output_dim=7,
         architecture="lstm",
         normalize_mode="quantile" if output_key == "tau_f" else "gaussian",
+        sample_rate_hz=50.0,
+        dataloader_filters=filters,
         target_contract=(
             "matched_causal_torque_filter_v1" if output_key == "tau_f" else None
         ),
@@ -100,6 +108,26 @@ def _config(tmp_path: Path) -> CollectionConfig:
     )
 
 
+def test_episode_buffer_can_disable_configured_online_inference(tmp_path: Path) -> None:
+    buffer = EpisodeBuffer(
+        config=_config(tmp_path),
+        arm_names=("main",),
+        enable_online_tau_ext=False,
+    )
+
+    assert buffer.online_tau_ext is None
+    assert not buffer.warm_up_online_inference()
+
+
+def test_episode_buffer_skips_inference_when_all_checkpoints_are_empty(
+    tmp_path: Path,
+) -> None:
+    buffer = EpisodeBuffer(config=_config(tmp_path), arm_names=("main",))
+
+    assert buffer.online_tau_ext is None
+    assert not buffer.warm_up_online_inference()
+
+
 def test_episode_buffer_passes_raw_tau_to_online_filter_once(tmp_path: Path) -> None:
     config = _config(tmp_path)
     config.robot_states["torque"] = StateParamConfig(
@@ -112,7 +140,6 @@ def test_episode_buffer_passes_raw_tau_to_online_filter_once(tmp_path: Path) -> 
     buffer = EpisodeBuffer(
         config=config,
         arm_names=("main",),
-        sample_rate_hz=100.0,
         online_tau_ext=inference,
     )
     zeros = np.zeros(7)
@@ -127,9 +154,8 @@ def test_episode_buffer_passes_raw_tau_to_online_filter_once(tmp_path: Path) -> 
             },
         )
 
-    alpha = 1.0 - np.exp(-2.0 * np.pi * 10.0 * 0.01)
     np.testing.assert_allclose(inference.taus[1], 10.0)
-    np.testing.assert_allclose(buffer.teleop_data["tau_follower"][1], 10.0 * alpha)
+    np.testing.assert_allclose(buffer.teleop_data["tau_follower"][1], 10.0)
 
 
 def test_h5_v9_saves_matched_filter_dual_tau_ext_schema(
@@ -156,7 +182,6 @@ def test_h5_v9_saves_matched_filter_dual_tau_ext_schema(
     buffer = EpisodeBuffer(
         config=_config(tmp_path),
         arm_names=("main",),
-        sample_rate_hz=100.0,
         online_tau_ext=inference,
     )
     for index in range(3):
@@ -216,7 +241,7 @@ def test_h5_v9_saves_matched_filter_dual_tau_ext_schema(
         )
         assert (
             teleop["tau_ext_pred"].attrs["definition"]
-            == "tau_ext_filter(tau_next_pred - tau_follower)"
+            == "tau_ext_filter(tau_next_pred - checkpoint_causal_filter(tau_follower))"
         )
         assert not bool(teleop["tau_ext_cal"].attrs["feedback_source"])
         assert bool(teleop["tau_ext_pred"].attrs["feedback_source"])
@@ -225,11 +250,24 @@ def test_h5_v9_saves_matched_filter_dual_tau_ext_schema(
         assert teleop["ddq_kf_causal"].attrs["max_gap_s"] == pytest.approx(0.1)
         assert not bool(teleop["ddq_kf_causal"].attrs["lowpass"])
         assert not bool(teleop["tau_f_pred"].attrs["lowpass"])
+        assert not bool(teleop["q_follower"].attrs["lowpass"])
+        assert not bool(teleop["dq_follower"].attrs["lowpass"])
+        assert not bool(teleop["ddq_follower"].attrs["lowpass"])
+        assert not bool(teleop["tau_follower"].attrs["lowpass"])
+        assert teleop["tau_follower"].attrs["processing_method"] == (
+            "nearest_motor_sample_unfiltered"
+        )
         assert bool(teleop["tau_id_filtered"].attrs["lowpass"])
         assert teleop["tau_id_filtered"].attrs["lowpass_cutoff_hz"] == 10.0
         assert bool(teleop["tau_ext_cal"].attrs["lowpass"])
-        assert teleop["tau_ext_cal"].attrs["moving_average_window"] == 21
-        assert teleop["tau_ext_cal"].attrs["lowpass_cutoff_hz"] == 20.0
+        assert (
+            teleop["tau_ext_cal"].attrs["processing_method"]
+            == "causal_hampel_then_butterworth_sos"
+        )
+        assert teleop["tau_ext_cal"].attrs["hampel_window"] == 5
+        assert teleop["tau_ext_cal"].attrs["butterworth_order"] == 4
+        assert teleop["tau_ext_cal"].attrs["lowpass_cutoff_hz"] == 8.0
+        assert teleop["tau_ext_cal"].attrs["moving_average_window"] == 1
         assert not bool(teleop["tau_ext_cal_raw"].attrs["lowpass"])
 
 
@@ -238,7 +276,6 @@ def test_precomputed_dual_results_are_not_inferred_twice(tmp_path: Path) -> None
     buffer = EpisodeBuffer(
         config=_config(tmp_path),
         arm_names=("main",),
-        sample_rate_hz=100.0,
         online_tau_ext=inference,
     )
     zeros = np.zeros(7)

@@ -65,7 +65,7 @@ def test_isolated_mock_arm_publishes_ordered_states_and_restarts() -> None:
             connected_state = arm.read_state()
         assert np.all(np.isfinite(connected_state.q))
 
-        arm.configure_state_alignment(0.015, 100.0, 1, None, None, None, 0.06)
+        arm.configure_state_capture(0.015, None, None, None, 0.06)
         deadline = time.monotonic() + 2.0
         first = ()
         while time.monotonic() < deadline:

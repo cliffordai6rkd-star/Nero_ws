@@ -57,7 +57,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default=None, help="Optional config path. If set, --role selects arm endpoint from it.")
     parser.add_argument("--pair", default="main")
     parser.add_argument("--role", choices=("leader", "follower"), default="follower")
-    parser.add_argument("--channel", default="can1")
+    parser.add_argument("--channel", default="can_slave")
     parser.add_argument("--name", default="single_arm")
     parser.add_argument("--interface", default="socketcan")
     parser.add_argument("--bitrate", type=int, default=1_000_000)

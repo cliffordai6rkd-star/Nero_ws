@@ -64,7 +64,11 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Configure SocketCAN and verify that each interface receives frames."
     )
-    parser.add_argument("interfaces", nargs="*", default=["can0", "can1"])
+    parser.add_argument(
+        "interfaces",
+        nargs="*",
+        default=["can_master", "can_slave"],
+    )
     parser.add_argument(
         "--bitrate",
         type=int,

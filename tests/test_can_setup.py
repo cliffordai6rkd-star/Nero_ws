@@ -79,3 +79,45 @@ def test_setup_can_rejects_conflicting_bitrate_on_same_channel() -> None:
 
     with pytest.raises(RuntimeError, match="Conflicting bitrates"):
         cli._setup_can_interfaces(config)
+
+
+def test_resolve_can_interfaces_binds_usb_serials(monkeypatch: pytest.MonkeyPatch) -> None:
+    channels = {"MASTER-SERIAL": "can8", "SLAVE-SERIAL": "can3"}
+    monkeypatch.setattr(
+        cli,
+        "interface_for_usb_serial",
+        lambda serial: channels[serial],
+    )
+    config = _config(
+        ArmEndpointConfig(
+            name="master",
+            channel="can_master",
+            usb_serial="MASTER-SERIAL",
+        ),
+        ArmEndpointConfig(
+            name="slave",
+            channel="can_slave",
+            usb_serial="SLAVE-SERIAL",
+        ),
+    )
+
+    resolved = cli._resolve_can_interfaces(config)
+    pair = resolved.teleop.master_slave[0]
+
+    assert pair.leader.channel == "can8"
+    assert pair.follower.channel == "can3"
+    assert pair.leader.usb_serial == "MASTER-SERIAL"
+    assert pair.follower.usb_serial == "SLAVE-SERIAL"
+
+
+def test_resolve_can_interfaces_rejects_duplicate_physical_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli, "interface_for_usb_serial", lambda _serial: "can0")
+    config = _config(
+        ArmEndpointConfig(name="master", usb_serial="MASTER-SERIAL"),
+        ArmEndpointConfig(name="slave", usb_serial="SLAVE-SERIAL"),
+    )
+
+    with pytest.raises(RuntimeError, match="assigned to both"):
+        cli._resolve_can_interfaces(config)

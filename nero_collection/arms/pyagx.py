@@ -13,7 +13,8 @@ from nero_collection.arms.base import ArmState, GripperState
 from nero_collection.arms.kinematics import pose6_to_matrix
 from nero_collection.coordinates import nero_v120_joint_velocity
 from nero_collection.config import ArmEndpointConfig
-from nero_collection.state_alignment import DelayedStateTimeline, StateTimingError
+from nero_collection.state_alignment import CanStateAssembler, StateTimingError
+from nero_collection.socketcan import interface_usb_serial
 from nero_collection.time_utils import now_us
 
 log = logging.getLogger(__name__)
@@ -35,14 +36,13 @@ class PyAgxArmAdapter:
     _leader_mode_commanded: bool = False
     _leader_feedback_timestamp: float | None = None
     _leader_gripper_feedback_baseline: float | None = None
-    _alignment_delay_s: float | None = None
-    _alignment_output_rate_hz: float | None = None
+    _maximum_source_skew_s: float | None = None
     _q_mean_window_samples: int = 5
     _q_lowpass_cutoff_hz: float | None = 10.0
-    _dq_lowpass_cutoff_hz: float | None = 6.0
-    _ddq_lowpass_cutoff_hz: float | None = 3.0
+    _dq_lowpass_cutoff_hz: float | None = 10.0
+    _ddq_lowpass_cutoff_hz: float | None = 10.0
     _maximum_input_gap_s: float = 0.03
-    _state_timeline: DelayedStateTimeline | None = None
+    _state_timeline: CanStateAssembler | None = None
     _state_sampler_stop: threading.Event = field(
         init=False, default_factory=threading.Event
     )
@@ -51,11 +51,24 @@ class PyAgxArmAdapter:
         init=False, default_factory=dict
     )
     _state_sampler_fault: StateTimingError | None = field(init=False, default=None)
+    _aligned_state_lock: threading.Lock = field(
+        init=False, default_factory=threading.Lock
+    )
+    _last_published_aligned_timestamp_us: int = field(init=False, default=0)
+    _last_aligned_arm_state: ArmState | None = field(init=False, default=None)
 
     def __post_init__(self) -> None:
         self.name = self.config.name
 
     def connect(self) -> None:
+        if self.config.interface == "socketcan" and self.config.usb_serial is not None:
+            actual_serial = interface_usb_serial(self.config.channel)
+            if actual_serial != self.config.usb_serial:
+                raise RuntimeError(
+                    f"Refusing to connect arm {self.name}: {self.config.channel} has "
+                    f"USB-CAN serial {actual_serial!r}, expected {self.config.usb_serial!r}. "
+                    "Resolve the configured USB-CAN binding before connecting."
+                )
         try:
             from pyAgxArm import AgxArmFactory, ArmModel, NeroFW, create_agx_arm_config
         except ImportError as exc:
@@ -207,14 +220,16 @@ class PyAgxArmAdapter:
             )
         self._state_capture_timestamps_us.clear()
         self._state_sampler_fault = None
-        if self._alignment_delay_s is None or self._alignment_output_rate_hz is None:
+        with self._aligned_state_lock:
+            self._last_published_aligned_timestamp_us = 0
+            self._last_aligned_arm_state = None
+        if self._maximum_source_skew_s is None:
             self._state_timeline = None
             return
-        self._state_timeline = DelayedStateTimeline(
+        self._state_timeline = CanStateAssembler(
             dof=self.dof,
             q_groups=_q_group_layout(self._leader_mode_commanded),
-            delay_s=self._alignment_delay_s,
-            output_rate_hz=self._alignment_output_rate_hz,
+            maximum_source_skew_s=self._maximum_source_skew_s,
             q_mean_window_samples=self._q_mean_window_samples,
             q_lowpass_cutoff_hz=self._q_lowpass_cutoff_hz,
             dq_lowpass_cutoff_hz=self._dq_lowpass_cutoff_hz,
@@ -223,33 +238,29 @@ class PyAgxArmAdapter:
         )
         self._start_state_sampler()
 
-    def configure_state_alignment(
+    def configure_state_capture(
         self,
-        delay_s: float,
-        output_rate_hz: float,
-        q_mean_window_samples: int,
+        maximum_source_skew_s: float,
         q_lowpass_cutoff_hz: float | None,
         dq_lowpass_cutoff_hz: float | None,
         ddq_lowpass_cutoff_hz: float | None,
         maximum_input_gap_s: float = 0.03,
     ) -> None:
         self._require_robot()
-        self._alignment_delay_s = float(delay_s)
-        self._alignment_output_rate_hz = float(output_rate_hz)
-        self._q_mean_window_samples = int(q_mean_window_samples)
+        self._maximum_source_skew_s = float(maximum_source_skew_s)
+        self._q_mean_window_samples = 1
         self._q_lowpass_cutoff_hz = q_lowpass_cutoff_hz
         self._dq_lowpass_cutoff_hz = dq_lowpass_cutoff_hz
         self._ddq_lowpass_cutoff_hz = ddq_lowpass_cutoff_hz
         self._maximum_input_gap_s = float(maximum_input_gap_s)
         self._reset_state_alignment_cache()
         log.info(
-            "configured delayed state timeline arm=%s delay=%.3fms rate=%.3fHz "
+            "configured event-driven CAN state assembler arm=%s max_source_skew=%.3fms "
             "dq_source=V120_motor_velocity q_lpf_compat=%sHz dq_lpf=%sHz "
             "ddq_source=d_dq_dt ddq_lpf=%sHz "
             "max_can_gap=%.3fms poll=%.3fms",
             self.name,
-            self._alignment_delay_s * 1e3,
-            self._alignment_output_rate_hz,
+            self._maximum_source_skew_s * 1e3,
             self._q_lowpass_cutoff_hz,
             self._dq_lowpass_cutoff_hz,
             self._ddq_lowpass_cutoff_hz,
@@ -367,35 +378,13 @@ class PyAgxArmAdapter:
         acquired_timestamp_us = now_us()
         timeline = self._state_timeline
         if timeline is not None:
-            sample = timeline.aligned_sample(acquired_timestamp_us)
-            if sample is None:
-                q = np.full(self.dof, np.nan, dtype=np.float64)
-                dq = np.full(self.dof, np.nan, dtype=np.float64)
-                ddq = np.full(self.dof, np.nan, dtype=np.float64)
-                q_timestamp_us = 0
-                q_component_timestamp_us = np.zeros(self.dof, dtype=np.int64)
-                q_source_before_timestamp_us = np.zeros(self.dof, dtype=np.int64)
-                q_source_after_timestamp_us = np.zeros(self.dof, dtype=np.int64)
-                motor_states = _empty_motor_states(self.dof)
-            else:
-                q = sample.q.copy()
-                dq = sample.dq.copy()
-                ddq = sample.ddq.copy()
-                q_timestamp_us = sample.timestamp_us
-                q_component_timestamp_us = sample.q_source_timestamp_us.copy()
-                q_source_before_timestamp_us = (
-                    q_component_timestamp_us.copy()
-                )
-                q_source_after_timestamp_us = q_component_timestamp_us.copy()
-                motor_states = {
-                    "velocity": dq.copy(),
-                    "torque": sample.torque.copy(),
-                    "current": sample.current.copy(),
-                    "timestamp_us": sample.motor_source_timestamp_us.copy(),
-                    "acquired_timestamp_us": np.full(
-                        self.dof, acquired_timestamp_us, dtype=np.int64
-                    ),
-                }
+            pending = self.read_pending_states()
+            if pending:
+                return pending[-1]
+            with self._aligned_state_lock:
+                if self._last_aligned_arm_state is not None:
+                    return _copy_arm_state(self._last_aligned_arm_state)
+            return _invalid_aligned_arm_state(self.dof, acquired_timestamp_us)
         else:
             reader = (
                 getattr(robot, "get_leader_joint_angles", None)
@@ -438,6 +427,37 @@ class PyAgxArmAdapter:
             motor_acquired_timestamp_us=motor_states["acquired_timestamp_us"],
         )
         return state
+
+    def read_pending_states(self) -> tuple[ArmState, ...]:
+        """Return complete unpublished states on their real CAN timeline."""
+        if self._state_sampler_fault is not None:
+            raise RuntimeError(
+                f"CAN state watchdog tripped for arm {self.name}: {self._state_sampler_fault}"
+            ) from self._state_sampler_fault
+        robot = self._require_robot()
+        timeline = self._state_timeline
+        if timeline is None:
+            return (self.read_state(),)
+
+        with self._aligned_state_lock:
+            acquired_timestamp_us = now_us()
+            samples = timeline.drain_completed()
+            if not samples:
+                return ()
+            # Pose is not a model input. Read it once for an event batch so a
+            # briefly delayed consumer does not multiply SDK calls by backlog size.
+            ee_pose = _read_pose(robot)
+            states = tuple(
+                _arm_state_from_aligned_sample(
+                    sample,
+                    acquired_timestamp_us=acquired_timestamp_us,
+                    ee_pose=ee_pose,
+                )
+                for sample in samples
+            )
+            self._last_published_aligned_timestamp_us = states[-1].timestamp_us
+            self._last_aligned_arm_state = states[-1]
+            return tuple(_copy_arm_state(state) for state in states)
 
     def read_leader_joint_positions(self) -> np.ndarray:
         return self.read_state().q
@@ -775,7 +795,7 @@ def _q_group_layout(leader: bool) -> tuple[tuple[str, tuple[int, ...]], ...]:
 
 def _capture_async_state(
     robot: Any,
-    timeline: DelayedStateTimeline,
+    timeline: CanStateAssembler,
     *,
     leader: bool,
     firmware: str,
@@ -858,6 +878,86 @@ def _empty_motor_states(dof: int) -> dict[str, np.ndarray]:
         "timestamp_us": np.zeros(dof, dtype=np.int64),
         "acquired_timestamp_us": np.zeros(dof, dtype=np.int64),
     }
+
+
+def _arm_state_from_aligned_sample(
+    sample: Any,
+    *,
+    acquired_timestamp_us: int,
+    ee_pose: np.ndarray,
+) -> ArmState:
+    q_source_timestamp_us = np.asarray(
+        sample.q_source_timestamp_us,
+        dtype=np.int64,
+    ).copy()
+    motor_source_timestamp_us = np.asarray(
+        sample.motor_source_timestamp_us,
+        dtype=np.int64,
+    ).copy()
+    dof = int(np.asarray(sample.q).size)
+    return ArmState(
+        q=np.asarray(sample.q, dtype=np.float64).copy(),
+        dq=np.asarray(sample.dq, dtype=np.float64).copy(),
+        ddq=np.asarray(sample.ddq, dtype=np.float64).copy(),
+        ee_pose=np.asarray(ee_pose, dtype=np.float64).copy(),
+        torque=np.asarray(sample.torque, dtype=np.float64).copy(),
+        current=np.asarray(sample.current, dtype=np.float64).copy(),
+        timestamp_us=int(sample.timestamp_us),
+        acquired_timestamp_us=int(acquired_timestamp_us),
+        q_timestamp_us=int(sample.timestamp_us),
+        q_acquired_timestamp_us=int(acquired_timestamp_us),
+        q_component_timestamp_us=q_source_timestamp_us,
+        q_source_before_timestamp_us=q_source_timestamp_us.copy(),
+        q_source_after_timestamp_us=q_source_timestamp_us.copy(),
+        motor_timestamp_us=motor_source_timestamp_us,
+        motor_acquired_timestamp_us=np.full(
+            dof,
+            int(acquired_timestamp_us),
+            dtype=np.int64,
+        ),
+    )
+
+
+def _invalid_aligned_arm_state(dof: int, acquired_timestamp_us: int) -> ArmState:
+    invalid = np.full(dof, np.nan, dtype=np.float64)
+    timestamps = np.zeros(dof, dtype=np.int64)
+    return ArmState(
+        q=invalid.copy(),
+        dq=invalid.copy(),
+        ddq=invalid.copy(),
+        ee_pose=np.eye(4, dtype=np.float64),
+        torque=invalid.copy(),
+        current=invalid.copy(),
+        timestamp_us=int(acquired_timestamp_us),
+        acquired_timestamp_us=int(acquired_timestamp_us),
+        q_timestamp_us=0,
+        q_acquired_timestamp_us=int(acquired_timestamp_us),
+        q_component_timestamp_us=timestamps.copy(),
+        q_source_before_timestamp_us=timestamps.copy(),
+        q_source_after_timestamp_us=timestamps.copy(),
+        motor_timestamp_us=timestamps.copy(),
+        motor_acquired_timestamp_us=timestamps.copy(),
+    )
+
+
+def _copy_arm_state(state: ArmState) -> ArmState:
+    return ArmState(
+        q=np.asarray(state.q).copy(),
+        dq=np.asarray(state.dq).copy(),
+        ddq=np.asarray(state.ddq).copy(),
+        ee_pose=np.asarray(state.ee_pose).copy(),
+        torque=np.asarray(state.torque).copy(),
+        current=np.asarray(state.current).copy(),
+        timestamp_us=int(state.timestamp_us),
+        acquired_timestamp_us=int(state.acquired_timestamp_us),
+        q_timestamp_us=int(state.q_timestamp_us),
+        q_acquired_timestamp_us=int(state.q_acquired_timestamp_us),
+        q_component_timestamp_us=np.asarray(state.q_component_timestamp_us).copy(),
+        q_source_before_timestamp_us=np.asarray(state.q_source_before_timestamp_us).copy(),
+        q_source_after_timestamp_us=np.asarray(state.q_source_after_timestamp_us).copy(),
+        motor_timestamp_us=np.asarray(state.motor_timestamp_us).copy(),
+        motor_acquired_timestamp_us=np.asarray(state.motor_acquired_timestamp_us).copy(),
+    )
 
 
 def _read_motor_states(

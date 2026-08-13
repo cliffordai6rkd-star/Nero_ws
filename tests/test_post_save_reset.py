@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -405,6 +408,310 @@ def test_dual_tau_ext_uses_limited_follower_q_cmd_before_inference() -> None:
     assert len(teleop.pairs[0].controller.tau_ext_overrides) == 1
 
 
+def test_bilateral_sampling_consumes_all_ring_frames_with_zoh_backlog_command() -> None:
+    class Inference:
+        def __init__(self) -> None:
+            self.timestamps = []
+            self.q_cmds = []
+
+        def estimate_aligned(self, timestamp_us, q, dq, tau, q_cmd):
+            self.timestamps.append(int(timestamp_us))
+            self.q_cmds.append(np.asarray(q_cmd, dtype=np.float64).copy())
+            zeros = np.zeros(7, dtype=np.float64)
+            return OnlineTauExtResult(
+                timestamp_us=int(timestamp_us),
+                q=np.asarray(q, dtype=np.float64),
+                dq=np.asarray(dq, dtype=np.float64),
+                ddq_kf_causal=zeros.copy(),
+                tau=np.asarray(tau, dtype=np.float64),
+                tau_id=zeros.copy(),
+                tau_id_filtered=zeros.copy(),
+                tau_f_pred=zeros.copy(),
+                tau_next_pred=zeros.copy(),
+                tau_ext_cal=zeros.copy(),
+                tau_ext_pred=zeros.copy(),
+            )
+
+    def state(timestamp_us: int, q_value: float) -> ArmState:
+        q = np.full(7, q_value, dtype=np.float64)
+        zeros = np.zeros(7, dtype=np.float64)
+        timestamps = np.full(7, timestamp_us, dtype=np.int64)
+        return ArmState(
+            q=q,
+            dq=zeros.copy(),
+            ddq=zeros.copy(),
+            ee_pose=np.eye(4),
+            torque=zeros.copy(),
+            current=zeros.copy(),
+            timestamp_us=timestamp_us,
+            q_timestamp_us=timestamp_us,
+            q_component_timestamp_us=timestamps.copy(),
+            motor_timestamp_us=timestamps.copy(),
+        )
+
+    leader = FakeLeader()
+    follower = BiasedFollower(np.zeros(7))
+    leader_states = tuple(state(timestamp, value) for timestamp, value in (
+        (10_000, 0.1),
+        (20_000, 0.2),
+        (30_000, 0.3),
+    ))
+    follower_states = tuple(state(timestamp, 0.0) for timestamp in (
+        10_000,
+        20_000,
+        30_000,
+    ))
+    leader.drain_states = lambda: SimpleNamespace(states=leader_states, dropped=0)
+    follower.drain_states = lambda: SimpleNamespace(states=follower_states, dropped=0)
+    teleop = _teleop_with_fakes(CommandConfig(), leader, follower)
+    teleop.online_tau_ext = Inference()
+    teleop._bilateral_active = True
+    teleop._last_bilateral_step_t = None
+    teleop._last_sent_q_cmd = {"main": np.full(7, 0.05)}
+
+    frames = teleop.teleop_frames()
+
+    assert [frame.timestamp_us for frame in frames] == [10_000, 20_000, 30_000]
+    assert teleop.online_tau_ext.timestamps == [10_000, 20_000, 30_000]
+    assert len(leader.command_mit_calls) == 1
+    assert len(follower.command_mit_calls) == 1
+    np.testing.assert_allclose(teleop.online_tau_ext.q_cmds[0], 0.05)
+    np.testing.assert_allclose(teleop.online_tau_ext.q_cmds[1], 0.05)
+    np.testing.assert_allclose(teleop.online_tau_ext.q_cmds[2], 0.08)
+    np.testing.assert_allclose(frames[0].values["q_cmd"][1], 0.05)
+    np.testing.assert_allclose(frames[-1].values["q_cmd"][1], 0.08)
+    teleop._command_executor.shutdown(wait=True)
+
+
+def test_bilateral_sampling_does_not_resend_commands_without_new_state() -> None:
+    leader = FakeLeader()
+    follower = BiasedFollower(np.zeros(7))
+    leader.drain_states = lambda: SimpleNamespace(states=(), dropped=0)
+    follower.drain_states = lambda: SimpleNamespace(states=(), dropped=0)
+    teleop = _teleop_with_fakes(CommandConfig(), leader, follower)
+    cached_state = follower.read_state()
+    teleop._last_synchronized_states = {"main": (cached_state, cached_state)}
+    teleop._bilateral_active = True
+    teleop._last_bilateral_step_t = None
+
+    frames = teleop.teleop_frames()
+
+    assert frames == ()
+    assert leader.command_mit_calls == []
+    assert follower.command_mit_calls == []
+    assert teleop.pairs[0].controller.tau_ext_overrides == []
+    teleop._command_executor.shutdown(wait=True)
+
+
+def test_bilateral_sampling_preserves_irregular_real_state_frames() -> None:
+    def state(timestamp_us: int) -> ArmState:
+        zeros = np.zeros(7, dtype=np.float64)
+        return ArmState(
+            q=zeros.copy(),
+            dq=zeros.copy(),
+            ddq=zeros.copy(),
+            ee_pose=np.eye(4),
+            torque=zeros.copy(),
+            current=zeros.copy(),
+            timestamp_us=timestamp_us,
+            q_timestamp_us=timestamp_us,
+        )
+
+    leader = FakeLeader()
+    follower = BiasedFollower(np.zeros(7))
+    states = (state(10_000), state(30_000))
+    leader.drain_states = lambda: SimpleNamespace(states=states, dropped=0)
+    follower.drain_states = lambda: SimpleNamespace(states=states, dropped=0)
+    teleop = _teleop_with_fakes(CommandConfig(), leader, follower)
+    teleop.online_tau_ext = None
+    teleop._bilateral_active = True
+    teleop._last_bilateral_step_t = None
+
+    frames = teleop.teleop_frames()
+    assert [frame.timestamp_us for frame in frames] == [10_000, 30_000]
+
+    teleop._command_executor.shutdown(wait=True)
+
+
+def test_bilateral_sampling_pairs_independent_can_timestamps_within_limit() -> None:
+    def state(timestamp_us: int) -> ArmState:
+        zeros = np.zeros(7, dtype=np.float64)
+        return ArmState(
+            q=zeros.copy(),
+            dq=zeros.copy(),
+            ddq=zeros.copy(),
+            ee_pose=np.eye(4),
+            torque=zeros.copy(),
+            current=zeros.copy(),
+            timestamp_us=timestamp_us,
+            q_timestamp_us=timestamp_us,
+        )
+
+    leader = FakeLeader()
+    follower = BiasedFollower(np.zeros(7))
+    leader.drain_states = lambda: SimpleNamespace(
+        states=(state(1_000_000), state(1_010_000)), dropped=0
+    )
+    follower.drain_states = lambda: SimpleNamespace(
+        states=(state(1_002_317), state(1_012_317)), dropped=0
+    )
+    teleop = _teleop_with_fakes(
+        CommandConfig(maximum_arm_pair_skew_s=0.015), leader, follower
+    )
+
+    synchronized = teleop._drain_synchronized_pair_states(teleop.pairs[0])
+
+    assert [(_arm.timestamp_us, follower_arm.timestamp_us) for _arm, follower_arm in synchronized] == [
+        (1_000_000, 1_002_317),
+        (1_010_000, 1_012_317),
+    ]
+    assert teleop._last_synchronized_timestamp_us["main"] == 1_012_317
+    teleop._command_executor.shutdown(wait=True)
+
+
+def test_bilateral_sampling_discards_unmatchable_old_state_then_recovers() -> None:
+    def state(timestamp_us: int) -> ArmState:
+        zeros = np.zeros(7, dtype=np.float64)
+        return ArmState(
+            q=zeros.copy(),
+            dq=zeros.copy(),
+            ddq=zeros.copy(),
+            ee_pose=np.eye(4),
+            torque=zeros.copy(),
+            current=zeros.copy(),
+            timestamp_us=timestamp_us,
+            q_timestamp_us=timestamp_us,
+        )
+
+    leader = FakeLeader()
+    follower = BiasedFollower(np.zeros(7))
+    leader.drain_states = lambda: SimpleNamespace(
+        states=(state(900_000), state(1_000_000)), dropped=0
+    )
+    follower.drain_states = lambda: SimpleNamespace(
+        states=(state(1_002_000),), dropped=0
+    )
+    teleop = _teleop_with_fakes(
+        CommandConfig(maximum_arm_pair_skew_s=0.015), leader, follower
+    )
+
+    synchronized = teleop._drain_synchronized_pair_states(teleop.pairs[0])
+
+    assert len(synchronized) == 1
+    assert synchronized[0][0].timestamp_us == 1_000_000
+    assert synchronized[0][1].timestamp_us == 1_002_000
+    teleop._command_executor.shutdown(wait=True)
+
+
+def test_bilateral_sampling_does_not_shift_phase_after_one_missing_frame() -> None:
+    def state(timestamp_us: int) -> ArmState:
+        zeros = np.zeros(7, dtype=np.float64)
+        return ArmState(
+            q=zeros.copy(),
+            dq=zeros.copy(),
+            ddq=zeros.copy(),
+            ee_pose=np.eye(4),
+            torque=zeros.copy(),
+            current=zeros.copy(),
+            timestamp_us=timestamp_us,
+            q_timestamp_us=timestamp_us,
+        )
+
+    leader = FakeLeader()
+    follower = BiasedFollower(np.zeros(7))
+    leader.drain_states = lambda: SimpleNamespace(
+        states=(state(1_000_000), state(1_010_000), state(1_020_000)),
+        dropped=0,
+    )
+    follower.drain_states = lambda: SimpleNamespace(
+        states=(state(1_010_000), state(1_020_000)),
+        dropped=0,
+    )
+    teleop = _teleop_with_fakes(
+        CommandConfig(maximum_arm_pair_skew_s=0.015), leader, follower
+    )
+
+    synchronized = teleop._drain_synchronized_pair_states(teleop.pairs[0])
+
+    assert [
+        (leader_arm.timestamp_us, follower_arm.timestamp_us)
+        for leader_arm, follower_arm in synchronized
+    ] == [
+        (1_010_000, 1_010_000),
+        (1_020_000, 1_020_000),
+    ]
+    teleop._command_executor.shutdown(wait=True)
+
+
+def test_bilateral_sampling_rejects_stale_cached_states(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leader = FakeLeader()
+    follower = BiasedFollower(np.zeros(7))
+    leader.drain_states = lambda: SimpleNamespace(states=(), dropped=0)
+    follower.drain_states = lambda: SimpleNamespace(states=(), dropped=0)
+    teleop = _teleop_with_fakes(
+        CommandConfig(
+            maximum_can_frame_gap_s=0.03,
+        ),
+        leader,
+        follower,
+    )
+    teleop._last_synchronized_timestamp_us = {"main": 1_000_000}
+    monkeypatch.setattr(master_slave_module, "now_us", lambda: 1_060_001)
+
+    with pytest.raises(TeleopSafetyError, match="state stream is stale"):
+        teleop._drain_synchronized_pair_states(teleop.pairs[0])
+
+    teleop._command_executor.shutdown(wait=True)
+
+
+def test_bilateral_commands_reach_both_arm_workers_concurrently() -> None:
+    barrier = threading.Barrier(2)
+    leader = FakeLeader()
+    follower = BiasedFollower(np.zeros(7))
+
+    def wait_for_peer(*_args) -> None:
+        barrier.wait(timeout=1.0)
+
+    leader.command_joint_impedance = wait_for_peer
+    follower.command_joint_impedance = wait_for_peer
+    teleop = _teleop_with_fakes(CommandConfig(), leader, follower)
+    state = follower.read_state()
+    result = teleop.pairs[0].controller.compute(
+        state,
+        state,
+        timestamp_us=1,
+    )
+
+    teleop._send_bilateral_commands(teleop.pairs[0], result, state.q)
+
+    assert barrier.n_waiting == 0
+    teleop._command_executor.shutdown(wait=True)
+
+
+def test_bilateral_hardware_command_timeout_is_independent_of_backlog() -> None:
+    leader = FakeLeader()
+    follower = BiasedFollower(np.zeros(7))
+    leader.command_joint_impedance = lambda *_args: time.sleep(0.05)
+    teleop = _teleop_with_fakes(
+        CommandConfig(control_watchdog_timeout_s=0.02),
+        leader,
+        follower,
+    )
+    state = follower.read_state()
+    result = teleop.pairs[0].controller.compute(
+        state,
+        state,
+        timestamp_us=1,
+    )
+
+    with pytest.raises(TeleopSafetyError, match="MIT hardware command timed out"):
+        teleop._send_bilateral_commands(teleop.pairs[0], result, state.q)
+
+    teleop._command_executor.shutdown(wait=True)
+
+
 def test_reset_uses_five_sample_mean_to_fine_tune(monkeypatch: pytest.MonkeyPatch) -> None:
     bias = np.array([0.03, -0.02, 0.01, 0.0, -0.01, 0.02, -0.03])
     leader = FakeLeader()
@@ -468,6 +775,122 @@ def test_enter_teleop_keeps_both_arms_in_follower_and_activates_software_control
     assert len(teleop.pairs[0].controller.activations) == 1
     assert len(leader.command_mit_calls) == 1
     assert len(follower.command_mit_calls) == 1
+
+
+def test_enter_teleop_waits_for_finite_synchronized_states_after_mit_reset() -> None:
+    def aligned_state(timestamp_us: int, q_value: float) -> ArmState:
+        q = np.full(7, q_value, dtype=np.float64)
+        zeros = np.zeros(7, dtype=np.float64)
+        return ArmState(
+            q=q,
+            dq=zeros.copy(),
+            ddq=zeros.copy(),
+            ee_pose=np.eye(4, dtype=np.float64),
+            torque=zeros.copy(),
+            current=zeros.copy(),
+            timestamp_us=timestamp_us,
+            q_timestamp_us=timestamp_us,
+        )
+
+    def drain_batches(batches):
+        pending = list(batches)
+
+        def drain():
+            states = pending.pop(0) if pending else ()
+            return SimpleNamespace(states=states, dropped=0)
+
+        return drain
+
+    leader = FakeLeader()
+    follower = BiasedFollower(np.zeros(7, dtype=np.float64))
+    leader_state = aligned_state(20_000, 0.02)
+    follower_state = aligned_state(20_000, 0.01)
+    leader.drain_states = drain_batches(((), (), (leader_state,)))
+    follower.drain_states = drain_batches(((), (follower_state,), ()))
+    teleop = _teleop_with_fakes(
+        CommandConfig(input_ready_timeout_s=0.1),
+        leader,
+        follower,
+    )
+
+    teleop.enter_teleop()
+
+    activation = teleop.pairs[0].controller.activations[0]
+    assert activation[0].timestamp_us == 20_000
+    assert activation[1].timestamp_us == 20_000
+    np.testing.assert_allclose(activation[0].q, 0.02)
+    np.testing.assert_allclose(activation[1].q, 0.01)
+    assert teleop._last_synchronized_timestamp_us["main"] == 20_000
+    teleop._command_executor.shutdown(wait=True)
+
+
+def test_enter_teleop_accepts_independent_can_timestamps_within_limit() -> None:
+    def aligned_state(timestamp_us: int) -> ArmState:
+        zeros = np.zeros(7, dtype=np.float64)
+        return ArmState(
+            q=zeros.copy(),
+            dq=zeros.copy(),
+            ddq=zeros.copy(),
+            ee_pose=np.eye(4, dtype=np.float64),
+            torque=zeros.copy(),
+            current=zeros.copy(),
+            timestamp_us=timestamp_us,
+            q_timestamp_us=timestamp_us,
+        )
+
+    leader = FakeLeader()
+    follower = BiasedFollower(np.zeros(7, dtype=np.float64))
+    leader_state = aligned_state(1_000_000)
+    follower_state = aligned_state(1_002_317)
+    leader.drain_states = lambda: SimpleNamespace(states=(leader_state,), dropped=0)
+    follower.drain_states = lambda: SimpleNamespace(states=(follower_state,), dropped=0)
+    teleop = _teleop_with_fakes(
+        CommandConfig(
+            input_ready_timeout_s=0.1,
+            maximum_arm_pair_skew_s=0.015,
+        ),
+        leader,
+        follower,
+    )
+
+    teleop.enter_teleop()
+
+    activation = teleop.pairs[0].controller.activations[0]
+    assert activation[0].timestamp_us == 1_000_000
+    assert activation[1].timestamp_us == 1_002_317
+    assert teleop._last_synchronized_timestamp_us["main"] == 1_002_317
+    teleop._command_executor.shutdown(wait=True)
+
+
+def test_mit_state_readiness_timeout_reports_incomplete_ring_status() -> None:
+    zeros = np.zeros(7, dtype=np.float64)
+    leader_state = ArmState(
+        q=zeros.copy(),
+        dq=zeros.copy(),
+        ddq=zeros.copy(),
+        ee_pose=np.eye(4, dtype=np.float64),
+        torque=zeros.copy(),
+        current=zeros.copy(),
+        timestamp_us=30_000,
+        q_timestamp_us=30_000,
+    )
+    leader = FakeLeader()
+    follower = BiasedFollower(np.zeros(7, dtype=np.float64))
+    leader_batches = [(leader_state,)]
+    leader.drain_states = lambda: SimpleNamespace(
+        states=leader_batches.pop(0) if leader_batches else (),
+        dropped=0,
+    )
+    follower.drain_states = lambda: SimpleNamespace(states=(), dropped=0)
+    teleop = _teleop_with_fakes(CommandConfig(), leader, follower)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"leader=timestamp_us=30000 invalid=none follower=no-state",
+    ):
+        teleop._wait_for_synchronized_pair_state(teleop.pairs[0], 0.01)
+
+    teleop._command_executor.shutdown(wait=True)
 
 
 def test_bilateral_control_dispatches_commands_to_both_arms() -> None:
@@ -555,6 +978,10 @@ def test_gripper_teleop_maps_leader_width_to_follower() -> None:
     values: dict[str, tuple[str, np.ndarray]] = {}
 
     teleop._update_gripper_teleop(values)
+    deadline = time.monotonic() + 1.0
+    while teleop._gripper_futures and time.monotonic() < deadline:
+        time.sleep(0.001)
+        teleop._update_gripper_teleop(values)
 
     assert follower.gripper_commands == [(0.06, 2.0, "width")]
     assert values["gripper_follower"][1] == pytest.approx([0.01])
@@ -562,6 +989,7 @@ def test_gripper_teleop_maps_leader_width_to_follower() -> None:
     assert "gripper_leader" not in values
     assert "gripper_state" not in values
     assert "gripper_value" not in values
+    teleop._gripper_executor.shutdown(wait=True)
 
 
 def test_gripper_teleop_ignores_non_width_input() -> None:
@@ -582,11 +1010,54 @@ def test_gripper_teleop_ignores_non_width_input() -> None:
     values: dict[str, tuple[str, np.ndarray]] = {}
 
     teleop._update_gripper_teleop(values)
+    deadline = time.monotonic() + 1.0
+    while teleop._gripper_futures and time.monotonic() < deadline:
+        time.sleep(0.001)
+        teleop._update_gripper_teleop(values)
 
     assert follower.gripper_commands == []
     assert values["gripper_cmd"][1] == pytest.approx([np.nan], nan_ok=True)
     assert "gripper_force" not in values
     assert "gripper_mode_leader" not in values
+    teleop._gripper_executor.shutdown(wait=True)
+
+
+def test_slow_gripper_rpc_does_not_block_bilateral_control_thread() -> None:
+    class SlowLeader(FakeLeader):
+        def read_gripper_state(self):
+            time.sleep(0.05)
+            return super().read_gripper_state()
+
+    leader = SlowLeader()
+    leader.gripper_value = 0.03
+    follower = BiasedFollower(np.zeros(7, dtype=np.float64))
+    teleop = _teleop_with_fakes(CommandConfig(), leader, follower)
+    teleop.config = CollectionConfig(
+        teleop=teleop.config.teleop,
+        output=OutputConfig(directory=Path(".")),
+        gripper=GripperConfig(
+            enabled=True,
+            attach_to="both",
+            teleop_enabled=True,
+        ),
+    )
+    values: dict[str, tuple[str, np.ndarray]] = {}
+
+    started = time.monotonic()
+    teleop._update_gripper_teleop(values)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.02
+    assert teleop._gripper_futures
+    deadline = time.monotonic() + 1.0
+    while (
+        "main" not in teleop._cached_follower_gripper_state
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.005)
+        teleop._update_gripper_teleop(values)
+    assert values["gripper_follower"][1] == pytest.approx([0.0])
+    teleop._gripper_executor.shutdown(wait=True)
 
 
 def test_wait_for_record_start_handles_t_then_r(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -615,6 +1086,40 @@ def test_wait_for_record_start_handles_t_then_r(monkeypatch: pytest.MonkeyPatch)
     cli._wait_for_record_start(Teleop(), Keys(), config, None)
 
     assert events == ["unrecorded_teleop"]
+
+
+def test_unrecorded_teleop_polls_events_without_idle_rate_delay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleeps: list[float] = []
+    events: list[str] = []
+
+    class Keys:
+        def __init__(self) -> None:
+            self.keys = iter(("t", "", "r"))
+
+        def read_key(self, _timeout: float) -> str:
+            return next(self.keys)
+
+    class Teleop:
+        def enter_unrecorded_teleop(self) -> None:
+            events.append("unrecorded_teleop")
+
+        def idle_step(self) -> None:
+            events.append("idle")
+
+    config = CollectionConfig(
+        teleop=TeleopConfig(command=CommandConfig(idle_rate_hz=30.0)),
+        output=OutputConfig(directory=Path(".")),
+    )
+    monotonic_values = iter((0.0, 0.0, 0.0, 0.0))
+    monkeypatch.setattr(cli.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(cli.time, "sleep", sleeps.append)
+
+    cli._wait_for_record_start(Teleop(), Keys(), config, None)
+
+    assert events == ["unrecorded_teleop", "idle"]
+    assert sleeps == [pytest.approx(cli._ACTIVE_TELEOP_EVENT_POLL_S)]
 
 
 @pytest.mark.parametrize(
@@ -725,7 +1230,7 @@ def test_emergency_reset_never_disables_arms(monkeypatch: pytest.MonkeyPatch) ->
 
     for arm in (leader, follower):
         arm.disable = lambda: pytest.fail("emergency reset must never call disable()")
-        arm.configure_state_alignment = (
+        arm.configure_state_capture = (
             lambda *_args, arm_name=arm.name: events.append(f"align:{arm_name}")
         )
     monkeypatch.setattr(

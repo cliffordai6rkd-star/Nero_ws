@@ -59,7 +59,7 @@ class _Arm:
     def set_follower_mode(self):
         self.follower_mode_count += 1
 
-    def configure_state_alignment(self, *args):
+    def configure_state_capture(self, *args):
         self.state_alignment_args = args
 
     def validate_joint_impedance_support(self):
@@ -554,17 +554,14 @@ def test_runtime_uses_aligned_dq_and_tau_ext_kalman_acceleration() -> None:
     dq_state = runtime.collection.robot_states["velocity"]
     ddq_state = runtime.collection.robot_states["acceleration"]
     assert arm.state_alignment_args == (
-        command.state_alignment_delay_s,
-        command.sample_rate_hz,
-        q_state.mean_window,
+        command.maximum_state_source_skew_s,
         q_state.lowpass_cutoff_hz if q_state.lowpass else None,
         dq_state.lowpass_cutoff_hz if dq_state.lowpass else None,
         ddq_state.lowpass_cutoff_hz if ddq_state.lowpass else None,
         command.maximum_can_frame_gap_s,
     )
     np.testing.assert_allclose(pipeline.inputs[-1].dq, arm.dq)
-    np.testing.assert_allclose(pipeline.inputs[-1].ddq, 0.0)
-    assert not np.allclose(pipeline.inputs[-1].ddq, arm.ddq)
+    np.testing.assert_allclose(pipeline.inputs[-1].ddq, arm.ddq)
 
 
 def test_runtime_skips_transient_incomplete_aligned_state() -> None:

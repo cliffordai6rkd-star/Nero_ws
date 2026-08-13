@@ -14,9 +14,12 @@ from nero_collection.episode_output import episode_path, next_episode_index
 from nero_collection.h5_writer import EpisodeBuffer
 from nero_collection.keyboard import TerminalKeys
 from nero_collection.realtime_plot import RealtimeJointPlotter
+from nero_collection.socketcan import interface_for_usb_serial
 from nero_collection.teleop.master_slave import MasterSlaveTeleop
 
 log = logging.getLogger(__name__)
+
+_ACTIVE_TELEOP_EVENT_POLL_S = 0.001
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -28,6 +31,8 @@ def main(argv: list[str] | None = None) -> int:
     config = load_config(args.config)
     if args.backend:
         config = _with_backend(config, args.backend)
+    if config.teleop.backend == "pyagxarm":
+        config = _resolve_can_interfaces(config)
     if config.teleop.backend == "pyagxarm" and not args.skip_can_setup:
         _setup_can_interfaces(config)
     return run_collection(
@@ -74,7 +79,6 @@ def run_collection(
                 buffer = EpisodeBuffer(
                     config=config,
                     arm_names=teleop.arm_names,
-                    sample_rate_hz=config.teleop.command.sample_rate_hz,
                     online_tau_ext=getattr(teleop, "online_tau_ext", None),
                 )
                 if buffer.warm_up_online_inference():
@@ -167,6 +171,7 @@ def _wait_for_record_start(
         flush=True,
     )
     idle_period = 1.0 / max(config.teleop.command.idle_rate_hz, 1.0)
+    unrecorded_teleop_active = False
     while True:
         start = time.monotonic()
         key = keys.read_key(0.0)
@@ -174,6 +179,7 @@ def _wait_for_record_start(
             return
         if key in {"t", "T"}:
             teleop.enter_unrecorded_teleop()
+            unrecorded_teleop_active = True
             print("Unrecorded teleoperation active. Press r to start recording.", flush=True)
             continue
         if key in {"q", "Q", "\x03"}:
@@ -182,8 +188,13 @@ def _wait_for_record_start(
         if cameras is not None:
             cameras.poll()
         elapsed = time.monotonic() - start
-        if elapsed < idle_period:
-            time.sleep(idle_period - elapsed)
+        poll_period = (
+            _ACTIVE_TELEOP_EVENT_POLL_S
+            if unrecorded_teleop_active
+            else idle_period
+        )
+        if elapsed < poll_period:
+            time.sleep(poll_period - elapsed)
 
 
 def _record_episode(
@@ -195,7 +206,6 @@ def _record_episode(
     dry_run_duration_s: float | None,
     realtime_plot: RealtimeJointPlotter,
 ) -> None:
-    sample_period = 1.0 / max(config.teleop.command.sample_rate_hz, 1.0)
     start_t = time.monotonic()
     discard_initial_s = config.output.discard_initial_s
     discard_complete_logged = discard_initial_s <= 0.0
@@ -214,21 +224,32 @@ def _record_episode(
         if dry_run_duration_s is not None and loop_t - start_t >= dry_run_duration_s:
             return
 
-        timestamp_us, values = teleop.teleop_step()
+        frame_reader = getattr(teleop, "teleop_frames", None)
+        if callable(frame_reader):
+            teleop_frames = tuple(
+                (frame.timestamp_us, frame.values)
+                for frame in frame_reader()
+            )
+        else:
+            timestamp_us, values = teleop.teleop_step()
+            teleop_frames = ((timestamp_us, values),)
         store = loop_t - start_t >= discard_initial_s
         if store and not discard_complete_logged:
             log.info("initial episode discard complete; saving and visualization started")
             discard_complete_logged = True
-        accepted = buffer.append_teleop(timestamp_us, values, store=store)
-        if accepted is not None:
-            realtime_plot.append(accepted.timestamp_us, accepted.values)
+        for timestamp_us, values in teleop_frames:
+            accepted = buffer.append_teleop(
+                timestamp_us,
+                values,
+                store=store,
+            )
+            if accepted is not None:
+                realtime_plot.append(accepted.timestamp_us, accepted.values)
         for frame in cameras.poll():
             if store:
                 buffer.append_camera(frame.camera_name, frame.timestamp_us, frame.frame)
 
-        elapsed = time.monotonic() - loop_t
-        if elapsed < sample_period:
-            time.sleep(sample_period - elapsed)
+        time.sleep(0.001)
 
 
 def _wait_for_save_choice(keys: TerminalKeys, auto_save: bool) -> bool:
@@ -248,6 +269,45 @@ def _wait_for_save_choice(keys: TerminalKeys, auto_save: bool) -> bool:
 
 def _with_backend(config: CollectionConfig, backend: str) -> CollectionConfig:
     return replace(config, teleop=replace(config.teleop, backend=backend))
+
+
+def _resolve_can_interfaces(config: CollectionConfig) -> CollectionConfig:
+    """Bind arm endpoints to current canX names through USB adapter serials."""
+
+    resolved_pairs = []
+    used_channels: dict[str, str] = {}
+    for pair in config.teleop.master_slave:
+        endpoints = []
+        for logical_role, endpoint in (
+            ("leader", pair.leader),
+            ("follower", pair.follower),
+        ):
+            if endpoint.interface != "socketcan" or endpoint.usb_serial is None:
+                resolved = endpoint
+            else:
+                channel = interface_for_usb_serial(endpoint.usb_serial)
+                resolved = replace(endpoint, channel=channel)
+                log.info(
+                    "bound USB-CAN adapter pair=%s role=%s arm=%s serial=%s channel=%s",
+                    pair.name,
+                    logical_role,
+                    endpoint.name,
+                    endpoint.usb_serial,
+                    channel,
+                )
+            owner = used_channels.get(resolved.channel)
+            identity = f"{pair.name}:{logical_role}:{resolved.name}"
+            if owner is not None:
+                raise RuntimeError(
+                    f"CAN channel {resolved.channel!r} is assigned to both {owner} and {identity}"
+                )
+            used_channels[resolved.channel] = identity
+            endpoints.append(resolved)
+        resolved_pairs.append(replace(pair, leader=endpoints[0], follower=endpoints[1]))
+    return replace(
+        config,
+        teleop=replace(config.teleop, master_slave=tuple(resolved_pairs)),
+    )
 
 
 def _setup_can_interfaces(config: CollectionConfig) -> None:

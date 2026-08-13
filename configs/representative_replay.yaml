@@ -1,0 +1,71 @@
+collection_config: master_slave_can.yaml
+pair: main
+
+model:
+  urdf_path: ../urdf/nero/nero_with_gripper.urdf
+  locked_joint_names: [gripper, gripper_joint1, gripper_joint2]
+  joint_names: [joint1, joint2, joint3, joint4, joint5, joint6, joint7]
+  gravity_m_s2: [0.0, 0.0, -9.81]
+
+trajectory:
+  planner: representative_replay
+  sample_rate_hz: 50.0
+  joint_limit_margin_rad: 0.05
+  joint_position_min_rad: [-1.10, -0.60, -0.95, 0.55, -1.35, -0.62, -0.10]
+  joint_position_max_rad: [+1.15, +1.00, +1.10, 2.08, +1.30, +0.88, +1.51]
+  max_velocity_rad_s: [1.0, 0.9, 1.0, 0.8, 1.0, 0.8, 1.0]
+  max_acceleration_rad_s2: [3.0, 2.5, 3.0, 2.5, 3.0, 2.5, 3.0]
+  section_fractions: [1.0]
+
+  replay_source_directory: ../runs/next_data_raw
+  replay_include_sources: [teleop]
+  representative_episode_count: 4
+  # Reduce the old 100 Hz path to meaningful pose changes, then reconstruct
+  # each leg with a velocity/acceleration-bounded quintic command profile.
+  replay_path_min_delta_rad: 0.02
+  replay_speed_scale: 0.65
+
+  # Unused by this planner, retained as the shared planner schema defaults.
+  reference_dataset: teleop/q_follower
+  waypoint_min_delta_rad: 0.05
+  workspace_voxel_counts: [6, 8, 5]
+  static_transition_speed_scale: 0.10
+  static_hold_s: 0.50
+  static_pose_count: 48
+  replay_pose_count: 128
+  jump_pose_count: 64
+  jump_min_delta_rad: 0.08
+  jump_max_delta_rad: 0.35
+  jump_transition_speed_scale: 0.60
+  jump_hold_s: 0.25
+  joint_candidate_count: 4096
+  joint_pose_count: 128
+  joint_connection_step_rad: 0.40
+  joint_transition_speed_scale: 0.65
+
+  run:
+    name: representative_next_data_replay
+    seed: 20260812
+    duration_s: 1800.0
+    trajectory_path: ../calibration/data/representative_next_data_replay.npz
+
+simulation:
+  scene_template_path: ../calibration/mujoco/scene_template.xml
+  end_effector_body: gripper_base
+  floor_z_m: -0.02
+  workspace_min_m: [-0.75, -0.75, 0.02]
+  workspace_max_m: [+0.75, +0.75, 1.10]
+  display_rate_hz: 50.0
+  playback_speed: 10.0
+  collision_sample_stride: 1
+  ignored_contact_pairs:
+    - [link5_collision_0, gripper_flange_collision_0]
+
+hardware:
+  approved: true
+  preflight_report_path: ../calibration/data/representative_replay_preflight.json
+  max_tracking_error_rad: [0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2]
+  max_abs_torque_nm: [20.0, 20.0, 12.0, 12.0, 6.0, 6.0, 6.0]
+  max_timestamp_gap_s: 0.10
+  start_move_speed_rad_s: 0.20
+  record_cameras: false

@@ -1,0 +1,50 @@
+{
+  "config_path": "/mnt/code/lcx/nero_ws/configs/representative_replay.yaml",
+  "config_sha256": "1f58c453dc1c2c5088d961c675616822041c32fc48c31e742cd80f6ead233ae4",
+  "format": "nero_free_space_preflight/v2",
+  "passed": true,
+  "sample_rate_hz": 50.0,
+  "trajectory": {
+    "contact_events": [],
+    "contact_samples_checked": 89746,
+    "duration_s": 1794.92,
+    "name": "representative_next_data_replay",
+    "passed": true,
+    "planner": "representative_replay",
+    "reference_h5_path": "/mnt/code/lcx/nero_ws/runs/next_data_raw",
+    "reference_h5_sha256": "b22d09476dad04ae858e7fe8eaba6778563d426b20ca549e239cd94043b54d36",
+    "replay_path_min_delta_rad": 0.02,
+    "replay_speed_scale": 0.65,
+    "samples": 89746,
+    "scene_path": "/mnt/code/lcx/nero_ws/calibration/data/representative_next_data_replay.scene.xml",
+    "segment_names": [
+      "episode_transition",
+      "representative_episode_replay"
+    ],
+    "segment_sample_counts": [
+      318,
+      89428
+    ],
+    "selected_episode_count": 4,
+    "source_h5_paths": [
+      "/mnt/code/lcx/nero_ws/runs/next_data_raw/episode_0000_20260811_163210.h5",
+      "/mnt/code/lcx/nero_ws/runs/next_data_raw/episode_0014_20260811_202154.h5",
+      "/mnt/code/lcx/nero_ws/runs/next_data_raw/episode_0020_20260811_221223.h5",
+      "/mnt/code/lcx/nero_ws/runs/next_data_raw/episode_0027_20260812_154638.h5"
+    ],
+    "trajectory_path": "/mnt/code/lcx/nero_ws/calibration/data/representative_next_data_replay.npz",
+    "trajectory_sha256": "4d6169a135a6ca5c5597299975c7a9a0ae8faf1c1ff02db421ef33dcc5e928b9",
+    "workspace_convex_hull_volume_m3": 0.03347032837103336,
+    "workspace_max_m": [
+      -0.11711632984182606,
+      0.2860078828919707,
+      0.6124416179215114
+    ],
+    "workspace_min_m": [
+      -0.47820403009511914,
+      -0.23033197341574282,
+      0.1302958751052513
+    ],
+    "workspace_violation_count": 0
+  }
+}

@@ -8,14 +8,10 @@ from typing import Any
 
 import numpy as np
 
-from nero_collection.config import CollectionConfig, StateParamConfig
+from nero_collection.config import CollectionConfig
 from nero_collection.coordinates import NERO_V120_MOTOR_VELOCITY_TO_JOINT_SIGN
 from nero_collection.contact_wrench import (
     PinocchioContactWrenchEstimator,
-)
-from nero_collection.filters import (
-    DatasetFilterBank,
-    OnePoleLowPass,
 )
 from nero_collection.tau_ext_inference import OnlineTauExtInference
 from nero_collection.time_utils import now_us
@@ -57,20 +53,9 @@ FOLLOWER_TELEOP_DATASETS = frozenset(
         "q_source_timestamp_follower_us",
         "motor_source_timestamp_follower_us",
         "state_source_skew_follower_us",
-    }
-)
-
-_MEASURED_TORQUE_DATASETS = frozenset({"tau_leader", "tau_follower"})
-_INFERENCE_TORQUE_DATASETS = frozenset(
-    {
-        "tau_id",
-        "tau_id_filtered",
-        "tau_f_pred",
-        "tau_next_pred",
-        "tau_ext_cal_raw",
-        "tau_ext_pred_raw",
-        "tau_ext_cal",
-        "tau_ext_pred",
+        "model_observation_updated",
+        "model_observation_timestamp_us",
+        "model_prediction_age_us",
     }
 )
 
@@ -80,6 +65,8 @@ _TIMING_DATASET_SOURCES = {
     "q_source_timestamp_follower_us": "pyagx_can_joint_group_frames",
     "motor_source_timestamp_follower_us": "pyagx_can_motor_state_frames",
     "state_source_skew_follower_us": "max_minus_min_q_and_motor_source_timestamp",
+    "model_observation_timestamp_us": "causal_real_observation_selector",
+    "model_prediction_age_us": "source_timestamp_minus_model_observation_timestamp",
 }
 
 
@@ -93,24 +80,35 @@ class AcceptedTeleopFrame:
 class EpisodeBuffer:
     config: CollectionConfig
     arm_names: tuple[str, ...]
-    sample_rate_hz: float
     teleop_timestamps_us: list[int] = field(default_factory=list)
     teleop_data: dict[str, list[np.ndarray]] = field(default_factory=lambda: defaultdict(list))
     teleop_state_names: dict[str, str] = field(default_factory=dict)
     camera_frames: dict[str, list[np.ndarray]] = field(default_factory=lambda: defaultdict(list))
     camera_timestamps_us: dict[str, list[int]] = field(default_factory=lambda: defaultdict(list))
     episode_metadata: dict[str, Any] = field(default_factory=dict)
-    measured_torque_filters: dict[str, OnePoleLowPass] = field(
-        init=False, default_factory=dict
-    )
     last_input_timestamp_us: int | None = field(init=False, default=None)
     input_frame_count: int = field(init=False, default=0)
     duplicate_input_frame_count: int = field(init=False, default=0)
     online_tau_ext: OnlineTauExtInference | None = None
+    enable_online_tau_ext: bool | None = None
 
     def __post_init__(self) -> None:
-        self.filter_bank = DatasetFilterBank(self.config.robot_states)
-        if self.online_tau_ext is None and self.config.tau_ext_inference.enabled:
+        inference_enabled = (
+            self.config.tau_ext_inference.enabled
+            if self.enable_online_tau_ext is None
+            else self.enable_online_tau_ext
+        )
+        if self.online_tau_ext is None:
+            inference_enabled = inference_enabled and any(
+                branch.checkpoint_path is not None
+                for branch in (
+                    self.config.tau_ext_inference.tau_f,
+                    self.config.tau_ext_inference.tau_next,
+                )
+            )
+        if not inference_enabled:
+            self.online_tau_ext = None
+        elif self.online_tau_ext is None:
             self.online_tau_ext = OnlineTauExtInference(
                 self.config.tau_ext_inference,
                 self.config.realtime_plot.inverse_dynamics,
@@ -193,8 +191,29 @@ class EpisodeBuffer:
                 ),
                 ("tau_ext_cal", result.tau_ext_cal),
                 ("tau_ext_pred", result.tau_ext_pred),
+                (
+                    "model_observation_updated",
+                    np.asarray(result.observation_updated, dtype=np.uint8),
+                ),
+                (
+                    "model_observation_timestamp_us",
+                    np.asarray(result.observation_timestamp_us, dtype=np.int64),
+                ),
+                (
+                    "model_prediction_age_us",
+                    np.asarray(result.prediction_age_us, dtype=np.int64),
+                ),
             ):
-                state_name = "acceleration" if name == "ddq_kf_causal" else "torque"
+                if name == "ddq_kf_causal":
+                    state_name = "acceleration"
+                elif name.endswith("timestamp_us"):
+                    state_name = "timestamp"
+                elif name.endswith("age_us"):
+                    state_name = "duration"
+                elif name == "model_observation_updated":
+                    state_name = "flag"
+                else:
+                    state_name = "torque"
                 if store:
                     self.teleop_data[name].append(value.copy())
                     self.teleop_state_names[name] = state_name
@@ -210,21 +229,10 @@ class EpisodeBuffer:
         value: np.ndarray,
         timestamp_us: int,
     ) -> np.ndarray:
-        if dataset_name in _INFERENCE_TORQUE_DATASETS:
-            return value.copy()
-        if state_name in {"q", "velocity", "acceleration"}:
-            return value.copy()
-        if dataset_name in _MEASURED_TORQUE_DATASETS and self.config.dynamics_processing.enabled:
-            filt = self.measured_torque_filters.get(dataset_name)
-            if filt is None:
-                processing = self.config.dynamics_processing
-                filt = OnePoleLowPass(
-                    processing.torque_lowpass_hz,
-                    processing.torque_median_window,
-                )
-                self.measured_torque_filters[dataset_name] = filt
-            return filt.apply(value, timestamp_us)
-        return self.filter_bank.apply(dataset_name, state_name, value, timestamp_us)
+        del dataset_name, state_name, timestamp_us
+        # Persist aligned raw samples. Training/checkpoint filters operate on
+        # independent copies and never mutate the recorded source signal.
+        return value.copy()
 
     def append_camera(self, camera_name: str, timestamp_us: int, frame: np.ndarray) -> None:
         self.camera_timestamps_us[camera_name].append(int(timestamp_us))
@@ -290,22 +298,17 @@ class EpisodeBuffer:
                 "timestamp_us",
                 data=np.asarray(self.teleop_timestamps_us, dtype=np.int64),
             )
-            teleop_timestamp.attrs["source"] = "delayed_nearest_joint_group_state"
+            teleop_timestamp.attrs["source"] = "event_driven_can_state_watermark"
             teleop_timestamp.attrs["clock"] = "unix_epoch"
             teleop_timestamp.attrs["unit"] = "us"
             for name, data in sorted(finalized_data.items()):
                 dataset = teleop.create_dataset(name, data=data, compression=_compression_for(data))
                 state_name = finalized_state_names.get(name, "")
                 dataset.attrs["state_name"] = state_name
-                state_config = self.config.robot_states.get(state_name)
-                saved_value_is_lowpass = bool(
-                    state_config and state_config.lowpass and state_name != "q"
-                )
-                dataset.attrs["lowpass"] = saved_value_is_lowpass
-                dataset.attrs["median_window"] = state_config.median_window if state_config else 1
-                if state_config and saved_value_is_lowpass:
-                    dataset.attrs["lowpass_cutoff_hz"] = state_config.lowpass_cutoff_hz
-                    dataset.attrs["filter_timeline"] = "teleop/timestamp_us"
+                # Collected signals are persisted exactly as received. Derived
+                # online inference outputs override these defaults below.
+                dataset.attrs["lowpass"] = False
+                dataset.attrs["median_window"] = 1
                 if name == "ee_pose_follower":
                     dataset.attrs["frame_name"] = "tcp"
                     dataset.attrs["frame_type"] = "end_effector"
@@ -354,20 +357,9 @@ class EpisodeBuffer:
         state_names = dict(self.teleop_state_names)
         attrs: dict[str, dict[str, object]] = defaultdict(dict)
         timeline = np.asarray(self.teleop_timestamps_us, dtype=np.int64)
-        processing = self.config.dynamics_processing
         if timeline.size and np.any(np.diff(timeline) <= 0):
             raise RuntimeError("Teleop acquisition timestamps must be strictly increasing")
         self._apply_dynamics_metadata(data, state_names, attrs, timeline)
-        if processing.enabled and timeline.size < processing.min_samples:
-            raise RuntimeError(
-                "Dynamics-aware episode saving requires at least "
-                f"{processing.min_samples} samples; got {timeline.size}"
-            )
-        if processing.enabled and processing.state_method != "finite_difference":
-            raise RuntimeError(
-                "H5 episode saving only supports causal finite_difference processing; "
-                f"got {processing.state_method!r}"
-            )
         self._append_online_tau_ext_attrs(attrs)
         self._append_wrenches(data, state_names, attrs, timeline)
         return data, state_names, attrs
@@ -378,15 +370,32 @@ class EpisodeBuffer:
         metadata = self.online_tau_ext.metadata
         kalman = self.config.tau_ext_inference.state_estimator
         tau_ext_filter = metadata.tau_ext_filter
+        sample_rates = {
+            name: model_metadata.sample_rate_hz
+            for name, model_metadata in (
+                ("tau_f", metadata.tau_f),
+                ("tau_next", metadata.tau_next),
+            )
+            if model_metadata is not None
+            and model_metadata.sample_rate_hz is not None
+        }
         common = {
             "timestamp_path": "teleop/timestamp_us",
             "causal": True,
+            "model_observation_policy": "per_model_fixed_rate_observation",
+            "fixed_observation_interval": True,
+            "active_model_sample_rates_hz_json": json.dumps(sample_rates),
+            "observation_grid_phase": "per_model",
+            "observation_gap_warning_s": (
+                self.config.tau_ext_inference.observation_gap_warning_s
+            ),
             "dq_coordinate_sign_correction_json": json.dumps(
                 NERO_V120_MOTOR_VELOCITY_TO_JOINT_SIGN
             ),
         }
-        attrs["ddq_kf_causal"].update(
-            {
+        if metadata.tau_f is not None:
+            attrs["ddq_kf_causal"].update(
+                {
                 **common,
                 "first_valid_sample_index": 0,
                 "definition": "causal Kalman acceleration state",
@@ -410,10 +419,10 @@ class EpisodeBuffer:
                     list(kalman.initial_acceleration_std)
                 ),
                 "max_gap_s": kalman.max_gap_s,
-            }
-        )
-        attrs["tau_id"].update(
-            {
+                }
+            )
+            attrs["tau_id"].update(
+                {
                 **common,
                 "first_valid_sample_index": 0,
                 "definition": "RNEA(q_follower, dq_follower, ddq_kf_causal)",
@@ -429,27 +438,79 @@ class EpisodeBuffer:
                 "model_manifest": str(
                     self.config.realtime_plot.inverse_dynamics.manifest_path or ""
                 ),
+                }
+            )
+        else:
+            disabled_dynamics = {
+                **common,
+                "definition": "disabled because tau_f checkpoint is empty",
+                "processing_method": "disabled_zero_output",
+                "lowpass": False,
+                "zero_phase": False,
             }
-        )
-        attrs["tau_id_filtered"].update(
-            {
+            attrs["ddq_kf_causal"].update(disabled_dynamics)
+            attrs["tau_id"].update(disabled_dynamics)
+        if metadata.tau_f is not None:
+            attrs["tau_id_filtered"].update(
+                {
                 **common,
                 "first_valid_sample_index": 0,
-                "definition": "causal_lowpass(tau_id)",
-                "processing_method": "causal_median_then_one_pole_iir",
-                "lowpass": True,
-                "lowpass_cutoff_hz": metadata.tau_f.target_filter_cutoff_hz,
-                "median_window": metadata.tau_f.target_filter_median_window,
+                "definition": "checkpoint_causal_filter(tau_id)",
+                "processing_method": "checkpoint_dataloader_filter_pipeline",
+                "lowpass": _pipeline_has_operation(
+                    metadata.tau_f.dataloader_filters,
+                    "tau",
+                    "lowpass",
+                ),
+                "median_window": _pipeline_window(
+                    metadata.tau_f.dataloader_filters,
+                    "tau",
+                    "median",
+                    fallback=metadata.tau_f.target_filter_median_window or 1,
+                ),
+                "filter_operations_json": json.dumps(
+                    _metadata_filter_operations(metadata.tau_f, "tau")
+                ),
                 "zero_phase": False,
                 "filter_timeline": "teleop/timestamp_us",
                 "filter_initialization": "first_sample",
                 "source_dataset": "teleop/tau_id",
-            }
-        )
+                }
+            )
+            lowpass_cutoff_hz = _pipeline_cutoff_hz(
+                metadata.tau_f.dataloader_filters,
+                "tau",
+                fallback=metadata.tau_f.target_filter_cutoff_hz,
+            )
+            if lowpass_cutoff_hz is not None:
+                attrs["tau_id_filtered"]["lowpass_cutoff_hz"] = lowpass_cutoff_hz
+        else:
+            attrs["tau_id_filtered"].update(
+                {
+                    **common,
+                    "definition": "disabled because tau_f checkpoint is empty",
+                    "processing_method": "disabled_zero_output",
+                    "lowpass": False,
+                    "zero_phase": False,
+                }
+            )
         for dataset_name, model_metadata, definition in (
             ("tau_f_pred", metadata.tau_f, "checkpoint prediction of tau_f"),
             ("tau_next_pred", metadata.tau_next, "checkpoint prediction of tau"),
         ):
+            if model_metadata is None:
+                attrs[dataset_name].update(
+                    {
+                        **common,
+                        "definition": "disabled because checkpoint_path is empty",
+                        "processing_method": "disabled_zero_output",
+                        "lowpass": False,
+                        "zero_phase": False,
+                        "model_checkpoint": "",
+                        "history_warmup_samples": 0,
+                    }
+                )
+                continue
             attrs[dataset_name].update(
                 {
                     **common,
@@ -472,6 +533,35 @@ class EpisodeBuffer:
                     ),
                     "model_output_key": model_metadata.output_key,
                     "model_normalize_mode": model_metadata.normalize_mode,
+                    "model_sample_rate_hz": (
+                        model_metadata.sample_rate_hz
+                        if model_metadata.sample_rate_hz is not None
+                        else float("nan")
+                    ),
+                    "observation_sample_rate_hz": (
+                        self.online_tau_ext.observation_sample_rate_hz(
+                            "tau_f" if dataset_name == "tau_f_pred" else "tau_next"
+                        )
+                        if hasattr(
+                            self.online_tau_ext,
+                            "observation_sample_rate_hz",
+                        )
+                        else model_metadata.sample_rate_hz
+                    ),
+                    "observation_selection_policy": (
+                        "fixed_phase_latest_complete_at_or_before_tick"
+                        if dataset_name == "tau_next_pred"
+                        else "episode_phase_absolute_nearest_complete_observation"
+                    ),
+                    "observation_phase_reference": (
+                        "unix_epoch"
+                        if dataset_name == "tau_next_pred"
+                        else "first_complete_observation"
+                    ),
+                    "model_dataloader_filters_json": json.dumps(
+                        model_metadata.dataloader_filters,
+                        sort_keys=True,
+                    ),
                     "model_target_contract": model_metadata.target_contract or "",
                     "model_target_filter_enabled": (
                         model_metadata.target_filter_enabled
@@ -480,6 +570,12 @@ class EpisodeBuffer:
                         model_metadata.target_filter_cutoff_hz
                         if model_metadata.target_filter_cutoff_hz is not None
                         else float("nan")
+                    ),
+                    "model_target_filter_moving_average_window": (
+                        model_metadata.target_filter_moving_average_window
+                        if model_metadata.target_filter_moving_average_window
+                        is not None
+                        else -1
                     ),
                     "model_target_filter_median_window": (
                         model_metadata.target_filter_median_window
@@ -492,23 +588,44 @@ class EpisodeBuffer:
                 }
             )
         tau_source_lowpass = bool(
-            self.config.dynamics_processing.enabled
-            or self.config.robot_states.get("torque", StateParamConfig()).lowpass
+            metadata.tau_f is not None
+            and (
+                _pipeline_has_operation(
+                    metadata.tau_f.dataloader_filters,
+                    "tau",
+                    "lowpass",
+                )
+                or metadata.tau_f.target_filter_cutoff_hz
+            )
         )
         tau_next_target = "tau_follower"
-        if metadata.tau_next.target_filter_enabled:
-            if metadata.tau_next.target_filter_apply_additional_lowpass:
+        if metadata.tau_next is not None and metadata.tau_next.dataloader_filters:
+            operations = _metadata_filter_operations(metadata.tau_next, "tau")
+            if operations:
+                tau_next_target = "checkpoint_causal_filter(tau_follower)"
+        elif metadata.tau_next is not None and metadata.tau_next.target_filter_enabled:
+            moving_average_window = (
+                metadata.tau_next.target_filter_moving_average_window
+            )
+            if (
+                metadata.tau_next.target_filter_apply_additional_lowpass
+                and moving_average_window is not None
+            ):
+                tau_next_target = "target_moving_average_then_lowpass(tau_follower)"
+            elif metadata.tau_next.target_filter_apply_additional_lowpass:
                 tau_next_target = "target_median_then_lowpass(tau_follower)"
+            elif (moving_average_window or 1) > 1:
+                tau_next_target = "target_trailing_moving_average(tau_follower)"
             elif (metadata.tau_next.target_filter_median_window or 1) > 1:
                 tau_next_target = "target_trailing_median(tau_follower)"
-        for raw_name, filtered_name, residual_definition, residual_method, feedback, horizon in (
+        for raw_name, filtered_name, residual_definition, residual_method, feedback, model_metadata in (
             (
                 "tau_ext_cal_raw",
                 "tau_ext_cal",
                 "tau_id_filtered + tau_f_pred - tau_follower",
                 "online_inverse_dynamics_residual",
                 False,
-                metadata.tau_f.horizon,
+                metadata.tau_f,
             ),
             (
                 "tau_ext_pred_raw",
@@ -516,9 +633,24 @@ class EpisodeBuffer:
                 f"tau_next_pred - {tau_next_target}",
                 "online_free_space_torque_residual",
                 True,
-                metadata.tau_next.horizon,
+                metadata.tau_next,
             ),
         ):
+            if model_metadata is None:
+                disabled = {
+                    **common,
+                    "definition": "disabled because checkpoint_path is empty",
+                    "processing_method": "disabled_zero_output",
+                    "lowpass": False,
+                    "zero_phase": False,
+                    "feedback_source": False,
+                    "history_warmup_samples": 0,
+                    "history_warmup_output": "zeros",
+                }
+                attrs[raw_name].update(disabled)
+                attrs[filtered_name].update(disabled)
+                continue
+            horizon = model_metadata.horizon
             attrs[raw_name].update(
                 {
                     **common,
@@ -542,7 +674,10 @@ class EpisodeBuffer:
                         else residual_definition
                     ),
                     "processing_method": (
-                        f"causal_{tau_ext_filter.mode}_then_one_pole_iir"
+                        "causal_hampel_then_butterworth_sos"
+                        if tau_ext_filter.enabled
+                        and tau_ext_filter.mode == "hampel_butterworth"
+                        else f"causal_{tau_ext_filter.mode}_then_one_pole_iir"
                         if tau_ext_filter.enabled
                         else residual_method
                     ),
@@ -575,6 +710,16 @@ class EpisodeBuffer:
                 attrs[filtered_name]["lowpass_cutoff_hz"] = (
                     tau_ext_filter.cutoff_hz
                 )
+                if tau_ext_filter.mode == "hampel_butterworth":
+                    attrs[filtered_name].update(
+                        {
+                            "hampel_window": tau_ext_filter.window,
+                            "hampel_n_sigma": tau_ext_filter.hampel_n_sigma,
+                            "butterworth_order": tau_ext_filter.order,
+                            "filter_sample_rate_hz": tau_ext_filter.sample_rate_hz,
+                            "filter_initialization": "steady_first_real_sample",
+                        }
+                    )
 
     def _append_wrenches(self, data, state_names, attrs, timeline) -> None:
         if "q_follower" not in data:
@@ -640,10 +785,6 @@ class EpisodeBuffer:
             )
 
     def _apply_dynamics_metadata(self, data, state_names, attrs, timeline) -> None:
-        processing = self.config.dynamics_processing
-        q_state = self.config.robot_states["q"]
-        dq_state = self.config.robot_states["velocity"]
-        ddq_state = self.config.robot_states["acceleration"]
         for role in ("leader", "follower"):
             q_name = f"q_{role}"
             dq_name = f"dq_{role}"
@@ -673,8 +814,7 @@ class EpisodeBuffer:
                         "median_window": 1,
                         "derivative_q_mean_window_samples": 1,
                         "derivative_q_mean_window_enabled": False,
-                        "derivative_q_lowpass": q_state.lowpass,
-                        "derivative_q_lowpass_cutoff_hz": q_state.lowpass_cutoff_hz,
+                        "derivative_q_lowpass": False,
                     }
                 )
                 if dq_name in data:
@@ -682,7 +822,7 @@ class EpisodeBuffer:
                         {
                             "derived_from": "motor_state_velocity",
                             "derivative_method": (
-                                "sign_corrected_official_motor_velocity_with_causal_lowpass"
+                                "sign_corrected_official_motor_velocity_unfiltered"
                             ),
                             "timestamp_path": "teleop/timestamp_us",
                             "first_valid_sample_index": 0,
@@ -692,8 +832,7 @@ class EpisodeBuffer:
                                 NERO_V120_MOTOR_VELOCITY_TO_JOINT_SIGN
                             ),
                             "coordinate_frame": "nero_joint_position_coordinates",
-                            "lowpass": dq_state.lowpass,
-                            "lowpass_cutoff_hz": dq_state.lowpass_cutoff_hz,
+                            "lowpass": False,
                             "median_window": 1,
                         }
                     )
@@ -702,14 +841,13 @@ class EpisodeBuffer:
                         {
                             "derived_from_json": json.dumps([dq_name]),
                             "derivative_method": (
-                                "causal_first_derivative_of_sign_corrected_filtered_official_velocity"
+                                "causal_first_derivative_of_sign_corrected_raw_official_velocity"
                             ),
                             "timestamp_path": "teleop/timestamp_us",
                             "first_valid_sample_index": 0,
                             "uses_measured_intervals": True,
                             "formula": "ddq_raw[k]=(dq[k]-dq[k-1])/measured_dt",
-                            "lowpass": ddq_state.lowpass,
-                            "lowpass_cutoff_hz": ddq_state.lowpass_cutoff_hz,
+                            "lowpass": False,
                             "median_window": 1,
                         }
                     )
@@ -720,35 +858,57 @@ class EpisodeBuffer:
             tau_values = np.asarray(data[tau_name], dtype=np.float64)
             if tau_values.ndim != 2 or tau_values.shape[0] != timeline.size:
                 raise RuntimeError(f"Cannot save {tau_name} with shape {tau_values.shape}")
-            torque_config = self.config.robot_states.get("torque", StateParamConfig())
-            if processing.enabled:
-                processing_method = "causal_median_then_one_pole_iir"
-                lowpass_cutoff_hz = processing.torque_lowpass_hz
-                median_window = processing.torque_median_window
-                lowpass = True
-            elif torque_config.lowpass:
-                processing_method = "causal_median_then_one_pole_iir"
-                lowpass_cutoff_hz = torque_config.lowpass_cutoff_hz
-                median_window = torque_config.median_window
-                lowpass = True
-            else:
-                processing_method = "nearest_motor_sample_unfiltered"
-                lowpass_cutoff_hz = None
-                median_window = 1
-                lowpass = False
             state_names[tau_name] = "torque"
             attrs[tau_name].update(
                 {
-                    "processing_method": processing_method,
+                    "processing_method": "nearest_motor_sample_unfiltered",
                     "timestamp_path": "teleop/timestamp_us",
-                    "median_window": median_window,
+                    "median_window": 1,
                     "zero_phase": False,
                     "causal": True,
-                    "lowpass": lowpass,
+                    "lowpass": False,
                 }
             )
-            if lowpass_cutoff_hz is not None:
-                attrs[tau_name]["lowpass_cutoff_hz"] = lowpass_cutoff_hz
+
+
+def _metadata_filter_operations(metadata, key: str) -> list[dict[str, object]]:
+    spec = metadata.dataloader_filters.get(key) or {}
+    if bool(spec.get("enabled", False)):
+        return [dict(operation) for operation in spec.get("operations", ())]
+    operations = []
+    if metadata.target_filter_median_window is not None:
+        operations.append(
+            {"type": "median", "window": metadata.target_filter_median_window}
+        )
+    if metadata.target_filter_cutoff_hz is not None:
+        operations.append(
+            {"type": "lowpass", "cutoff_hz": metadata.target_filter_cutoff_hz}
+        )
+    return operations
+
+
+def _pipeline_has_operation(filters, key: str, operation_type: str) -> bool:
+    spec = filters.get(key) or {}
+    return bool(spec.get("enabled", False)) and any(
+        operation.get("type") == operation_type
+        for operation in spec.get("operations", ())
+    )
+
+
+def _pipeline_window(filters, key: str, operation_type: str, *, fallback: int) -> int:
+    spec = filters.get(key) or {}
+    for operation in spec.get("operations", ()):
+        if operation.get("type") == operation_type:
+            return int(operation["window"])
+    return int(fallback)
+
+
+def _pipeline_cutoff_hz(filters, key: str, *, fallback):
+    spec = filters.get(key) or {}
+    for operation in spec.get("operations", ()):
+        if operation.get("type") == "lowpass":
+            return float(operation["cutoff_hz"])
+    return None if fallback is None else float(fallback)
 
 def _stack(values: list[np.ndarray]) -> np.ndarray:
     if not values:

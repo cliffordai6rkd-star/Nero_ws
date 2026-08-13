@@ -127,10 +127,22 @@ git add third_party/diffusion_policy
 python scripts/setup_can.py
 ```
 
+`can0`/`can1` 的枚举顺序会在重启或重新插拔 USB-CAN 后变化。首次部署时按
+USB-CAN 序列号安装稳定的 `can_master`/`can_slave` 名称：
+
+```bash
+python scripts/install_nero_can_udev.py --check
+python scripts/install_nero_can_udev.py
+```
+
+安装命令会请求一次 `sudo` 密码。安装完成后关闭遥操，重新插拔两个 USB-CAN，
+再用 `ip -brief link show type can` 确认两个稳定接口名均已出现。应用启动时还会
+校验配置中的 `usb_serial`，发现接线或绑定不一致时会拒绝下发机械臂命令。
+
 如果只配置某一个接口：
 
 ```bash
-python scripts/setup_can.py can0
+python scripts/setup_can.py can_master
 ```
 
 配置并检查 can0/can1 是否有 CAN 帧：
@@ -403,6 +415,31 @@ tau_ext_pred    = lowpass(moving_average(tau_ext_pred_raw, 21), 20 Hz)
 
 ## 自由空间自动采集
 
+### 七维关节组合姿态覆盖规划器
+
+[configs/joint_pose_coverage.yaml](/home/rei/mnt/code/lcx/nero_ws/configs/joint_pose_coverage.yaml)
+用于补充 `tau_free` 的多关节组合姿态覆盖。规划器在 URDF 软限位内生成七维低差异候选点，通过
+MuJoCo 剔除工作空间越界和碰撞姿态，再从一条已有安全姿态开始构建可连通的安全树。选点使用归一化
+七维关节距离，而不是只按末端 XYZ 体素，因此会保留更多不同的关节耦合构型。
+
+当前配置为严格 50 Hz、20 分钟、160 个连接姿态。安全树边使用 minimum-jerk 低到中速运动，峰值约
+`0.62 rad/s`；每条树边到达后保持 0.5 秒，因此同一数据集同时包含动态过渡和静态姿态样本。
+
+```bash
+python scripts/free_space.py \
+  --config configs/joint_pose_coverage.yaml \
+  simulate --reuse-existing --playback-speed 100
+```
+
+当前生成轨迹为 60,000 帧，完整 MuJoCo 预检结果为工作空间越界 0、自碰撞 0、异常环境接触 0。
+配置仍保持 `hardware.approved: false`；目视确认预览和真实工作区后才能改为 `true` 并执行：
+
+```bash
+python scripts/free_space.py \
+  --config configs/joint_pose_coverage.yaml \
+  collect
+```
+
 ### Tau refinement 三段规划器
 
 [configs/tau_refinement_coverage.yaml](/home/rei/mnt/code/lcx/nero_ws/configs/tau_refinement_coverage.yaml)
@@ -455,11 +492,10 @@ episode。保存和显式垃圾回收的暂停不会计入后续 100 Hz deadline
 每个分片都会重置在线滤波器和 GRU/LSTM 状态，并在 `episode_metadata_json` 中记录分片序号及其对应的
 全局轨迹索引范围。分片保存后会先等待异步状态对齐器重新产出完整有限状态，再恢复 100 Hz 调度；
 短暂缺帧不会直接终止轨迹，超过 `hardware.max_timestamp_gap_s` 仍会触发安全停止。
+轨迹包含：
 
-30 分钟轨迹包含：
-
-- 1368 秒：保留实测路径的时序和连通性，以最高约 `0.20 rad/s` 低速重定时遍历。
-- 432 秒：在 XYZ 体素中选取 96 个广泛分布的实测姿态，低速连接并分别停留 1 秒。
+- 60%：保留实测路径的时序和连通性，以最高约 `0.20 rad/s` 低速重定时遍历。
+- 40%：在 XYZ 体素中选取 96 个广泛分布的实测姿态，低速连接并分别停留 1 秒。
 
 参考 H5 识别出的末端范围为 X `[-0.502, -0.055] m`、Y `[-0.314, 0.375] m`、
 Z `[0.137, 0.504] m`，凸包体积约 `0.06068 m³`。规划器会校验参考 H5 的所有姿态均满足 URDF
@@ -629,7 +665,7 @@ python -m pip install --upgrade "git+https://github.com/agilexrobotics/pyAgxArm.
 
 - 根属性：常规双边数采使用 `format=factr_multimodal_episode/v9`，并包含 `saved_at_us`
 - `/config_yaml`: 本次采集配置原文
-- `/teleop/timestamp_us`: 延迟后的固定主时间线；重复目标时刻不重复写入
+- `/teleop/timestamp_us`: 延迟后的固定主时间线；硬件进程会补齐尚未发布的 10 ms 网格，控制线程 drain ring backlog 后逐帧写入，重复目标时刻不重复写入
 - `/teleop/q_follower`、`q_cmd`：从臂实测关节角和实际发送给从臂的关节命令
 - `/teleop/q_leader`、`dq_leader`、`ddq_leader`：软件逻辑主臂状态
 - `/teleop/dq_follower`：V120 `motor_state_*` 官方 velocity 转换到 q/URDF 关节坐标系并按主时间线对齐后的七维速度；转换符号为 `[-1,-1,-1,-1,-1,+1,-1]`
@@ -658,7 +694,7 @@ ddq_raw[k]    = (dq[k] - dq[k-1]) / dt_motor
 ddq[k]        = lowpass(ddq_raw[k])
 ```
 
-第一帧用当前 q、已转换到关节坐标系的官方 velocity 和零加速度初始化。之后每个 motor CAN 帧先低通 velocity，再按相邻 motor 帧的真实时间差计算普通状态字段 `ddq_follower`；它保留作观测诊断，不参与外力矩 RNEA。外力矩链路使用独立的 `ddq_kf_causal`。主时间线使用 `now - state_alignment_delay_s`，从 q 组历史和七个 motor 历史选择最近样本；力矩和电流来自相同 motor 样本。同一主时间格的快照、双模型窗口和 Kalman 只推进一次。实时数采和推理不进行需要未来样本的插值；超过配置上限的 CAN 间隔由 watchdog 拒绝。
+第一帧用当前 q、已转换到关节坐标系的官方 velocity 和零加速度初始化。之后每个 motor CAN 帧先低通 velocity，再按相邻 motor 帧的真实时间差计算普通状态字段 `ddq_follower`；它保留作观测诊断，不参与外力矩 RNEA。外力矩链路使用独立的 `ddq_kf_causal`。主时间线使用 `now - state_alignment_delay_s`，从 q 组历史和七个 motor 历史选择最近样本；力矩和电流来自相同 motor 样本。采样线程若短暂错过调度，会从 CAN 历史补齐全部尚未发布的固定网格；控制线程按主从臂共同时间戳消费所有 ring 帧。积压帧的 `q_cmd` 保持上一次已发送命令，最新帧才使用本轮新目标，与离线 `previous/ZOH` 契约一致。同一主时间格的快照、双模型窗口和 Kalman 只推进一次。实时数采和推理不进行需要未来样本的插值；ring 覆盖、非 10 ms 时间轴缺口或超过配置上限的 CAN 间隔均会 fail-closed。
 
 H5 额外保存 `control_timestamp_us`、`state_acquired_timestamp_follower_us`、`q_source_timestamp_follower_us`、`motor_source_timestamp_follower_us` 和 `state_source_skew_follower_us`。`teleop` 属性中的 `input_frame_count` 与 `duplicate_input_frame_count` 用于核对控制循环重复读取；PINN 特征映射未声明这些字段时不会把它们作为训练输入。
 

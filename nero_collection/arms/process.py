@@ -218,21 +218,17 @@ class IsolatedArmProcess:
     def read_control_role(self, refresh: bool = False) -> str | None:
         return self._rpc("read_control_role", bool(refresh))
 
-    def configure_state_alignment(
+    def configure_state_capture(
         self,
-        delay_s: float,
-        output_rate_hz: float,
-        q_mean_window_samples: int,
+        maximum_source_skew_s: float,
         q_lowpass_cutoff_hz: float | None,
         dq_lowpass_cutoff_hz: float | None,
         ddq_lowpass_cutoff_hz: float | None,
         maximum_input_gap_s: float = 0.03,
     ) -> None:
         self._state_reset_rpc(
-            "configure_state_alignment",
-            delay_s,
-            output_rate_hz,
-            q_mean_window_samples,
+            "configure_state_capture",
+            maximum_source_skew_s,
             q_lowpass_cutoff_hz,
             dq_lowpass_cutoff_hz,
             ddq_lowpass_cutoff_hz,
@@ -343,18 +339,38 @@ class IsolatedArmProcess:
                 raise RuntimeError(
                     f"hardware command queue is full arm={self.name} method={method}"
                 ) from exc
-            try:
-                response = self._responses.get(timeout=float(timeout_s))
-            except queue.Empty as exc:
-                raise RuntimeError(
-                    f"hardware command timed out arm={self.name} method={method} "
-                    f"timeout={timeout_s:.1f}s"
-                ) from exc
-            if response[0] != request_id:
-                raise RuntimeError(
-                    f"hardware response order mismatch arm={self.name}: "
-                    f"expected={request_id} got={response[0]}"
-                )
+            deadline = time.monotonic() + float(timeout_s)
+            while True:
+                remaining_s = deadline - time.monotonic()
+                if remaining_s <= 0.0:
+                    raise RuntimeError(
+                        f"hardware command timed out arm={self.name} method={method} "
+                        f"timeout={timeout_s:.1f}s"
+                    )
+                try:
+                    response = self._responses.get(timeout=remaining_s)
+                except queue.Empty as exc:
+                    raise RuntimeError(
+                        f"hardware command timed out arm={self.name} method={method} "
+                        f"timeout={timeout_s:.1f}s"
+                    ) from exc
+                response_id = int(response[0])
+                if response_id < request_id:
+                    log.warning(
+                        "discarding stale hardware response arm=%s method=%s "
+                        "expected=%d got=%d",
+                        self.name,
+                        method,
+                        request_id,
+                        response_id,
+                    )
+                    continue
+                if response_id > request_id:
+                    raise RuntimeError(
+                        f"hardware response order mismatch arm={self.name}: "
+                        f"expected={request_id} got={response_id}"
+                    )
+                break
             if not response[1]:
                 raise RuntimeError(
                     f"hardware command failed arm={self.name} method={method}: "
@@ -459,7 +475,7 @@ def _arm_process_worker(
                     "set_leader_mode",
                     "set_follower_mode",
                     "set_normal_mode",
-                    "configure_state_alignment",
+                    "configure_state_capture",
                     "configure_joint_impedance_mode",
                 }:
                     stop_publisher()
@@ -470,7 +486,7 @@ def _arm_process_worker(
                     "set_leader_mode",
                     "set_follower_mode",
                     "set_normal_mode",
-                    "configure_state_alignment",
+                    "configure_state_capture",
                     "configure_joint_impedance_mode",
                 }:
                     start_publisher()
@@ -505,11 +521,17 @@ def _state_publisher_loop(
     last_timestamp_us = 0
     try:
         while not stop_event.is_set():
-            state = arm.read_state()
-            timestamp_us = int(state.q_timestamp_us or state.timestamp_us)
-            if timestamp_us > last_timestamp_us and _publishable_arm_state(state):
-                state_ring.append(state)
-                last_timestamp_us = timestamp_us
+            read_pending = getattr(arm, "read_pending_states", None)
+            states = (
+                tuple(read_pending())
+                if callable(read_pending)
+                else (arm.read_state(),)
+            )
+            for state in states:
+                timestamp_us = int(state.q_timestamp_us or state.timestamp_us)
+                if timestamp_us > last_timestamp_us and _publishable_arm_state(state):
+                    state_ring.append(state)
+                    last_timestamp_us = timestamp_us
             stop_event.wait(_STATE_PUBLISH_POLL_S)
     except BaseException as exc:
         _put_latest(faults, (str(exc), traceback.format_exc()))

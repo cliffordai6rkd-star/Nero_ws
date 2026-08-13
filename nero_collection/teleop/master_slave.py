@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 
 import numpy as np
@@ -38,6 +39,23 @@ class ArmPairRuntime:
     controller: BilateralJointController
 
 
+@dataclass(frozen=True)
+class TeleopFrame:
+    timestamp_us: int
+    values: dict[str, tuple[str, np.ndarray]]
+
+
+@dataclass(frozen=True)
+class _GripperIoResult:
+    leader_state: object | None
+    follower_state: object | None
+    command_value: float
+    command_sent: bool
+    state_elapsed_s: float
+    command_elapsed_s: float
+    completed_t: float
+
+
 class MasterSlaveTeleop:
     def __init__(self, config: CollectionConfig) -> None:
         self.config = config
@@ -56,7 +74,14 @@ class MasterSlaveTeleop:
             )
             for pair in config.teleop.master_slave
         )
-        if config.tau_ext_inference.enabled and len(self.pairs) != 1:
+        inference_enabled = config.tau_ext_inference.enabled and any(
+            branch.checkpoint_path is not None
+            for branch in (
+                config.tau_ext_inference.tau_f,
+                config.tau_ext_inference.tau_next,
+            )
+        )
+        if inference_enabled and len(self.pairs) != 1:
             raise RuntimeError(
                 "tau_ext inference currently requires exactly one arm pair"
             )
@@ -67,7 +92,7 @@ class MasterSlaveTeleop:
                 config.dynamics_processing,
                 config.robot_states,
             )
-            if config.tau_ext_inference.enabled
+            if inference_enabled
             else None
         )
         self.arm_names = tuple(pair.name for pair in self.pairs)
@@ -77,6 +102,12 @@ class MasterSlaveTeleop:
         self._unrecorded_teleop = False
         self._bilateral_active = False
         self._last_bilateral_step_t: float | None = None
+        self._last_bilateral_step_timeout_s = (
+            config.teleop.command.control_watchdog_timeout_s
+        )
+        self._current_bilateral_step_timeout_s = (
+            config.teleop.command.control_watchdog_timeout_s
+        )
         self._last_gripper_command: dict[str, float] = {}
         self._last_gripper_command_mode: dict[str, str] = {}
         self._last_gripper_command_t: dict[str, float] = {}
@@ -85,24 +116,39 @@ class MasterSlaveTeleop:
         self._leader_gripper_feedback_timestamp_us: dict[str, int] = {}
         self._leader_gripper_feedback_change_t: dict[str, float] = {}
         self._leader_gripper_stale_warned: set[str] = set()
+        self._last_gripper_sample_t: dict[str, float] = {}
+        self._cached_leader_gripper_state: dict[str, object] = {}
+        self._cached_follower_gripper_state: dict[str, object] = {}
+        self._cached_gripper_command_value: dict[str, float] = {}
+        self._gripper_futures: dict[str, object] = {}
+        self._gripper_executor = ThreadPoolExecutor(
+            max_workers=max(1, len(self.pairs)),
+            thread_name_prefix="nero-gripper-io",
+        )
+        self._state_pending: dict[str, dict[str, dict[int, ArmState]]] = {}
+        self._last_synchronized_states: dict[
+            str,
+            tuple[ArmState, ArmState],
+        ] = {}
+        self._last_synchronized_timestamp_us: dict[str, int] = {}
+        self._last_sent_q_cmd: dict[str, np.ndarray] = {}
+        self._command_executor = ThreadPoolExecutor(
+            max_workers=max(2, 2 * len(self.pairs)),
+            thread_name_prefix="nero-arm-command",
+        )
 
     def start(self) -> None:
         log.info("starting Nero master-slave arms over CAN")
-        q_state = self.config.robot_states["q"]
-        dq_state = self.config.robot_states["velocity"]
-        ddq_state = self.config.robot_states["acceleration"]
         for pair in self.pairs:
             log.info("starting pair=%s leader=%s follower=%s", pair.name, pair.leader.name, pair.follower.name)
             pair.leader.connect()
             pair.follower.connect()
             for arm in (pair.leader, pair.follower):
-                arm.configure_state_alignment(
-                    self.config.teleop.command.state_alignment_delay_s,
-                    self.config.teleop.command.sample_rate_hz,
-                    q_state.mean_window,
-                    q_state.lowpass_cutoff_hz if q_state.lowpass else None,
-                    dq_state.lowpass_cutoff_hz if dq_state.lowpass else None,
-                    ddq_state.lowpass_cutoff_hz if ddq_state.lowpass else None,
+                arm.configure_state_capture(
+                    self.config.teleop.command.maximum_state_source_skew_s,
+                    None,
+                    None,
+                    None,
                     self.config.teleop.command.maximum_can_frame_gap_s,
                 )
             pair.leader.validate_joint_impedance_support()
@@ -119,6 +165,14 @@ class MasterSlaveTeleop:
             self._set_parked_state()
 
     def shutdown(self) -> None:
+        gripper_executor = getattr(self, "_gripper_executor", None)
+        if gripper_executor is not None:
+            gripper_executor.shutdown(wait=True, cancel_futures=False)
+            self._gripper_executor = None
+        executor = getattr(self, "_command_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=False)
+            self._command_executor = None
         for pair in self.pairs:
             for arm in (pair.leader, pair.follower):
                 try:
@@ -175,10 +229,13 @@ class MasterSlaveTeleop:
             self._unrecorded_teleop = False
             return
         log.info("entering software bilateral MIT teleoperation")
+        self._ensure_sampling_runtime()
         for pair in self.pairs:
             self._prepare_pair_for_teleop(pair)
-            leader_state = pair.leader.read_state()
-            follower_state = pair.follower.read_state()
+            leader_state, follower_state = self._wait_for_synchronized_pair_state(
+                pair,
+                self.config.teleop.command.input_ready_timeout_s,
+            )
             pair.controller.activate(leader_state, follower_state)
             self._teleop_reference[pair.name] = (
                 leader_state.q.copy(),
@@ -195,6 +252,8 @@ class MasterSlaveTeleop:
                 ),
             )
             self._send_bilateral_commands(pair, initial, follower_state.q)
+            self._last_sent_q_cmd[pair.name] = follower_state.q.copy()
+            self._reset_pair_state_tracking(pair, leader_state, follower_state)
             log.info(
                 "software bilateral reference initialized pair=%s leader_q=%s follower_q=%s",
                 pair.name,
@@ -206,6 +265,9 @@ class MasterSlaveTeleop:
         self._unrecorded_teleop = False
         self._bilateral_active = True
         self._last_bilateral_step_t = time.monotonic()
+        self._last_bilateral_step_timeout_s = (
+            self.config.teleop.command.control_watchdog_timeout_s
+        )
 
     def enter_unrecorded_teleop(self) -> None:
         if self._unrecorded_teleop:
@@ -331,18 +393,66 @@ class MasterSlaveTeleop:
                 self._wait_for_arm_role(pair.name, arm, "follower")
 
     def teleop_step(self) -> tuple[int, dict[str, tuple[str, np.ndarray]]]:
+        frames = self.teleop_frames()
+        if not frames:
+            raise RuntimeError("bilateral control produced no synchronized state frame")
+        latest = frames[-1]
+        return latest.timestamp_us, latest.values
+
+    def teleop_frames(self) -> tuple[TeleopFrame, ...]:
         if not self._bilateral_active:
             raise RuntimeError("Software bilateral teleoperation is not active")
-        timestamp_us, values = self._bilateral_step(build_values=True)
-        self._update_gripper_teleop(values)
-        return timestamp_us, values
+        frames = self._bilateral_step_frames(build_values=True)
+        if not frames:
+            return ()
+        self._update_gripper_teleop(frames[-1].values)
+        gripper_values = {
+            name: value
+            for name, value in frames[-1].values.items()
+            if name in {"gripper_follower", "gripper_cmd"}
+        }
+        if gripper_values:
+            for frame in frames[:-1]:
+                frame.values.update(
+                    {
+                        name: (state_name, np.asarray(value).copy())
+                        for name, (state_name, value) in gripper_values.items()
+                    }
+                )
+        self._check_bilateral_step_deadline(
+            getattr(self, "_current_bilateral_step_t", time.monotonic()),
+            "bilateral step completion",
+        )
+        return frames
 
     def _bilateral_step(
         self,
         *,
         build_values: bool,
     ) -> tuple[int, dict[str, tuple[str, np.ndarray]]]:
+        frames = self._bilateral_step_frames(build_values=build_values)
+        if not frames:
+            return 0, {}
+        latest = frames[-1]
+        return latest.timestamp_us, latest.values
+
+    def _bilateral_step_frames(
+        self,
+        *,
+        build_values: bool,
+    ) -> tuple[TeleopFrame, ...]:
         step_started_t = self._begin_bilateral_step()
+        self._current_bilateral_step_t = step_started_t
+        if len(self.pairs) == 1:
+            return self._single_pair_bilateral_frames(
+                self.pairs[0],
+                step_started_t=step_started_t,
+                build_values=build_values,
+            )
+
+        # Multi-pair collection has no learned tau_ext path. Preserve one
+        # synchronized control record per loop until a cross-pair batch join is
+        # explicitly required.
         leader_states: list[ArmState] = []
         follower_states: list[ArmState] = []
         q_cmds: list[np.ndarray] = []
@@ -385,6 +495,7 @@ class MasterSlaveTeleop:
             )
             self._check_bilateral_step_deadline(step_started_t, "bilateral compute")
             self._send_bilateral_commands(pair, result, q_cmd)
+            self._last_sent_q_cmd[pair.name] = q_cmd.copy()
             leader_states.append(leader_state)
             follower_states.append(follower_state)
             q_cmds.append(q_cmd)
@@ -403,23 +514,359 @@ class MasterSlaveTeleop:
             if build_values
             else {}
         )
-        return timestamp_us, values
+        self._check_bilateral_step_deadline(step_started_t, "MIT command send")
+        return (TeleopFrame(timestamp_us=timestamp_us, values=values),)
+
+    def _single_pair_bilateral_frames(
+        self,
+        pair: ArmPairRuntime,
+        *,
+        step_started_t: float,
+        build_values: bool,
+    ) -> tuple[TeleopFrame, ...]:
+        self._ensure_sampling_runtime()
+        synchronized = self._drain_synchronized_pair_states(pair)
+        self._check_bilateral_step_deadline(step_started_t, "aligned state drain")
+        if not synchronized:
+            return ()
+        current_leader, current_follower = synchronized[-1]
+
+        current_q_cmd = _limit_joint_step(
+            pair.controller.follower_target(current_leader, current_follower),
+            current_follower.q,
+            self.config.teleop.command.joint_step_limit_rad,
+        )
+        previous_q_cmd = getattr(self, "_last_sent_q_cmd", {}).get(pair.name)
+        if previous_q_cmd is None:
+            previous_q_cmd = current_follower.q.copy()
+
+        inference_records: list[
+            tuple[ArmState, ArmState, np.ndarray, OnlineTauExtResult | None]
+        ] = []
+        online_tau_ext = getattr(self, "online_tau_ext", None)
+        for index, (leader_state, follower_state) in enumerate(synchronized):
+            is_latest = index == len(synchronized) - 1
+            q_cmd = current_q_cmd if is_latest else previous_q_cmd
+            inference_result = None
+            if online_tau_ext is not None:
+                inference_result = online_tau_ext.estimate_aligned(
+                    follower_state.timestamp_us,
+                    follower_state.q,
+                    follower_state.dq,
+                    follower_state.torque,
+                    q_cmd,
+                )
+            inference_records.append(
+                (leader_state, follower_state, q_cmd.copy(), inference_result)
+            )
+        self._check_bilateral_step_deadline(step_started_t, "tau model inference")
+
+        latest_inference = inference_records[-1][3]
+        control_timestamp_us = time.monotonic_ns() // 1000
+        result = pair.controller.compute(
+            current_leader,
+            current_follower,
+            timestamp_us=control_timestamp_us,
+            **(
+                {
+                    "tau_ext_override": (
+                        latest_inference.tau_ext_pred
+                        if latest_inference is not None
+                        and latest_inference.history_ready
+                        else np.zeros(7, dtype=np.float64)
+                    )
+                }
+                if online_tau_ext is not None
+                else {}
+            ),
+        )
+        self._check_bilateral_step_deadline(step_started_t, "bilateral compute")
+        self._send_bilateral_commands(pair, result, current_q_cmd)
+        self._last_sent_q_cmd[pair.name] = current_q_cmd.copy()
+        self._check_bilateral_step_deadline(step_started_t, "MIT command send")
+
+        frames = []
+        for index, (leader_state, follower_state, q_cmd, inference_result) in enumerate(
+            inference_records
+        ):
+            values = (
+                self._build_teleop_values(
+                    [leader_state],
+                    [follower_state],
+                    [q_cmd],
+                    [inference_result] if inference_result is not None else [],
+                    control_timestamp_us if index == len(inference_records) - 1 else 0,
+                )
+                if build_values
+                else {}
+            )
+            frames.append(
+                TeleopFrame(
+                    timestamp_us=int(follower_state.timestamp_us),
+                    values=values,
+                )
+            )
+        return tuple(frames)
+
+    def _ensure_sampling_runtime(self) -> None:
+        if not hasattr(self, "_state_pending"):
+            self._state_pending = {}
+        if not hasattr(self, "_last_synchronized_states"):
+            self._last_synchronized_states = {}
+        if not hasattr(self, "_last_synchronized_timestamp_us"):
+            self._last_synchronized_timestamp_us = {}
+        if not hasattr(self, "_last_sent_q_cmd"):
+            self._last_sent_q_cmd = {}
+        if not hasattr(self, "_command_executor") or self._command_executor is None:
+            self._command_executor = ThreadPoolExecutor(
+                max_workers=max(2, 2 * len(self.pairs)),
+                thread_name_prefix="nero-arm-command",
+            )
+
+    def _reset_pair_state_tracking(
+        self,
+        pair: ArmPairRuntime,
+        leader_state: ArmState,
+        follower_state: ArmState,
+    ) -> None:
+        self._clear_pair_state_tracking(pair)
+        self._last_synchronized_states[pair.name] = (leader_state, follower_state)
+        leader_timestamp_us = _arm_state_timestamp_us(leader_state)
+        follower_timestamp_us = _arm_state_timestamp_us(follower_state)
+        maximum_pair_skew_us = int(
+            round(self.config.teleop.command.maximum_arm_pair_skew_s * 1e6)
+        )
+        if (
+            leader_timestamp_us > 0
+            and follower_timestamp_us > 0
+            and abs(leader_timestamp_us - follower_timestamp_us)
+            <= maximum_pair_skew_us
+        ):
+            self._last_synchronized_timestamp_us[pair.name] = follower_timestamp_us
+
+    def _clear_pair_state_tracking(self, pair: ArmPairRuntime) -> None:
+        self._ensure_sampling_runtime()
+        self._state_pending[pair.name] = {"leader": {}, "follower": {}}
+        self._last_synchronized_states.pop(pair.name, None)
+        self._last_synchronized_timestamp_us.pop(pair.name, None)
+
+    def _wait_for_synchronized_pair_state(
+        self,
+        pair: ArmPairRuntime,
+        timeout_s: float,
+    ) -> tuple[ArmState, ArmState]:
+        self._clear_pair_state_tracking(pair)
+        deadline = time.monotonic() + timeout_s
+        last_pair: tuple[ArmState, ArmState] | None = None
+        ring_synchronized = all(
+            callable(getattr(arm, "drain_states", None))
+            for arm in (pair.leader, pair.follower)
+        )
+        while time.monotonic() < deadline:
+            synchronized = self._drain_synchronized_pair_states(pair)
+            if synchronized:
+                last_pair = synchronized[-1]
+                leader_state, follower_state = last_pair
+                leader_timestamp_us = _arm_state_timestamp_us(leader_state)
+                follower_timestamp_us = _arm_state_timestamp_us(follower_state)
+                timestamps_valid = (
+                    not ring_synchronized
+                    or (
+                        leader_timestamp_us > 0
+                        and follower_timestamp_us > 0
+                        and abs(leader_timestamp_us - follower_timestamp_us)
+                        <= int(
+                            round(
+                                self.config.teleop.command.maximum_arm_pair_skew_s
+                                * 1e6
+                            )
+                        )
+                    )
+                )
+                if (
+                    timestamps_valid
+                    and _is_complete_arm_state(leader_state)
+                    and _is_complete_arm_state(follower_state)
+                ):
+                    log.info(
+                        "aligned arm states ready pair=%s timestamp_us=%d",
+                        pair.name,
+                        follower_timestamp_us,
+                    )
+                    return leader_state, follower_state
+            time.sleep(0.002)
+
+        if last_pair is not None:
+            last_leader, last_follower = last_pair
+        else:
+            pending = self._state_pending.get(pair.name, {})
+            last_leader = _latest_timestamped_state(pending.get("leader", {}))
+            last_follower = _latest_timestamped_state(pending.get("follower", {}))
+        details = (
+            f"leader={_arm_state_readiness(last_leader)} "
+            f"follower={_arm_state_readiness(last_follower)}"
+        )
+        raise RuntimeError(
+            "Timed out waiting for synchronized collection-aligned arm states "
+            f"after MIT mode reset pair={pair.name} timeout={timeout_s:.1f}s; "
+            f"{details}"
+        )
+
+    def _drain_synchronized_pair_states(
+        self,
+        pair: ArmPairRuntime,
+    ) -> tuple[tuple[ArmState, ArmState], ...]:
+        self._ensure_sampling_runtime()
+        leader_drain = getattr(pair.leader, "drain_states", None)
+        follower_drain = getattr(pair.follower, "drain_states", None)
+        if not callable(leader_drain) or not callable(follower_drain):
+            leader_state = pair.leader.read_state()
+            follower_state = pair.follower.read_state()
+            self._last_synchronized_states[pair.name] = (
+                leader_state,
+                follower_state,
+            )
+            return ((leader_state, follower_state),)
+
+        pending = self._state_pending.setdefault(
+            pair.name,
+            {"leader": {}, "follower": {}},
+        )
+        for role, drain in (("leader", leader_drain), ("follower", follower_drain)):
+            result = drain()
+            dropped = int(getattr(result, "dropped", 0))
+            if dropped > 0:
+                raise TeleopSafetyError(
+                    f"aligned {role} state ring overrun pair={pair.name}: "
+                    f"dropped={dropped}"
+                )
+            for state in tuple(getattr(result, "states", ())):
+                timestamp_us = _arm_state_timestamp_us(state)
+                if timestamp_us > 0:
+                    pending[role][timestamp_us] = state
+
+        previous_timestamp_us = self._last_synchronized_timestamp_us.get(pair.name)
+        synchronized = []
+        maximum_pair_skew_us = int(
+            round(self.config.teleop.command.maximum_arm_pair_skew_s * 1e6)
+        )
+        while pending["leader"] and pending["follower"]:
+            leader_times = sorted(pending["leader"])
+            follower_times = sorted(pending["follower"])
+            leader_timestamp_us, follower_timestamp_us = min(
+                (
+                    (leader_time, follower_time)
+                    for leader_time in leader_times
+                    for follower_time in follower_times
+                    if abs(leader_time - follower_time) <= maximum_pair_skew_us
+                ),
+                key=lambda pair_times: (
+                    abs(pair_times[0] - pair_times[1]),
+                    max(pair_times),
+                ),
+                default=(0, 0),
+            )
+            if leader_timestamp_us == 0:
+                leader_oldest_us = leader_times[0]
+                follower_oldest_us = follower_times[0]
+                if leader_oldest_us < follower_oldest_us:
+                    dropped_role = "leader"
+                    dropped_timestamp_us = leader_oldest_us
+                else:
+                    dropped_role = "follower"
+                    dropped_timestamp_us = follower_oldest_us
+                pending[dropped_role].pop(dropped_timestamp_us)
+                log.warning(
+                    "discarded unpaired arm state pair=%s role=%s timestamp_us=%d "
+                    "leader_oldest_us=%d follower_oldest_us=%d limit=%.3fms",
+                    pair.name,
+                    dropped_role,
+                    dropped_timestamp_us,
+                    leader_oldest_us,
+                    follower_oldest_us,
+                    maximum_pair_skew_us * 1e-3,
+                )
+                continue
+            for timestamp_us in leader_times:
+                if timestamp_us >= leader_timestamp_us:
+                    break
+                pending["leader"].pop(timestamp_us)
+            for timestamp_us in follower_times:
+                if timestamp_us >= follower_timestamp_us:
+                    break
+                pending["follower"].pop(timestamp_us)
+            if previous_timestamp_us is None or follower_timestamp_us > previous_timestamp_us:
+                synchronized.append(
+                    (
+                        pending["leader"][leader_timestamp_us],
+                        pending["follower"][follower_timestamp_us],
+                    )
+                )
+                previous_timestamp_us = follower_timestamp_us
+            pending["leader"].pop(leader_timestamp_us)
+            pending["follower"].pop(follower_timestamp_us)
+
+        if not synchronized:
+            if max(len(pending["leader"]), len(pending["follower"])) > 256:
+                raise TeleopSafetyError(
+                    f"aligned state streams cannot be synchronized pair={pair.name}: "
+                    f"leader_pending={len(pending['leader'])} "
+                    f"follower_pending={len(pending['follower'])}"
+                )
+            if previous_timestamp_us is not None:
+                maximum_age_s = (
+                    self.config.teleop.command.maximum_can_frame_gap_s
+                    + self.config.teleop.command.maximum_arm_pair_skew_s
+                )
+                state_age_s = (now_us() - previous_timestamp_us) * 1.0e-6
+                if state_age_s > maximum_age_s:
+                    raise TeleopSafetyError(
+                        "aligned hardware state stream is stale: "
+                        f"pair={pair.name} age={state_age_s:.6f}s "
+                        f"limit={maximum_age_s:.6f}s "
+                        f"leader_pending={len(pending['leader'])} "
+                        f"follower_pending={len(pending['follower'])}"
+                    )
+            return ()
+
+        self._state_pending[pair.name] = pending
+        self._last_synchronized_states[pair.name] = synchronized[-1]
+        self._last_synchronized_timestamp_us[pair.name] = synchronized[-1][1].timestamp_us
+        if len(synchronized) > 1:
+            log.info(
+                "consumed aligned state backlog pair=%s frames=%d span=%.3fms",
+                pair.name,
+                len(synchronized),
+                (synchronized[-1][1].timestamp_us - synchronized[0][1].timestamp_us) * 1.0e-3,
+            )
+        return tuple(synchronized)
 
     def _begin_bilateral_step(self) -> float:
         now = time.monotonic()
         previous = getattr(self, "_last_bilateral_step_t", None)
-        timeout_s = self.config.teleop.command.control_watchdog_timeout_s
+        base_timeout_s = self.config.teleop.command.control_watchdog_timeout_s
+        timeout_s = getattr(
+            self,
+            "_last_bilateral_step_timeout_s",
+            base_timeout_s,
+        )
         if previous is not None and now - previous > timeout_s:
             raise TeleopSafetyError(
                 f"bilateral control watchdog exceeded: dt={now - previous:.6f}s "
                 f"limit={timeout_s:.6f}s"
             )
         self._last_bilateral_step_t = now
+        self._last_bilateral_step_timeout_s = base_timeout_s
+        self._current_bilateral_step_timeout_s = base_timeout_s
         return now
 
     def _check_bilateral_step_deadline(self, step_started_t: float, stage: str) -> None:
         elapsed_s = time.monotonic() - step_started_t
-        timeout_s = self.config.teleop.command.control_watchdog_timeout_s
+        timeout_s = getattr(
+            self,
+            "_current_bilateral_step_timeout_s",
+            self.config.teleop.command.control_watchdog_timeout_s,
+        )
         if elapsed_s > timeout_s:
             raise TeleopSafetyError(
                 f"bilateral control step stalled during {stage}: elapsed={elapsed_s:.6f}s "
@@ -432,18 +879,87 @@ class MasterSlaveTeleop:
         result: BilateralControlResult,
         follower_q: np.ndarray,
     ) -> None:
-        MasterSlaveTeleop._send_mit(pair.leader, result.leader)
+        self._ensure_sampling_runtime()
+        commands = [
+            (
+                "leader",
+                pair.leader,
+                lambda: MasterSlaveTeleop._send_mit(pair.leader, result.leader),
+            )
+        ]
         if self.config.teleop.command.control_mode == "position":
-            pair.follower.command_joint_positions(np.asarray(follower_q, dtype=np.float64))
-            return
-        follower_command = JointMitCommand(
-            q=np.asarray(follower_q, dtype=np.float64),
-            v_des=result.follower.v_des,
-            kp=result.follower.kp,
-            kd=result.follower.kd,
-            t_ff=result.follower.t_ff,
+            commands.append(
+                (
+                    "follower",
+                    pair.follower,
+                    lambda: pair.follower.command_joint_positions(
+                        np.asarray(follower_q, dtype=np.float64)
+                    ),
+                )
+            )
+        else:
+            follower_command = JointMitCommand(
+                q=np.asarray(follower_q, dtype=np.float64),
+                v_des=result.follower.v_des,
+                kp=result.follower.kp,
+                kd=result.follower.kd,
+                t_ff=result.follower.t_ff,
+            )
+            commands.append(
+                (
+                    "follower",
+                    pair.follower,
+                    lambda: MasterSlaveTeleop._send_mit(
+                        pair.follower,
+                        follower_command,
+                    ),
+                )
+            )
+
+        futures = {
+            self._command_executor.submit(_timed_hardware_call, command): (
+                role,
+                arm,
+            )
+            for role, arm, command in commands
+        }
+        _, pending = wait(
+            futures,
+            timeout=self.config.teleop.command.control_watchdog_timeout_s,
         )
-        MasterSlaveTeleop._send_mit(pair.follower, follower_command)
+        if pending:
+            stalled = ", ".join(
+                f"{role}:{arm.name}" for future, (role, arm) in futures.items()
+                if future in pending
+            )
+            for future in pending:
+                future.cancel()
+            raise TeleopSafetyError(
+                "MIT hardware command timed out "
+                f"pair={pair.name} pending={stalled} "
+                "limit="
+                f"{self.config.teleop.command.control_watchdog_timeout_s:.6f}s"
+            )
+        failures = []
+        for future, (role, arm) in futures.items():
+            try:
+                elapsed_s = future.result()
+                if elapsed_s > 0.005:
+                    log.warning(
+                        "slow MIT hardware command pair=%s role=%s arm=%s elapsed=%.3fms",
+                        pair.name,
+                        role,
+                        arm.name,
+                        elapsed_s * 1.0e3,
+                    )
+            except Exception as exc:
+                failures.append((role, arm.name, exc))
+        if failures:
+            role, arm_name, exc = failures[0]
+            raise RuntimeError(
+                f"bilateral hardware command failed pair={pair.name} "
+                f"role={role} arm={arm_name}: {exc}"
+            ) from exc
 
     @staticmethod
     def _send_mit(arm: ArmInterface, command: JointMitCommand) -> None:
@@ -476,19 +992,14 @@ class MasterSlaveTeleop:
         self._unrecorded_teleop = False
         self._last_bilateral_step_t = None
         log.critical("emergency reset requested after collection safety fault")
-        q_state = self.config.robot_states["q"]
-        dq_state = self.config.robot_states["velocity"]
-        ddq_state = self.config.robot_states["acceleration"]
         for pair in self.pairs:
             for arm in (pair.leader, pair.follower):
                 arm.set_follower_mode()
-                arm.configure_state_alignment(
-                    self.config.teleop.command.state_alignment_delay_s,
-                    self.config.teleop.command.sample_rate_hz,
-                    q_state.mean_window,
-                    q_state.lowpass_cutoff_hz if q_state.lowpass else None,
-                    dq_state.lowpass_cutoff_hz if dq_state.lowpass else None,
-                    ddq_state.lowpass_cutoff_hz if ddq_state.lowpass else None,
+                arm.configure_state_capture(
+                    self.config.teleop.command.maximum_state_source_skew_s,
+                    None,
+                    None,
+                    None,
                     self.config.teleop.command.maximum_can_frame_gap_s,
                 )
         self._settle_after_role_switch(True)
@@ -499,6 +1010,7 @@ class MasterSlaveTeleop:
         gripper = self.config.gripper
         if not gripper.enabled:
             return
+        self._ensure_gripper_io_runtime()
         follower_values: list[np.ndarray] = []
         command_values: list[np.ndarray] = []
         now = time.monotonic()
@@ -506,8 +1018,46 @@ class MasterSlaveTeleop:
         for pair in self.pairs:
             read_leader = gripper.teleop_enabled or gripper.attach_to in {"leader", "both"}
             read_follower = gripper.teleop_enabled or gripper.attach_to in {"follower", "both"}
-            leader_state = pair.leader.read_gripper_state() if read_leader else None
-            follower_state = pair.follower.read_gripper_state() if read_follower else None
+            future = self._gripper_futures.get(pair.name)
+            if future is not None and future.done():
+                del self._gripper_futures[pair.name]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    log.error(
+                        "asynchronous gripper I/O failed pair=%s: %s",
+                        pair.name,
+                        exc,
+                    )
+                else:
+                    self._apply_gripper_io_result(pair, result)
+                future = None
+
+            last_sample_t = self._last_gripper_sample_t.get(pair.name, float("-inf"))
+            sample_due = now - last_sample_t >= command_period
+            sample_due = sample_due or (
+                read_leader and pair.name not in self._cached_leader_gripper_state
+            )
+            sample_due = sample_due or (
+                read_follower and pair.name not in self._cached_follower_gripper_state
+            )
+            if sample_due and future is None:
+                self._last_gripper_sample_t[pair.name] = now
+                future = self._gripper_executor.submit(
+                    _run_gripper_io,
+                    pair,
+                    gripper,
+                    read_leader,
+                    read_follower,
+                    self._last_gripper_command.get(pair.name),
+                    self._last_gripper_command_mode.get(pair.name),
+                    self._last_gripper_command_t.get(pair.name, float("-inf")),
+                    now,
+                )
+                self._gripper_futures[pair.name] = future
+
+            leader_state = self._cached_leader_gripper_state.get(pair.name)
+            follower_state = self._cached_follower_gripper_state.get(pair.name)
             if leader_state is not None:
                 previous_timestamp = self._leader_gripper_feedback_timestamp_us.get(pair.name)
                 if previous_timestamp != leader_state.timestamp_us:
@@ -543,38 +1093,11 @@ class MasterSlaveTeleop:
                         gripper.max_width_m,
                     )
                 )
-                last_value = self._last_gripper_command.get(pair.name)
-                last_mode = self._last_gripper_command_mode.get(pair.name)
-                last_t = self._last_gripper_command_t.get(pair.name, float("-inf"))
-                changed = (
-                    last_value is None
-                    or last_mode != "width"
-                    or abs(command_value - last_value) >= gripper.deadband_m
-                )
-                due = now - last_t >= command_period
-                keepalive_due = now - last_t >= gripper.keepalive_s
-                if due and (changed or keepalive_due):
-                    pair.follower.command_gripper(command_value, gripper.force_n, mode="width")
-                    if pair.name not in self._gripper_command_announced:
-                        log.info(
-                            "gripper teleop active pair=%s leader=%.6fm command=%.6fm force=%.3fN",
-                            pair.name,
-                            leader_state.value,
-                            command_value,
-                            gripper.force_n,
-                        )
-                        self._gripper_command_announced.add(pair.name)
-                    else:
-                        log.debug(
-                            "gripper command pair=%s leader=%.6fm command=%.6fm",
-                            pair.name,
-                            leader_state.value,
-                            command_value,
-                        )
-                    self._last_gripper_command[pair.name] = command_value
-                    self._last_gripper_command_mode[pair.name] = "width"
-                    self._last_gripper_command_t[pair.name] = now
-            elif gripper.teleop_enabled and pair.name not in self._gripper_feedback_warned:
+            elif (
+                gripper.teleop_enabled
+                and future is None
+                and pair.name not in self._gripper_feedback_warned
+            ):
                 mode = leader_state.mode if leader_state is not None else "unavailable"
                 log.warning(
                     "leader gripper feedback unavailable pair=%s mode=%s; command skipped",
@@ -589,6 +1112,55 @@ class MasterSlaveTeleop:
             values["gripper_follower"] = ("gripper", follower_value)
         if command_values:
             values["gripper_cmd"] = ("gripper", _concat(command_values))
+
+    def _ensure_gripper_io_runtime(self) -> None:
+        if not hasattr(self, "_last_gripper_sample_t"):
+            self._last_gripper_sample_t = {}
+        if not hasattr(self, "_cached_leader_gripper_state"):
+            self._cached_leader_gripper_state = {}
+        if not hasattr(self, "_cached_follower_gripper_state"):
+            self._cached_follower_gripper_state = {}
+        if not hasattr(self, "_cached_gripper_command_value"):
+            self._cached_gripper_command_value = {}
+        if not hasattr(self, "_gripper_futures"):
+            self._gripper_futures = {}
+        if not hasattr(self, "_gripper_executor") or self._gripper_executor is None:
+            self._gripper_executor = ThreadPoolExecutor(
+                max_workers=max(1, len(self.pairs)),
+                thread_name_prefix="nero-gripper-io",
+            )
+
+    def _apply_gripper_io_result(self, pair, result: _GripperIoResult) -> None:
+        if result.state_elapsed_s > 0.005:
+            log.warning(
+                "slow asynchronous gripper state RPC pair=%s elapsed=%.3fms",
+                pair.name,
+                result.state_elapsed_s * 1.0e3,
+            )
+        if result.command_elapsed_s > 0.005:
+            log.warning(
+                "slow asynchronous gripper command RPC pair=%s arm=%s elapsed=%.3fms",
+                pair.name,
+                pair.follower.name,
+                result.command_elapsed_s * 1.0e3,
+            )
+        if result.leader_state is not None:
+            self._cached_leader_gripper_state[pair.name] = result.leader_state
+        if result.follower_state is not None:
+            self._cached_follower_gripper_state[pair.name] = result.follower_state
+        self._cached_gripper_command_value[pair.name] = result.command_value
+        if result.command_sent:
+            self._last_gripper_command[pair.name] = result.command_value
+            self._last_gripper_command_mode[pair.name] = "width"
+            self._last_gripper_command_t[pair.name] = result.completed_t
+            if pair.name not in self._gripper_command_announced:
+                log.info(
+                    "asynchronous gripper teleop active pair=%s command=%.6fm force=%.3fN",
+                    pair.name,
+                    result.command_value,
+                    self.config.gripper.force_n,
+                )
+                self._gripper_command_announced.add(pair.name)
 
     def reset_to_rest(self) -> None:
         command = self.config.teleop.command
@@ -652,8 +1224,8 @@ class MasterSlaveTeleop:
                         "reset fine-tune pair=%s role=%s mean_error=%s target=%s",
                         pair.name,
                         role,
-                        np.array2string(error, precision=6, suppress_small=True),
-                        np.array2string(reset_targets[pair.name][role], precision=6, suppress_small=True),
+                        np.array2string(error, precision=25, suppress_small=True),
+                        np.array2string(reset_targets[pair.name][role], precision=25, suppress_small=True),
                     )
             self._move_both_arms_to_reset_targets(reset_targets)
 
@@ -829,6 +1401,27 @@ class MasterSlaveTeleop:
             )
 
         if inference_results:
+            values["model_observation_updated"] = (
+                "flag",
+                np.asarray(
+                    [result.observation_updated for result in inference_results],
+                    dtype=np.uint8,
+                ),
+            )
+            values["model_observation_timestamp_us"] = (
+                "timestamp",
+                np.asarray(
+                    [result.observation_timestamp_us for result in inference_results],
+                    dtype=np.int64,
+                ),
+            )
+            values["model_prediction_age_us"] = (
+                "duration",
+                np.asarray(
+                    [result.prediction_age_us for result in inference_results],
+                    dtype=np.int64,
+                ),
+            )
             values["ddq_kf_causal"] = (
                 "acceleration",
                 _concat([result.ddq_kf_causal for result in inference_results]),
@@ -887,6 +1480,113 @@ def _rest_q(rest_q: tuple[float, ...]) -> np.ndarray:
     if rest_q:
         return np.asarray(rest_q, dtype=np.float64)
     return np.zeros(7, dtype=np.float64)
+
+
+def _run_gripper_io(
+    pair,
+    gripper,
+    read_leader: bool,
+    read_follower: bool,
+    last_command_value: float | None,
+    last_command_mode: str | None,
+    last_command_t: float,
+    scheduled_t: float,
+) -> _GripperIoResult:
+    state_started_t = time.monotonic()
+    leader_state = pair.leader.read_gripper_state() if read_leader else None
+    follower_state = pair.follower.read_gripper_state() if read_follower else None
+    state_elapsed_s = time.monotonic() - state_started_t
+
+    command_value = np.nan
+    command_sent = False
+    command_elapsed_s = 0.0
+    valid_leader_state = (
+        leader_state is not None
+        and np.isfinite(leader_state.value)
+        and leader_state.mode == "width"
+    )
+    if gripper.teleop_enabled and valid_leader_state:
+        command_value = float(
+            np.clip(
+                gripper.scale * leader_state.value + gripper.offset_m,
+                gripper.min_width_m,
+                gripper.max_width_m,
+            )
+        )
+        changed = (
+            last_command_value is None
+            or last_command_mode != "width"
+            or abs(command_value - last_command_value) >= gripper.deadband_m
+        )
+        keepalive_due = scheduled_t - last_command_t >= gripper.keepalive_s
+        if changed or keepalive_due:
+            command_started_t = time.monotonic()
+            pair.follower.command_gripper(
+                command_value,
+                gripper.force_n,
+                mode="width",
+            )
+            command_elapsed_s = time.monotonic() - command_started_t
+            command_sent = True
+    return _GripperIoResult(
+        leader_state=leader_state,
+        follower_state=follower_state,
+        command_value=command_value,
+        command_sent=command_sent,
+        state_elapsed_s=state_elapsed_s,
+        command_elapsed_s=command_elapsed_s,
+        completed_t=time.monotonic(),
+    )
+
+
+def _arm_state_timestamp_us(state: ArmState) -> int:
+    return int(
+        state.q_timestamp_us
+        or state.q_acquired_timestamp_us
+        or state.timestamp_us
+        or state.acquired_timestamp_us
+    )
+
+
+def _is_complete_arm_state(state: ArmState) -> bool:
+    return all(
+        np.asarray(value, dtype=np.float64).shape == (7,)
+        and np.all(np.isfinite(value))
+        for value in (state.q, state.dq, state.ddq, state.torque, state.current)
+    )
+
+
+def _latest_timestamped_state(states: dict[int, ArmState]) -> ArmState | None:
+    if not states:
+        return None
+    return states[max(states)]
+
+
+def _arm_state_readiness(state: ArmState | None) -> str:
+    if state is None:
+        return "no-state"
+    invalid_fields = [
+        name
+        for name, value in (
+            ("q", state.q),
+            ("dq", state.dq),
+            ("ddq", state.ddq),
+            ("torque", state.torque),
+            ("current", state.current),
+        )
+        if np.asarray(value, dtype=np.float64).shape != (7,)
+        or not np.all(np.isfinite(value))
+    ]
+    return (
+        f"timestamp_us={_arm_state_timestamp_us(state)} "
+        f"invalid={invalid_fields or 'none'}"
+    )
+
+
+def _timed_hardware_call(command) -> float:
+    started_t = time.monotonic()
+    command()
+    return time.monotonic() - started_t
 
 
 def _primary_observation_timestamp_us(states: list[ArmState]) -> int:

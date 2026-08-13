@@ -140,7 +140,7 @@ def test_state_stream_maps_raw_and_filtered_tau_ext_without_refiltering() -> Non
         tau_ext_pred_raw=np.full(7, 2.0),
     )
 
-    sample = stream._build_sample(1_000, 1_000, result)
+    sample = stream._build_sample(1_000, 1_000, result, zeros)
 
     np.testing.assert_allclose(sample.raw_wrench, 2.0)
     np.testing.assert_allclose(sample.wrench, 1.0)

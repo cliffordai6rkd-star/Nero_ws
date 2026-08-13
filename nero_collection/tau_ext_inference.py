@@ -20,6 +20,9 @@ from nero_collection.config import (
 )
 from nero_collection.contact_wrench import PinocchioJointTorqueResidualEstimator
 from nero_collection.filters import (
+    CausalFilterPipeline,
+    CausalHampelButterworth,
+    CausalTrailingMovingAverage,
     CausalTrailingMedian,
     CausalWindowLowPass,
     OnePoleLowPass,
@@ -43,18 +46,21 @@ class SequenceCheckpointMetadata:
     output_dim: int
     architecture: str
     normalize_mode: str
+    sample_rate_hz: float | None = None
+    dataloader_filters: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     inference_mode: str = "fixed_window"
     target_contract: str | None = None
     target_filter_enabled: bool = False
     target_filter_cutoff_hz: float | None = None
+    target_filter_moving_average_window: int | None = None
     target_filter_median_window: int | None = None
     target_filter_apply_additional_lowpass: bool = False
 
 
 @dataclass(frozen=True)
 class TauExtInferenceMetadata:
-    tau_f: SequenceCheckpointMetadata
-    tau_next: SequenceCheckpointMetadata
+    tau_f: SequenceCheckpointMetadata | None
+    tau_next: SequenceCheckpointMetadata | None
     input_keys: tuple[str, ...]
     tau_ext_filter: TauExtFilterConfig = field(default_factory=TauExtFilterConfig)
 
@@ -73,8 +79,114 @@ class OnlineTauExtResult:
     tau_ext_cal: np.ndarray
     tau_ext_pred: np.ndarray
     history_ready: bool = True
+    observation_updated: bool = True
+    observation_timestamp_us: int = 0
+    prediction_age_us: int = 0
     tau_ext_cal_raw: np.ndarray | None = None
     tau_ext_pred_raw: np.ndarray | None = None
+
+
+@dataclass(frozen=True)
+class _SourceObservation:
+    timestamp_us: int
+    q: np.ndarray
+    dq: np.ndarray
+    tau: np.ndarray
+    q_cmd: np.ndarray
+
+
+@dataclass
+class _NearestObservationGrid:
+    sample_rate_hz: float
+    origin_timestamp_us: int | None = None
+    next_index: int = 0
+    previous_source: _SourceObservation | None = None
+
+    def reset(self) -> None:
+        self.origin_timestamp_us = None
+        self.next_index = 0
+        self.previous_source = None
+
+    def advance(
+        self,
+        source: _SourceObservation,
+    ) -> list[tuple[int, _SourceObservation]]:
+        previous = self.previous_source
+        if previous is None:
+            self.origin_timestamp_us = source.timestamp_us
+            self.next_index = 1
+            self.previous_source = source
+            return [(source.timestamp_us, source)]
+
+        selected: list[tuple[int, _SourceObservation]] = []
+        target_timestamp_us = self.timestamp_us(self.next_index)
+        while source.timestamp_us >= target_timestamp_us:
+            left_gap_us = target_timestamp_us - previous.timestamp_us
+            right_gap_us = source.timestamp_us - target_timestamp_us
+            nearest = previous if left_gap_us <= right_gap_us else source
+            selected.append((target_timestamp_us, nearest))
+            self.next_index += 1
+            target_timestamp_us = self.timestamp_us(self.next_index)
+
+        self.previous_source = source
+        return selected
+
+    def timestamp_us(self, index: int) -> int:
+        assert self.origin_timestamp_us is not None
+        offset_us = round(int(index) * 1.0e6 / self.sample_rate_hz)
+        return self.origin_timestamp_us + int(offset_us)
+
+
+@dataclass
+class _FixedPhaseCausalObservationGrid:
+    """Sample latest complete observations on an absolute, history-only grid."""
+
+    sample_rate_hz: float
+    next_timestamp_us: int | None = None
+    previous_source: _SourceObservation | None = None
+
+    def __post_init__(self) -> None:
+        period_us = 1.0e6 / float(self.sample_rate_hz)
+        rounded_period_us = round(period_us)
+        if (
+            not np.isfinite(period_us)
+            or rounded_period_us <= 0
+            or not np.isclose(period_us, rounded_period_us, rtol=0.0, atol=1.0e-9)
+        ):
+            raise ValueError(
+                "fixed-phase causal observation rate must divide 1 MHz exactly"
+            )
+        self._period_us = int(rounded_period_us)
+
+    def reset(self) -> None:
+        self.next_timestamp_us = None
+        self.previous_source = None
+
+    def advance(
+        self,
+        source: _SourceObservation,
+    ) -> list[tuple[int, _SourceObservation]]:
+        previous = self.previous_source
+        if previous is None:
+            self.next_timestamp_us = self._ceil_to_grid(source.timestamp_us)
+
+        selected: list[tuple[int, _SourceObservation]] = []
+        assert self.next_timestamp_us is not None
+        while source.timestamp_us >= self.next_timestamp_us:
+            if source.timestamp_us == self.next_timestamp_us:
+                observation = source
+            elif previous is not None:
+                observation = previous
+            else:
+                break
+            selected.append((self.next_timestamp_us, observation))
+            self.next_timestamp_us += self._period_us
+
+        self.previous_source = source
+        return selected
+
+    def _ceil_to_grid(self, timestamp_us: int) -> int:
+        return -(-int(timestamp_us) // self._period_us) * self._period_us
 
 
 class SequenceTorquePredictorProtocol(Protocol):
@@ -136,6 +248,26 @@ class SequenceTorquePredictor:
             checkpoint_config.get("dataloader"),
             "checkpoint.config.dataloader",
         )
+        dataloader_filters = _normalize_checkpoint_filters(
+            checkpoint.get(
+                "dataloader_filters",
+                dataloader_config.get("filters", {}),
+            )
+        )
+        sample_rate_value = checkpoint.get(
+            "sample_rate_hz",
+            dataloader_config.get(
+                "filter_sample_rate_hz",
+                dataloader_config.get("expected_fps"),
+            ),
+        )
+        sample_rate_hz = (
+            None if sample_rate_value is None else float(sample_rate_value)
+        )
+        if sample_rate_hz is not None and (
+            not np.isfinite(sample_rate_hz) or sample_rate_hz <= 0.0
+        ):
+            raise RuntimeError("checkpoint sample_rate_hz must be positive and finite")
         model_config = _mapping(
             checkpoint_config.get("model"),
             "checkpoint.config.model",
@@ -164,12 +296,27 @@ class SequenceTorquePredictor:
             target_filter_config.get("enabled", True)
         )
         target_filter_cutoff_hz = target_filter_config.get("cutoff_hz")
+        target_filter_moving_average_window = target_filter_config.get(
+            "moving_average_window"
+        )
         target_filter_median_window = target_filter_config.get("median_window")
+        if (
+            target_filter_moving_average_window is not None
+            and target_filter_median_window is not None
+        ):
+            raise RuntimeError(
+                "checkpoint target_filter must not define both "
+                "moving_average_window and median_window"
+            )
         target_filter_apply_additional_lowpass = bool(
             target_filter_config.get("apply_additional_lowpass", False)
         )
         if target_filter_cutoff_hz is not None:
             target_filter_cutoff_hz = float(target_filter_cutoff_hz)
+        if target_filter_moving_average_window is not None:
+            target_filter_moving_average_window = int(
+                target_filter_moving_average_window
+            )
         if target_filter_median_window is not None:
             target_filter_median_window = int(target_filter_median_window)
 
@@ -263,9 +410,14 @@ class SequenceTorquePredictor:
             output_dim=output_dim,
             architecture=architecture,
             normalize_mode=self._normalize_mode,
+            sample_rate_hz=sample_rate_hz,
+            dataloader_filters=dataloader_filters,
             target_contract=target_contract,
             target_filter_enabled=target_filter_enabled,
             target_filter_cutoff_hz=target_filter_cutoff_hz,
+            target_filter_moving_average_window=(
+                target_filter_moving_average_window
+            ),
             target_filter_median_window=target_filter_median_window,
             target_filter_apply_additional_lowpass=(
                 target_filter_apply_additional_lowpass
@@ -435,7 +587,7 @@ class SequenceTorquePredictor:
 
 
 class OnlineTauExtInference:
-    """Compute both external-torque estimates on one aligned online sample."""
+    """Run torque models on their configured fixed-rate observation grids."""
 
     def __init__(
         self,
@@ -449,100 +601,224 @@ class OnlineTauExtInference:
         estimator: Any | None = None,
         state_estimator: CausalJointKalmanFilter | None = None,
     ) -> None:
-        if not config.enabled and (
-            tau_f_predictor is None or tau_next_predictor is None
-        ):
+        if not config.enabled and tau_f_predictor is None and tau_next_predictor is None:
             raise ValueError("tau_ext inference is disabled")
         self.config = config
-        self.tau_f_predictor = tau_f_predictor or SequenceTorquePredictor(
+        self.tau_f_predictor = tau_f_predictor
+        if self.tau_f_predictor is None and config.tau_f.checkpoint_path is not None:
+            self.tau_f_predictor = SequenceTorquePredictor(config.tau_f, name="tau_f")
+        self.tau_next_predictor = tau_next_predictor
+        if (
+            self.tau_next_predictor is None
+            and config.tau_next.checkpoint_path is not None
+        ):
+            self.tau_next_predictor = SequenceTorquePredictor(
+                config.tau_next,
+                name="tau_next",
+            )
+        if self.tau_f_predictor is None and self.tau_next_predictor is None:
+            raise ValueError("tau_ext inference has no configured checkpoint")
+
+        if self.tau_f_predictor is not None:
+            _validate_predictor_contract(
+                self.tau_f_predictor.metadata,
+                model_name="tau_f",
+                output_key="tau_f",
+            )
+        if self.tau_next_predictor is not None:
+            _validate_predictor_contract(
+                self.tau_next_predictor.metadata,
+                model_name="tau_next",
+                output_key="tau",
+            )
+
+        self._tau_f_sample_rate_hz = _resolve_observation_sample_rate(
             config.tau_f,
-            name="tau_f",
-        )
-        self.tau_next_predictor = tau_next_predictor or SequenceTorquePredictor(
-            config.tau_next,
-            name="tau_next",
-        )
-        _validate_predictor_contract(
-            self.tau_f_predictor.metadata,
+            None if self.tau_f_predictor is None else self.tau_f_predictor.metadata,
             model_name="tau_f",
-            output_key="tau_f",
         )
-        _validate_predictor_contract(
-            self.tau_next_predictor.metadata,
+        self._tau_next_sample_rate_hz = _resolve_observation_sample_rate(
+            config.tau_next,
+            None
+            if self.tau_next_predictor is None
+            else self.tau_next_predictor.metadata,
             model_name="tau_next",
-            output_key="tau",
         )
-        self.estimator = estimator or PinocchioJointTorqueResidualEstimator(
-            inverse_dynamics
+        self._tau_f_grid = (
+            None
+            if self._tau_f_sample_rate_hz is None
+            else _NearestObservationGrid(self._tau_f_sample_rate_hz)
         )
-        self.state_estimator = state_estimator or CausalJointKalmanFilter(
-            config.state_estimator
+        self._tau_next_grid = (
+            None
+            if self._tau_next_sample_rate_hz is None
+            else _FixedPhaseCausalObservationGrid(self._tau_next_sample_rate_hz)
         )
-        torque_filter = _tau_filter_spec(dynamics_processing, robot_states)
-        _validate_tau_filter_contract(self.tau_f_predictor.metadata, torque_filter)
-        assert torque_filter is not None
-        cutoff_hz, median_window = torque_filter
-        self.tau_filter = OnePoleLowPass(cutoff_hz, median_window)
-        self.tau_id_filter = OnePoleLowPass(cutoff_hz, median_window)
-        self.tau_next_target_filter = _build_tau_next_target_filter(
-            self.tau_next_predictor.metadata
+
+        self.estimator = None
+        self.state_estimator = None
+        self.tau_filter = None
+        self.tau_id_filter = None
+        self.tau_f_input_filters: dict[str, CausalFilterPipeline] = {}
+        if self.tau_f_predictor is not None:
+            self.estimator = estimator or PinocchioJointTorqueResidualEstimator(
+                inverse_dynamics
+            )
+            self.state_estimator = state_estimator or CausalJointKalmanFilter(
+                config.state_estimator
+            )
+            self.tau_f_input_filters = _build_feature_filter_bank(
+                self.tau_f_predictor.metadata
+            )
+            self.tau_filter = _build_tau_f_source_filter(
+                self.tau_f_predictor.metadata,
+                dynamics_processing,
+                robot_states,
+            )
+            self.tau_id_filter = _build_tau_f_source_filter(
+                self.tau_f_predictor.metadata,
+                dynamics_processing,
+                robot_states,
+            )
+
+        self.tau_next_input_filters = (
+            {}
+            if self.tau_next_predictor is None
+            else _build_feature_filter_bank(self.tau_next_predictor.metadata)
+        )
+        self.tau_next_target_filter = (
+            None
+            if self.tau_next_predictor is None
+            else _build_tau_target_filter(self.tau_next_predictor.metadata)
+        )
+        self.tau_next_target_uses_raw = bool(
+            self.tau_next_predictor is not None
+            and self.tau_next_predictor.metadata.dataloader_filters
+        )
+        self.tau_next_source_filter = (
+            _build_tau_f_source_filter(
+                self.tau_f_predictor.metadata,
+                dynamics_processing,
+                robot_states,
+            )
+            if self.tau_next_predictor is not None
+            and self.tau_f_predictor is not None
+            and not self.tau_next_target_uses_raw
+            else None
         )
         tau_ext_filter = config.tau_ext_filter
         self.tau_ext_cal_filter = (
-            CausalWindowLowPass(
-                tau_ext_filter.mode,
-                tau_ext_filter.window,
-                tau_ext_filter.cutoff_hz,
-            )
-            if tau_ext_filter.enabled
+            _build_tau_ext_post_filter(tau_ext_filter)
+            if self.tau_f_predictor is not None
             else None
         )
         self.tau_ext_pred_filter = (
-            CausalWindowLowPass(
-                tau_ext_filter.mode,
-                tau_ext_filter.window,
-                tau_ext_filter.cutoff_hz,
-            )
-            if tau_ext_filter.enabled
+            _build_tau_ext_post_filter(tau_ext_filter)
+            if self.tau_next_predictor is not None
             else None
         )
-        self._last_timestamp_us: int | None = None
-        self._last_result: OnlineTauExtResult | None = None
-        self._history_ready_logged = False
+        self._last_input_timestamp_us: int | None = None
+        self._last_source_timestamp_us: int | None = None
+        self._tau_f_timestamp_us: int | None = None
+        self._tau_next_timestamp_us: int | None = None
+        self._tau_f_ready = False
+        self._tau_next_ready = False
+        self._tau_f_ready_logged = False
+        self._tau_next_ready_logged = False
+        self._ddq = np.zeros(7, dtype=np.float64)
+        self._tau_id = np.zeros(7, dtype=np.float64)
+        self._tau_id_filtered = np.zeros(7, dtype=np.float64)
+        self._tau_f_pred = np.zeros(7, dtype=np.float64)
+        self._tau_next_pred = np.zeros(7, dtype=np.float64)
+        self._tau_ext_cal_raw = np.zeros(7, dtype=np.float64)
+        self._tau_ext_pred_raw = np.zeros(7, dtype=np.float64)
+        self._tau_ext_cal = np.zeros(7, dtype=np.float64)
+        self._tau_ext_pred = np.zeros(7, dtype=np.float64)
 
     @property
     def metadata(self) -> TauExtInferenceMetadata:
+        tau_f_metadata = (
+            None if self.tau_f_predictor is None else self.tau_f_predictor.metadata
+        )
+        tau_next_metadata = (
+            None
+            if self.tau_next_predictor is None
+            else self.tau_next_predictor.metadata
+        )
         return TauExtInferenceMetadata(
-            tau_f=self.tau_f_predictor.metadata,
-            tau_next=self.tau_next_predictor.metadata,
+            tau_f=tau_f_metadata,
+            tau_next=tau_next_metadata,
             input_keys=tuple(
                 dict.fromkeys(
-                    self.tau_f_predictor.metadata.input_keys
-                    + self.tau_next_predictor.metadata.input_keys
+                    (tau_f_metadata.input_keys if tau_f_metadata is not None else ())
+                    + (
+                        tau_next_metadata.input_keys
+                        if tau_next_metadata is not None
+                        else ()
+                    )
                 )
             ),
             tau_ext_filter=self.config.tau_ext_filter,
         )
 
+    def observation_sample_rate_hz(self, model_name: str) -> float | None:
+        if model_name == "tau_f":
+            return self._tau_f_sample_rate_hz
+        if model_name == "tau_next":
+            return self._tau_next_sample_rate_hz
+        raise ValueError(f"unknown torque model {model_name!r}")
+
     def warm_up(self) -> None:
-        self.tau_f_predictor.warm_up()
-        self.tau_next_predictor.warm_up()
+        if self.tau_f_predictor is not None:
+            self.tau_f_predictor.warm_up()
+        if self.tau_next_predictor is not None:
+            self.tau_next_predictor.warm_up()
 
     def reset_episode(self) -> None:
-        self.tau_f_predictor.reset()
-        self.tau_next_predictor.reset()
-        self.state_estimator.reset()
-        self.tau_filter.reset()
-        self.tau_id_filter.reset()
+        if self.tau_f_predictor is not None:
+            self.tau_f_predictor.reset()
+        if self.tau_next_predictor is not None:
+            self.tau_next_predictor.reset()
+        if self.state_estimator is not None:
+            self.state_estimator.reset()
+        _reset_filter_bank(self.tau_f_input_filters)
+        _reset_filter_bank(self.tau_next_input_filters)
+        if self.tau_filter is not None:
+            self.tau_filter.reset()
+        if self.tau_id_filter is not None:
+            self.tau_id_filter.reset()
         if self.tau_next_target_filter is not None:
             self.tau_next_target_filter.reset()
+        if self.tau_next_source_filter is not None:
+            self.tau_next_source_filter.reset()
         if self.tau_ext_cal_filter is not None:
             self.tau_ext_cal_filter.reset()
         if self.tau_ext_pred_filter is not None:
             self.tau_ext_pred_filter.reset()
-        self._last_timestamp_us = None
-        self._last_result = None
-        self._history_ready_logged = False
+        self._last_input_timestamp_us = None
+        self._last_source_timestamp_us = None
+        if self._tau_f_grid is not None:
+            self._tau_f_grid.reset()
+        if self._tau_next_grid is not None:
+            self._tau_next_grid.reset()
+        self._tau_f_timestamp_us = None
+        self._tau_next_timestamp_us = None
+        self._tau_f_ready = False
+        self._tau_next_ready = False
+        self._tau_f_ready_logged = False
+        self._tau_next_ready_logged = False
+        for value in (
+            self._ddq,
+            self._tau_id,
+            self._tau_id_filtered,
+            self._tau_f_pred,
+            self._tau_next_pred,
+            self._tau_ext_cal_raw,
+            self._tau_ext_pred_raw,
+            self._tau_ext_cal,
+            self._tau_ext_pred,
+        ):
+            value.fill(0.0)
 
     def estimate_aligned(
         self,
@@ -553,99 +829,221 @@ class OnlineTauExtInference:
         q_cmd: np.ndarray,
     ) -> OnlineTauExtResult:
         timestamp_us = int(timestamp_us)
-        if self._last_timestamp_us is not None:
-            if timestamp_us < self._last_timestamp_us:
-                raise ValueError(
-                    "aligned tau_ext inference timestamp moved backwards: "
-                    f"{timestamp_us} < {self._last_timestamp_us}"
-                )
-            if timestamp_us == self._last_timestamp_us:
-                assert self._last_result is not None
-                return self._last_result
-
         q_value = _finite_vector("q", q, 7)
         dq_value = _finite_vector("dq", dq, 7)
-        tau_value = _finite_vector("tau", tau, 7)
+        raw_tau_value = _finite_vector("tau", tau, 7)
         q_cmd_value = _finite_vector("q_cmd", q_cmd, 7)
-        tau_value = self.tau_filter.apply(tau_value, timestamp_us)
-        tau_next_target = (
-            self.tau_next_target_filter.apply(tau_value, timestamp_us)
-            if self.tau_next_target_filter is not None
-            else tau_value
+        if self._last_input_timestamp_us is not None:
+            if timestamp_us < self._last_input_timestamp_us:
+                raise ValueError(
+                    "tau_ext source timestamp moved backwards: "
+                    f"{timestamp_us} < {self._last_input_timestamp_us}"
+                )
+            if timestamp_us == self._last_input_timestamp_us:
+                return self._result_for_source(
+                    timestamp_us, q_value, dq_value, raw_tau_value, False
+                )
+        self._last_input_timestamp_us = timestamp_us
+
+        source = _SourceObservation(
+            timestamp_us=timestamp_us,
+            q=q_value.copy(),
+            dq=dq_value.copy(),
+            tau=raw_tau_value.copy(),
+            q_cmd=q_cmd_value.copy(),
+        )
+        if self._last_source_timestamp_us is not None:
+            source_gap_us = timestamp_us - self._last_source_timestamp_us
+            warning_us = int(round(self.config.observation_gap_warning_s * 1e6))
+            if source_gap_us > warning_us:
+                log.warning(
+                    "tau_ext source observation gap exceeded warning threshold: "
+                    "gap=%.3fms threshold=%.3fms; retaining the previous 49 "
+                    "observations in each model history",
+                    source_gap_us * 1.0e-3,
+                    warning_us * 1.0e-3,
+                )
+        self._last_source_timestamp_us = timestamp_us
+
+        tau_f_updated = False
+        if self._tau_f_grid is not None:
+            selected = self._tau_f_grid.advance(source)
+            tau_f_updated = bool(selected)
+            for model_timestamp_us, observation in selected:
+                self._estimate_tau_f(model_timestamp_us, observation)
+
+        tau_next_updated = False
+        if self._tau_next_grid is not None:
+            selected = self._tau_next_grid.advance(source)
+            tau_next_updated = bool(selected)
+            for model_timestamp_us, observation in selected:
+                self._estimate_tau_next(model_timestamp_us, observation)
+
+        updated = (
+            tau_next_updated
+            if self.tau_next_predictor is not None
+            else tau_f_updated
+        )
+        return self._result_for_source(
+            timestamp_us, q_value, dq_value, raw_tau_value, updated
         )
 
-        kalman_state = self.state_estimator.update(timestamp_us, q_value, dq_value)
-        ddq_value = kalman_state.ddq
+    def _estimate_tau_f(
+        self,
+        timestamp_us: int,
+        source: _SourceObservation,
+    ) -> None:
+        assert self.tau_f_predictor is not None
+        assert self.state_estimator is not None
+        assert self.estimator is not None
+        assert self.tau_filter is not None
+        assert self.tau_id_filter is not None
+        tau_value = self.tau_filter.apply(source.tau, timestamp_us)
+        kalman_state = self.state_estimator.update(timestamp_us, source.q, source.dq)
         inverse_dynamics = self.estimator.estimate(
-            q_value,
-            dq_value,
-            ddq_value,
+            source.q,
+            source.dq,
+            kalman_state.ddq,
             tau_value,
         )
         tau_id = _finite_vector("tau_id", inverse_dynamics.tau_id, 7)
         tau_id_filtered = self.tau_id_filter.apply(tau_id, timestamp_us)
-        features = {
-            "q": q_value,
-            "dq": dq_value,
-            "delta_q": q_cmd_value - q_value,
-        }
-        _require_features(features, self.tau_f_predictor.metadata.input_keys, "tau_f")
+        raw_features = _observation_features(source)
+        _require_features(raw_features, self.tau_f_predictor.metadata.input_keys, "tau_f")
+        features = _apply_feature_filter_bank(
+            raw_features,
+            self.tau_f_input_filters,
+            timestamp_us,
+        )
+        prediction = self.tau_f_predictor.append_and_predict(features)
+        self._ddq = kalman_state.ddq.copy()
+        self._tau_id = tau_id.copy()
+        self._tau_id_filtered = tau_id_filtered.copy()
+        self._tau_f_timestamp_us = timestamp_us
+        self._tau_f_ready = prediction is not None
+        if prediction is None:
+            self._tau_f_pred.fill(0.0)
+            self._tau_ext_cal_raw.fill(0.0)
+            self._tau_ext_cal.fill(0.0)
+            return
+        self._tau_f_pred = _finite_vector("tau_f_pred", prediction, 7)
+        self._tau_ext_cal_raw = tau_id_filtered + self._tau_f_pred - tau_value
+        self._tau_ext_cal = (
+            self.tau_ext_cal_filter.apply(self._tau_ext_cal_raw, timestamp_us)
+            if self.tau_ext_cal_filter is not None
+            else self._tau_ext_cal_raw.copy()
+        )
+        if not self._tau_f_ready_logged:
+            log.info(
+                "tau_f inference enabled after full history=%d samples",
+                self.tau_f_predictor.metadata.horizon,
+            )
+            self._tau_f_ready_logged = True
+
+    def _estimate_tau_next(
+        self,
+        timestamp_us: int,
+        source: _SourceObservation,
+    ) -> None:
+        assert self.tau_next_predictor is not None
+        tau_next_source = (
+            self.tau_next_source_filter.apply(source.tau, timestamp_us)
+            if self.tau_next_source_filter is not None
+            else source.tau
+        )
+        tau_next_target = (
+            self.tau_next_target_filter.apply(tau_next_source, timestamp_us)
+            if self.tau_next_target_filter is not None
+            else tau_next_source
+        )
+        raw_features = _observation_features(source)
         _require_features(
-            features,
-            self.tau_next_predictor.metadata.input_keys,
-            "tau_next",
+            raw_features, self.tau_next_predictor.metadata.input_keys, "tau_next"
         )
-        tau_f_prediction = self.tau_f_predictor.append_and_predict(features)
-        tau_next_prediction = self.tau_next_predictor.append_and_predict(features)
-        history_ready = tau_f_prediction is not None and tau_next_prediction is not None
-        if history_ready:
-            tau_f_pred = _finite_vector("tau_f_pred", tau_f_prediction, 7)
-            tau_next_pred = _finite_vector("tau_next_pred", tau_next_prediction, 7)
-            tau_ext_cal_raw = tau_id_filtered + tau_f_pred - tau_value
-            tau_ext_pred_raw = tau_next_pred - tau_next_target
-            tau_ext_cal = (
-                self.tau_ext_cal_filter.apply(tau_ext_cal_raw, timestamp_us)
-                if self.tau_ext_cal_filter is not None
-                else tau_ext_cal_raw.copy()
-            )
-            tau_ext_pred = (
-                self.tau_ext_pred_filter.apply(tau_ext_pred_raw, timestamp_us)
-                if self.tau_ext_pred_filter is not None
-                else tau_ext_pred_raw.copy()
-            )
-            if not self._history_ready_logged:
-                log.info(
-                    "tau_ext inference enabled after full history tau_f=%d tau_next=%d samples",
-                    self.tau_f_predictor.metadata.horizon,
-                    self.tau_next_predictor.metadata.horizon,
-                )
-                self._history_ready_logged = True
-        else:
-            tau_f_pred = np.zeros(7, dtype=np.float64)
-            tau_next_pred = np.zeros(7, dtype=np.float64)
-            tau_ext_cal = np.zeros(7, dtype=np.float64)
-            tau_ext_pred = np.zeros(7, dtype=np.float64)
-            tau_ext_cal_raw = np.zeros(7, dtype=np.float64)
-            tau_ext_pred_raw = np.zeros(7, dtype=np.float64)
-        result = OnlineTauExtResult(
-            timestamp_us=timestamp_us,
-            q=q_value.copy(),
-            dq=dq_value.copy(),
-            ddq_kf_causal=ddq_value.copy(),
-            tau=tau_value.copy(),
-            tau_id=tau_id.copy(),
-            tau_id_filtered=tau_id_filtered.copy(),
-            tau_f_pred=tau_f_pred.copy(),
-            tau_next_pred=tau_next_pred.copy(),
-            tau_ext_cal=tau_ext_cal.copy(),
-            tau_ext_pred=tau_ext_pred.copy(),
-            history_ready=history_ready,
-            tau_ext_cal_raw=tau_ext_cal_raw.copy(),
-            tau_ext_pred_raw=tau_ext_pred_raw.copy(),
+        features = _apply_feature_filter_bank(
+            raw_features,
+            self.tau_next_input_filters,
+            timestamp_us,
         )
-        self._last_timestamp_us = timestamp_us
-        self._last_result = result
-        return result
+        prediction = self.tau_next_predictor.append_and_predict(features)
+        self._tau_next_timestamp_us = timestamp_us
+        self._tau_next_ready = prediction is not None
+        if prediction is None:
+            self._tau_next_pred.fill(0.0)
+            self._tau_ext_pred_raw.fill(0.0)
+            self._tau_ext_pred.fill(0.0)
+            return
+        self._tau_next_pred = _finite_vector("tau_next_pred", prediction, 7)
+        self._tau_ext_pred_raw = self._tau_next_pred - tau_next_target
+        self._tau_ext_pred = (
+            self.tau_ext_pred_filter.apply(self._tau_ext_pred_raw, timestamp_us)
+            if self.tau_ext_pred_filter is not None
+            else self._tau_ext_pred_raw.copy()
+        )
+        if not self._tau_next_ready_logged:
+            log.info(
+                "tau_next inference enabled after full history=%d samples",
+                self.tau_next_predictor.metadata.horizon,
+            )
+            self._tau_next_ready_logged = True
+
+    def _result_for_source(
+        self,
+        timestamp_us: int,
+        q: np.ndarray,
+        dq: np.ndarray,
+        tau: np.ndarray,
+        updated: bool,
+    ) -> OnlineTauExtResult:
+        zeros = np.zeros(7, dtype=np.float64)
+        maximum_age_us = int(round(self.config.maximum_prediction_age_s * 1e6))
+        tau_f_age_us = (
+            0
+            if self._tau_f_timestamp_us is None
+            else max(0, timestamp_us - self._tau_f_timestamp_us)
+        )
+        tau_next_age_us = (
+            0
+            if self._tau_next_timestamp_us is None
+            else max(0, timestamp_us - self._tau_next_timestamp_us)
+        )
+        tau_f_valid = (
+            self.tau_f_predictor is not None
+            and self._tau_f_ready
+            and self._tau_f_timestamp_us is not None
+            and tau_f_age_us <= maximum_age_us
+        )
+        tau_next_valid = (
+            self.tau_next_predictor is not None
+            and self._tau_next_ready
+            and self._tau_next_timestamp_us is not None
+            and tau_next_age_us <= maximum_age_us
+        )
+        history_ready = (
+            (self.tau_f_predictor is None or tau_f_valid)
+            and (self.tau_next_predictor is None or tau_next_valid)
+        )
+        primary_timestamp_us = (
+            self._tau_next_timestamp_us
+            if self.tau_next_predictor is not None
+            else self._tau_f_timestamp_us
+        )
+        observation_timestamp_us = primary_timestamp_us or 0
+        age_us = max(0, timestamp_us - observation_timestamp_us)
+        return OnlineTauExtResult(
+            timestamp_us=timestamp_us, q=q.copy(), dq=dq.copy(),
+            ddq_kf_causal=self._ddq.copy(), tau=tau.copy(),
+            tau_id=self._tau_id.copy(), tau_id_filtered=self._tau_id_filtered.copy(),
+            tau_f_pred=self._tau_f_pred.copy(),
+            tau_next_pred=self._tau_next_pred.copy(),
+            tau_ext_cal=self._tau_ext_cal.copy() if tau_f_valid else zeros.copy(),
+            tau_ext_pred=self._tau_ext_pred.copy() if tau_next_valid else zeros.copy(),
+            history_ready=history_ready, observation_updated=updated,
+            observation_timestamp_us=observation_timestamp_us,
+            prediction_age_us=age_us,
+            tau_ext_cal_raw=(self._tau_ext_cal_raw.copy() if tau_f_valid else zeros.copy()),
+            tau_ext_pred_raw=(self._tau_ext_pred_raw.copy() if tau_next_valid else zeros.copy()),
+        )
 
 
 def _require_features(
@@ -656,6 +1054,131 @@ def _require_features(
     missing = [key for key in input_keys if key not in features]
     if missing:
         raise RuntimeError(f"{model_name} checkpoint is missing model inputs: {missing}")
+
+
+def _observation_features(source: _SourceObservation) -> dict[str, np.ndarray]:
+    return {
+        "q": source.q,
+        "dq": source.dq,
+        "delta_q": source.q_cmd - source.q,
+    }
+
+
+def _normalize_checkpoint_filters(value: Any) -> dict[str, dict[str, Any]]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise RuntimeError("checkpoint dataloader_filters must be a mapping")
+    normalized: dict[str, dict[str, Any]] = {}
+    for key, raw_spec in value.items():
+        key = str(key)
+        if not isinstance(raw_spec, Mapping):
+            raise RuntimeError(
+                f"checkpoint dataloader_filters.{key} must be a mapping"
+            )
+        enabled = bool(raw_spec.get("enabled", False))
+        raw_operations = raw_spec.get("operations", ())
+        if not isinstance(raw_operations, Sequence) or isinstance(
+            raw_operations, (str, bytes)
+        ):
+            raise RuntimeError(
+                f"checkpoint dataloader_filters.{key}.operations must be a list"
+            )
+        operations = []
+        for raw_operation in raw_operations:
+            if not isinstance(raw_operation, Mapping):
+                raise RuntimeError("checkpoint filter operations must be mappings")
+            operation_type = str(raw_operation.get("type", "")).strip().lower()
+            if operation_type in {"median", "moving_average"}:
+                window = int(raw_operation.get("window", 0))
+                if window < 1 or (operation_type == "median" and window % 2 == 0):
+                    raise RuntimeError(
+                        f"invalid checkpoint {operation_type} window {window}"
+                    )
+                operations.append({"type": operation_type, "window": window})
+            elif operation_type == "lowpass":
+                cutoff_hz = float(raw_operation.get("cutoff_hz", np.nan))
+                if not np.isfinite(cutoff_hz) or cutoff_hz <= 0.0:
+                    raise RuntimeError("checkpoint lowpass cutoff_hz must be positive")
+                operations.append(
+                    {"type": "lowpass", "cutoff_hz": cutoff_hz}
+                )
+            else:
+                raise RuntimeError(
+                    f"unsupported checkpoint causal filter {operation_type!r}"
+                )
+        raw_preprocessed = raw_spec.get("dataset_preprocessed_operations", ())
+        if not isinstance(raw_preprocessed, Sequence) or isinstance(
+            raw_preprocessed, (str, bytes)
+        ):
+            raise RuntimeError(
+                "checkpoint dataset_preprocessed_operations must be a list"
+            )
+        preprocessed_operations = []
+        for operation in raw_preprocessed:
+            if not isinstance(operation, Mapping):
+                raise RuntimeError(
+                    "checkpoint dataset_preprocessed_operations entries must be mappings"
+                )
+            operation_type = str(operation.get("type", "")).strip().lower()
+            if operation_type in {"median", "moving_average"}:
+                preprocessed_operations.append(
+                    {"type": operation_type, "window": int(operation["window"])}
+                )
+            elif operation_type == "lowpass":
+                preprocessed_operations.append(
+                    {"type": "lowpass", "cutoff_hz": float(operation["cutoff_hz"])}
+                )
+            else:
+                raise RuntimeError(
+                    f"unsupported preprocessed checkpoint filter {operation_type!r}"
+                )
+        if operations[: len(preprocessed_operations)] != preprocessed_operations:
+            raise RuntimeError(
+                "checkpoint dataset_preprocessed_operations must be an exact "
+                "prefix of operations"
+            )
+        if enabled and not operations:
+            raise RuntimeError(
+                f"checkpoint dataloader_filters.{key} is enabled without operations"
+            )
+        normalized[key] = {
+            "enabled": enabled,
+            "operations": operations,
+            "dataset_preprocessed_operations": preprocessed_operations,
+        }
+    return normalized
+
+
+def _build_feature_filter_bank(
+    metadata: SequenceCheckpointMetadata,
+) -> dict[str, CausalFilterPipeline]:
+    result = {}
+    for key in metadata.input_keys:
+        spec = metadata.dataloader_filters.get(key) or {}
+        if bool(spec.get("enabled", False)):
+            result[key] = CausalFilterPipeline(spec["operations"])
+    return result
+
+
+def _apply_feature_filter_bank(
+    features: Mapping[str, np.ndarray],
+    filter_bank: Mapping[str, CausalFilterPipeline],
+    timestamp_us: int,
+) -> dict[str, np.ndarray]:
+    return {
+        key: (
+            filter_bank[key].apply(value, timestamp_us)
+            if key in filter_bank
+            else np.asarray(value, dtype=np.float64).copy()
+        )
+        for key, value in features.items()
+    }
+
+
+def _reset_filter_bank(filter_bank: Mapping[str, CausalFilterPipeline]) -> None:
+    for pipeline in filter_bank.values():
+        pipeline.reset()
 
 
 def _validate_predictor_contract(
@@ -683,53 +1206,100 @@ def _validate_predictor_contract(
         )
 
 
-def _tau_filter_spec(
+def _validate_predictor_sample_rate(
+    metadata: SequenceCheckpointMetadata,
+    *,
+    model_name: str,
+    expected_hz: float,
+) -> None:
+    checkpoint_hz = metadata.sample_rate_hz
+    if checkpoint_hz is None:
+        return
+    if not np.isclose(checkpoint_hz, expected_hz, rtol=0.0, atol=1.0e-9):
+        raise RuntimeError(
+            f"{model_name} checkpoint sample_rate_hz={checkpoint_hz:g} does not "
+            f"match tau_ext_inference.{model_name}.observation_sample_rate_hz="
+            f"{expected_hz:g}"
+        )
+
+
+def _resolve_observation_sample_rate(
+    config: SequenceCheckpointConfig,
+    metadata: SequenceCheckpointMetadata | None,
+    *,
+    model_name: str,
+) -> float | None:
+    if metadata is None:
+        return None
+    configured_hz = config.observation_sample_rate_hz
+    checkpoint_hz = metadata.sample_rate_hz
+    if configured_hz is not None:
+        _validate_predictor_sample_rate(
+            metadata,
+            model_name=model_name,
+            expected_hz=configured_hz,
+        )
+        return configured_hz
+    if checkpoint_hz is not None:
+        return checkpoint_hz
+    # Injected and legacy predictors without timing metadata retain the former
+    # 50 Hz online observation contract. New checkpoints should carry a rate.
+    return 50.0
+
+
+def _build_tau_f_source_filter(
+    metadata: SequenceCheckpointMetadata,
     processing: DynamicsProcessingConfig,
     robot_states: Mapping[str, StateParamConfig],
-) -> tuple[float, int] | None:
-    if processing.enabled:
-        return (
-            float(processing.torque_lowpass_hz),
-            int(processing.torque_median_window),
-        )
-    param = robot_states.get("torque")
-    if param is None or not param.lowpass:
-        return None
-    return float(param.lowpass_cutoff_hz), int(param.median_window)
+) -> CausalFilterPipeline | OnePoleLowPass:
+    """Restore the matched measured-tau/RNEA chain for tau_f residuals."""
 
+    if metadata.dataloader_filters:
+        spec = metadata.dataloader_filters.get("tau") or {}
+        if not bool(spec.get("enabled", False)):
+            raise RuntimeError(
+                "tau_f checkpoint dataloader.filters.tau must be enabled"
+            )
+        return CausalFilterPipeline(spec["operations"])
 
-def _validate_tau_filter_contract(
-    metadata: SequenceCheckpointMetadata,
-    online_filter: tuple[float, int] | None,
-) -> None:
+    del processing, robot_states
     if not metadata.target_filter_enabled:
-        raise RuntimeError("tau_f checkpoint target_filter must be enabled")
+        raise RuntimeError(
+            "legacy tau_f checkpoint must define model.target_filter"
+        )
     cutoff_hz = metadata.target_filter_cutoff_hz
     median_window = metadata.target_filter_median_window
     if cutoff_hz is None or not np.isfinite(cutoff_hz) or cutoff_hz <= 0.0:
-        raise RuntimeError("tau_f checkpoint must define target_filter.cutoff_hz")
+        raise RuntimeError("legacy tau_f checkpoint target filter needs cutoff_hz")
     if median_window is None or median_window < 1 or median_window % 2 == 0:
         raise RuntimeError(
-            "tau_f checkpoint must define a positive odd target_filter.median_window"
+            "legacy tau_f checkpoint target filter needs an odd median_window"
         )
-    expected = (float(cutoff_hz), int(median_window))
-    if online_filter is None:
-        raise RuntimeError(
-            "online measured torque filtering must be enabled for the matched-filter "
-            "tau_f checkpoint"
-        )
-    if not np.isclose(online_filter[0], expected[0], rtol=0.0, atol=1.0e-12) or (
-        online_filter[1] != expected[1]
-    ):
-        raise RuntimeError(
-            f"online torque filter {online_filter} does not match tau_f checkpoint "
-            f"target filter {expected}"
-        )
+    return OnePoleLowPass(float(cutoff_hz), int(median_window))
+
+
+def _build_tau_target_filter(
+    metadata: SequenceCheckpointMetadata,
+) -> CausalFilterPipeline | CausalTrailingMovingAverage | CausalTrailingMedian | CausalWindowLowPass | OnePoleLowPass | None:
+    """Restore tau target preprocessing, preferring the unified new contract."""
+
+    if metadata.dataloader_filters:
+        spec = metadata.dataloader_filters.get("tau") or {}
+        if not bool(spec.get("enabled", False)):
+            return None
+        return CausalFilterPipeline(spec["operations"])
+    return _build_tau_next_target_filter(metadata)
 
 
 def _build_tau_next_target_filter(
     metadata: SequenceCheckpointMetadata,
-) -> CausalTrailingMedian | OnePoleLowPass | None:
+) -> (
+    CausalTrailingMovingAverage
+    | CausalTrailingMedian
+    | CausalWindowLowPass
+    | OnePoleLowPass
+    | None
+):
     """Replay tau_free target preprocessing on measured torque only.
 
     The shared measured-torque filter remains reserved for the tau_f matched
@@ -739,10 +1309,40 @@ def _build_tau_next_target_filter(
 
     if not metadata.target_filter_enabled:
         return None
+    moving_average_window = metadata.target_filter_moving_average_window
     median_window = metadata.target_filter_median_window
+    if moving_average_window is not None and median_window is not None:
+        raise RuntimeError(
+            "tau_next checkpoint target_filter must not define both "
+            "moving_average_window and median_window"
+        )
+    if moving_average_window is not None:
+        if moving_average_window < 1:
+            raise RuntimeError(
+                "tau_next checkpoint target_filter.moving_average_window "
+                "must be a positive integer"
+            )
+        if not metadata.target_filter_apply_additional_lowpass:
+            if moving_average_window == 1:
+                return None
+            return CausalTrailingMovingAverage(moving_average_window)
+
+        cutoff_hz = metadata.target_filter_cutoff_hz
+        if cutoff_hz is None or not np.isfinite(cutoff_hz) or cutoff_hz <= 0.0:
+            raise RuntimeError(
+                "tau_next checkpoint must define target_filter.cutoff_hz when "
+                "apply_additional_lowpass=true"
+            )
+        return CausalWindowLowPass(
+            "moving_average",
+            moving_average_window,
+            float(cutoff_hz),
+        )
+
     if median_window is None or median_window < 1 or median_window % 2 == 0:
         raise RuntimeError(
-            "tau_next checkpoint target_filter.median_window must be a positive odd integer"
+            "tau_next checkpoint target_filter must define either a positive "
+            "moving_average_window or a positive odd median_window"
         )
     if not metadata.target_filter_apply_additional_lowpass:
         if median_window == 1:
@@ -756,6 +1356,22 @@ def _build_tau_next_target_filter(
             "apply_additional_lowpass=true"
         )
     return OnePoleLowPass(float(cutoff_hz), median_window)
+
+
+def _build_tau_ext_post_filter(
+    config: TauExtFilterConfig,
+) -> CausalHampelButterworth | CausalWindowLowPass | None:
+    if not config.enabled:
+        return None
+    if config.mode == "hampel_butterworth":
+        return CausalHampelButterworth(
+            window=config.window,
+            n_sigma=config.hampel_n_sigma,
+            cutoff_hz=config.cutoff_hz,
+            sample_rate_hz=config.sample_rate_hz,
+            order=config.order,
+        )
+    return CausalWindowLowPass(config.mode, config.window, config.cutoff_hz)
 
 
 def _build_checkpoint_model(

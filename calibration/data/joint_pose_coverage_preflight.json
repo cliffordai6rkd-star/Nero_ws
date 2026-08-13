@@ -1,0 +1,47 @@
+{
+  "config_path": "/mnt/code/lcx/nero_ws/configs/joint_pose_coverage.yaml",
+  "config_sha256": "7d02c9e911ded6affdfd3348dc84717e616796432a2fef63d60c212b972ab234",
+  "format": "nero_free_space_preflight/v2",
+  "passed": true,
+  "sample_rate_hz": 50.0,
+  "trajectory": {
+    "contact_events": [],
+    "contact_samples_checked": 60000,
+    "duration_s": 1200.0,
+    "joint_candidate_count": 8192,
+    "joint_connection_step_rad": 0.35,
+    "joint_pose_count": 160,
+    "joint_transition_speed_scale": 0.65,
+    "name": "joint_pose_coverage_low_medium_hold",
+    "passed": true,
+    "planner": "joint_pose_coverage",
+    "reference_h5_path": "/mnt/code/lcx/nero_ws/runs/tau_refinement/episode_0000_20260806_144955.h5",
+    "reference_h5_sha256": "7ce61c73b13862160c6bde519e5ca61889d2f57c66f31c8fa52a27b92b64b085",
+    "samples": 60000,
+    "scene_path": "/mnt/code/lcx/nero_ws/calibration/data/joint_pose_coverage_low_medium_hold.scene.xml",
+    "segment_names": [
+      "joint_pose_transition",
+      "joint_pose_hold"
+    ],
+    "segment_sample_counts": [
+      41341,
+      18659
+    ],
+    "source_h5_paths": [],
+    "static_hold_s": 0.5,
+    "trajectory_path": "/mnt/code/lcx/nero_ws/calibration/data/joint_pose_coverage_low_medium_hold.npz",
+    "trajectory_sha256": "021e3da507f3985ffa30508b48267a8a633764ffd66e982e98f93cf44d86fdd1",
+    "workspace_convex_hull_volume_m3": 0.11623479459564547,
+    "workspace_max_m": [
+      0.12234665513320617,
+      0.42895540893292783,
+      0.7068287536125332
+    ],
+    "workspace_min_m": [
+      -0.48570744258973547,
+      -0.42118086669524185,
+      0.1424491737650162
+    ],
+    "workspace_violation_count": 0
+  }
+}

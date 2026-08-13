@@ -80,6 +80,7 @@ class RealtimePlotConfig:
 class SequenceCheckpointConfig:
     checkpoint_path: Path | None = None
     device: str = "cpu"
+    observation_sample_rate_hz: float | None = None
     horizon: int | None = None
     input_keys: tuple[str, ...] | None = None
     output_key: str | None = None
@@ -99,14 +100,19 @@ class CausalKalmanConfig:
 @dataclass(frozen=True)
 class TauExtFilterConfig:
     enabled: bool = True
-    mode: str = "moving_average"
-    window: int = 21
-    cutoff_hz: float = 20.0
+    mode: str = "hampel_butterworth"
+    window: int = 5
+    cutoff_hz: float = 8.0
+    hampel_n_sigma: float = 3.0
+    order: int = 4
+    sample_rate_hz: float = 100.0
 
 
 @dataclass(frozen=True)
 class TauExtInferenceConfig:
     enabled: bool = False
+    observation_gap_warning_s: float = 0.06
+    maximum_prediction_age_s: float = 0.06
     tau_f: SequenceCheckpointConfig = field(default_factory=SequenceCheckpointConfig)
     tau_next: SequenceCheckpointConfig = field(default_factory=SequenceCheckpointConfig)
     state_estimator: CausalKalmanConfig = field(default_factory=CausalKalmanConfig)
@@ -142,6 +148,7 @@ class ArmEndpointConfig:
     name: str
     can_id: int | None = None
     channel: str = "can0"
+    usb_serial: str | None = None
     interface: str = "socketcan"
     bitrate: int = 1_000_000
     firmware: str = "V120"
@@ -179,8 +186,8 @@ class BilateralMitConfig:
 
 @dataclass(frozen=True)
 class CommandConfig:
-    sample_rate_hz: float = 100.0
-    state_alignment_delay_s: float = 0.015
+    maximum_state_source_skew_s: float = 0.015
+    maximum_arm_pair_skew_s: float = 0.015
     maximum_can_frame_gap_s: float = 0.03
     control_watchdog_timeout_s: float = 0.05
     idle_rate_hz: float = 30.0
@@ -344,29 +351,31 @@ def _parse_command(data: dict[str, Any]) -> CommandConfig:
     reset_min_duration_s = float(data.get("reset_min_duration_s", 0.2))
     reset_max_step_rad = float(data.get("reset_max_step_rad", 0.05))
     control_mode = str(data.get("control_mode", "mit")).lower()
-    state_alignment_delay_s = float(data.get("state_alignment_delay_s", 0.015))
-    sample_rate_hz = float(data.get("sample_rate_hz", 100.0))
+    removed_timing = {"sample_rate_hz", "state_alignment_delay_s"}.intersection(data)
+    if removed_timing:
+        raise ValueError(
+            "fixed-grid teleop.command timing fields were removed: "
+            + ", ".join(sorted(removed_timing))
+        )
+    maximum_state_source_skew_s = float(
+        data.get("maximum_state_source_skew_s", 0.015)
+    )
+    maximum_arm_pair_skew_s = float(data.get("maximum_arm_pair_skew_s", 0.015))
     maximum_can_frame_gap_s = float(data.get("maximum_can_frame_gap_s", 0.03))
     control_watchdog_timeout_s = float(data.get("control_watchdog_timeout_s", 0.05))
     if control_mode not in {"mit", "position"}:
         raise ValueError("teleop.command.control_mode must be mit or position")
-    if not isfinite(state_alignment_delay_s) or state_alignment_delay_s <= 0:
-        raise ValueError("teleop.command.state_alignment_delay_s must be positive and finite")
-    if not isfinite(sample_rate_hz) or sample_rate_hz <= 0:
-        raise ValueError("teleop.command.sample_rate_hz must be positive and finite")
-    control_period_s = 1.0 / sample_rate_hz
-    if not isfinite(maximum_can_frame_gap_s) or maximum_can_frame_gap_s <= control_period_s:
+    if not isfinite(maximum_state_source_skew_s) or maximum_state_source_skew_s <= 0:
+        raise ValueError("teleop.command.maximum_state_source_skew_s must be positive and finite")
+    if not isfinite(maximum_arm_pair_skew_s) or maximum_arm_pair_skew_s <= 0:
+        raise ValueError("teleop.command.maximum_arm_pair_skew_s must be positive and finite")
+    if not isfinite(maximum_can_frame_gap_s) or maximum_can_frame_gap_s <= 0:
         raise ValueError(
-            "teleop.command.maximum_can_frame_gap_s must be finite and greater "
-            "than one control period"
+            "teleop.command.maximum_can_frame_gap_s must be positive and finite"
         )
-    if (
-        not isfinite(control_watchdog_timeout_s)
-        or control_watchdog_timeout_s <= control_period_s
-    ):
+    if not isfinite(control_watchdog_timeout_s) or control_watchdog_timeout_s <= 0:
         raise ValueError(
-            "teleop.command.control_watchdog_timeout_s must be finite and greater "
-            "than one control period"
+            "teleop.command.control_watchdog_timeout_s must be positive and finite"
         )
     if role_switch_settle_s < 0:
         raise ValueError("teleop.command.role_switch_settle_s must be non-negative")
@@ -381,8 +390,8 @@ def _parse_command(data: dict[str, Any]) -> CommandConfig:
     if reset_max_step_rad <= 0:
         raise ValueError("teleop.command.reset_max_step_rad must be positive")
     return CommandConfig(
-        sample_rate_hz=sample_rate_hz,
-        state_alignment_delay_s=state_alignment_delay_s,
+        maximum_state_source_skew_s=maximum_state_source_skew_s,
+        maximum_arm_pair_skew_s=maximum_arm_pair_skew_s,
         maximum_can_frame_gap_s=maximum_can_frame_gap_s,
         control_watchdog_timeout_s=control_watchdog_timeout_s,
         idle_rate_hz=float(data.get("idle_rate_hz", 30.0)),
@@ -786,8 +795,21 @@ def _parse_tau_ext_inference(
         data = {}
     if not isinstance(data, dict):
         raise ValueError("tau_ext_inference must be a mapping")
+    removed = {
+        "observation_interval_s",
+        "observation_stride_frames",
+        "observation_sample_rate_hz",
+    }.intersection(data)
+    if removed:
+        raise ValueError(
+            "global model observation selection was removed; configure each "
+            "checkpoint branch's observation_sample_rate_hz instead: "
+            + ", ".join(sorted(removed))
+        )
     unknown = set(data) - {
         "enabled",
+        "observation_gap_warning_s",
+        "maximum_prediction_age_s",
         "tau_f",
         "tau_next",
         "state_estimator",
@@ -799,6 +821,14 @@ def _parse_tau_ext_inference(
         )
 
     enabled = bool(data.get("enabled", False))
+    observation_gap_warning_s = float(data.get("observation_gap_warning_s", 0.06))
+    maximum_prediction_age_s = float(data.get("maximum_prediction_age_s", 0.06))
+    for name, value in (
+        ("observation_gap_warning_s", observation_gap_warning_s),
+        ("maximum_prediction_age_s", maximum_prediction_age_s),
+    ):
+        if not isfinite(value) or value <= 0:
+            raise ValueError(f"tau_ext_inference.{name} must be positive and finite")
     tau_f = _parse_sequence_checkpoint(
         data.get("tau_f", {}),
         "tau_ext_inference.tau_f",
@@ -814,19 +844,10 @@ def _parse_tau_ext_inference(
         "tau_ext_inference.state_estimator",
     )
     tau_ext_filter = _parse_tau_ext_filter(data.get("tau_ext_filter", {}))
-    if enabled:
-        missing = [
-            name
-            for name, model in (("tau_f", tau_f), ("tau_next", tau_next))
-            if model.checkpoint_path is None
-        ]
-        if missing:
-            raise ValueError(
-                "tau_ext_inference requires both checkpoint paths when enabled; "
-                f"missing={missing}"
-            )
     return TauExtInferenceConfig(
         enabled=enabled,
+        observation_gap_warning_s=observation_gap_warning_s,
+        maximum_prediction_age_s=maximum_prediction_age_s,
         tau_f=tau_f,
         tau_next=tau_next,
         state_estimator=state_estimator,
@@ -839,7 +860,15 @@ def _parse_tau_ext_filter(data: dict[str, Any]) -> TauExtFilterConfig:
         data = {}
     if not isinstance(data, dict):
         raise ValueError("tau_ext_inference.tau_ext_filter must be a mapping")
-    allowed = {"enabled", "mode", "window", "cutoff_hz"}
+    allowed = {
+        "enabled",
+        "mode",
+        "window",
+        "cutoff_hz",
+        "hampel_n_sigma",
+        "order",
+        "sample_rate_hz",
+    }
     unknown = set(data) - allowed
     if unknown:
         raise ValueError(
@@ -847,28 +876,53 @@ def _parse_tau_ext_filter(data: dict[str, Any]) -> TauExtFilterConfig:
             f"{sorted(unknown)}"
         )
     enabled = bool(data.get("enabled", True))
-    mode = str(data.get("mode", "moving_average")).strip().lower()
-    if mode not in {"moving_average", "median"}:
+    mode = str(data.get("mode", "hampel_butterworth")).strip().lower()
+    if mode not in {"hampel_butterworth", "moving_average", "median"}:
         raise ValueError(
-            "tau_ext_inference.tau_ext_filter.mode must be moving_average or median"
+            "tau_ext_inference.tau_ext_filter.mode must be "
+            "hampel_butterworth, moving_average, or median"
         )
-    window = int(data.get("window", 21))
+    window = int(data.get("window", 5))
     if window < 1:
         raise ValueError("tau_ext_inference.tau_ext_filter.window must be positive")
-    if mode == "median" and window % 2 == 0:
+    if mode in {"hampel_butterworth", "median"} and window % 2 == 0:
         raise ValueError(
-            "tau_ext_inference.tau_ext_filter.window must be odd in median mode"
+            "tau_ext_inference.tau_ext_filter.window must be odd in "
+            "hampel_butterworth or median mode"
         )
-    cutoff_hz = float(data.get("cutoff_hz", 20.0))
+    cutoff_hz = float(data.get("cutoff_hz", 8.0))
     if not isfinite(cutoff_hz) or cutoff_hz <= 0.0:
         raise ValueError(
             "tau_ext_inference.tau_ext_filter.cutoff_hz must be positive and finite"
+        )
+    hampel_n_sigma = float(data.get("hampel_n_sigma", 3.0))
+    if not isfinite(hampel_n_sigma) or hampel_n_sigma <= 0.0:
+        raise ValueError(
+            "tau_ext_inference.tau_ext_filter.hampel_n_sigma must be positive "
+            "and finite"
+        )
+    order = int(data.get("order", 4))
+    if order < 1:
+        raise ValueError("tau_ext_inference.tau_ext_filter.order must be positive")
+    sample_rate_hz = float(data.get("sample_rate_hz", 100.0))
+    if not isfinite(sample_rate_hz) or sample_rate_hz <= 0.0:
+        raise ValueError(
+            "tau_ext_inference.tau_ext_filter.sample_rate_hz must be positive "
+            "and finite"
+        )
+    if mode == "hampel_butterworth" and cutoff_hz >= 0.5 * sample_rate_hz:
+        raise ValueError(
+            "tau_ext_inference.tau_ext_filter.cutoff_hz must be below the "
+            "Nyquist frequency"
         )
     return TauExtFilterConfig(
         enabled=enabled,
         mode=mode,
         window=window,
         cutoff_hz=cutoff_hz,
+        hampel_n_sigma=hampel_n_sigma,
+        order=order,
+        sample_rate_hz=sample_rate_hz,
     )
 
 
@@ -881,7 +935,14 @@ def _parse_sequence_checkpoint(
         data = {}
     if not isinstance(data, dict):
         raise ValueError(f"{name} must be a mapping")
-    allowed = {"checkpoint_path", "device", "horizon", "input_keys", "output_key"}
+    allowed = {
+        "checkpoint_path",
+        "device",
+        "observation_sample_rate_hz",
+        "horizon",
+        "input_keys",
+        "output_key",
+    }
     unknown = set(data) - allowed
     if unknown:
         raise ValueError(f"{name} contains unknown options: {sorted(unknown)}")
@@ -903,6 +964,21 @@ def _parse_sequence_checkpoint(
     device = str(data.get("device", "cpu")).strip()
     if not device:
         raise ValueError(f"{name}.device must not be empty")
+    sample_rate_value = data.get("observation_sample_rate_hz")
+    if isinstance(sample_rate_value, bool):
+        raise ValueError(
+            f"{name}.observation_sample_rate_hz must be positive and finite"
+        )
+    observation_sample_rate_hz = (
+        None if sample_rate_value is None else float(sample_rate_value)
+    )
+    if observation_sample_rate_hz is not None and (
+        not isfinite(observation_sample_rate_hz)
+        or observation_sample_rate_hz <= 0.0
+    ):
+        raise ValueError(
+            f"{name}.observation_sample_rate_hz must be positive and finite"
+        )
     horizon_value = data.get("horizon")
     horizon = None if horizon_value is None else int(horizon_value)
     if horizon is not None and horizon <= 0:
@@ -927,6 +1003,7 @@ def _parse_sequence_checkpoint(
     return SequenceCheckpointConfig(
         checkpoint_path=checkpoint_path,
         device=device,
+        observation_sample_rate_hz=observation_sample_rate_hz,
         horizon=horizon,
         input_keys=input_keys,
         output_key=output_key,
@@ -989,6 +1066,7 @@ def _parse_arm_endpoint(data: dict[str, Any], default_name: str) -> ArmEndpointC
         "can_id",
         "id",
         "channel",
+        "usb_serial",
         "interface",
         "bitrate",
         "firmware",
@@ -1004,6 +1082,11 @@ def _parse_arm_endpoint(data: dict[str, Any], default_name: str) -> ArmEndpointC
         name=str(data.get("name", default_name)),
         can_id=int(can_id) if can_id is not None else None,
         channel=str(data.get("channel", "can0")),
+        usb_serial=(
+            str(data["usb_serial"]).strip()
+            if data.get("usb_serial") is not None
+            else None
+        ),
         interface=str(data.get("interface", "socketcan")),
         bitrate=int(data.get("bitrate", 1_000_000)),
         firmware=str(data.get("firmware", "V120")),

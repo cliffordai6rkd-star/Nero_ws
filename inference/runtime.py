@@ -118,10 +118,6 @@ class NeroInferenceRuntime:
             continuous_state_stream = collection.teleop.backend != "mock"
         self._continuous_state_stream_enabled = bool(continuous_state_stream)
         self._last_consumed_state_timestamp_us = 0
-        sample_rate_hz = float(collection.teleop.command.sample_rate_hz)
-        self._state_sample_period_us = int(
-            round(1.0e6 / sample_rate_hz)
-        ) if np.isfinite(sample_rate_hz) and sample_rate_hz > 0.0 else 10_000
         self._last_state_stream_rollover_count = 0
         self._q_cmd_lock = threading.Lock()
         self._q_cmd_history: deque[tuple[int, np.ndarray]] = deque(maxlen=4096)
@@ -401,10 +397,8 @@ class NeroInferenceRuntime:
         dq_state = self.collection.robot_states["velocity"]
         ddq_state = self.collection.robot_states["acceleration"]
         command = self.collection.teleop.command
-        self.arm.configure_state_alignment(
-            command.state_alignment_delay_s,
-            command.sample_rate_hz,
-            q_state.mean_window,
+        self.arm.configure_state_capture(
+            command.maximum_state_source_skew_s,
             q_state.lowpass_cutoff_hz if q_state.lowpass else None,
             dq_state.lowpass_cutoff_hz if dq_state.lowpass else None,
             ddq_state.lowpass_cutoff_hz if ddq_state.lowpass else None,
@@ -705,9 +699,8 @@ class NeroInferenceRuntime:
             history_gap_us = (
                 records[0].timestamp_us - self._last_consumed_state_timestamp_us
             )
-            allowed_gap_us = max(
-                100_000,
-                8 * max(self._state_sample_period_us, 1),
+            allowed_gap_us = int(
+                round(self.collection.teleop.command.maximum_can_frame_gap_s * 1e6)
             )
             if history_gap_us > allowed_gap_us:
                 raise RuntimeError(

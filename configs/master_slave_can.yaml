@@ -3,28 +3,29 @@ teleop:
   protocol: can
   backend: pyagxarm
   command:
-    sample_rate_hz: 100.0
-    # CAN 任一状态流超过 30 ms 未更新，禁止继续计算 dq/ddq 和力反馈。
-    maximum_can_frame_gap_s: 0.06
+    # CAN 任一状态流超过 30 ms 未更新，禁止继续使用缓存状态或推进模型。
+    maximum_can_frame_gap_s: 0.03
+    # 完整机械臂状态内 q 组和 7 路电机源时间戳的最大跨度。
+    maximum_state_source_skew_s: 0.015
+    # 主从臂真实状态配对时允许的最大时间差。
+    maximum_arm_pair_skew_s: 0.015
     # 双边控制周期超过 50 ms 时，在下一次命令下发前触发紧急复位。
     control_watchdog_timeout_s: 0.05
-    # 主时间线对齐延迟；状态滤波参数统一配置在 robot_states 下。
-    state_alignment_delay_s: 0.015
     # 只切换从臂下发方式；主臂始终使用 MIT 重力补偿和力反馈。
-    control_mode: mit  # mit 或 position
+    control_mode: mit
     bilateral_mit:
       # 主臂拖动阻尼；主臂 kp 固定使用代码默认值 0。
       leader_kd: [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]
-      # 仅 control_mode=mit 时用于从臂镜像跟踪。
-      follower_kp: [1.0, 1.0, 2.0, 4.0, 1.0, 1.0, 8.0]  # q
-      follower_kd: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]  # v
+      # 下面的两个值尽量都不要修改，比较危险  并且改了的话需要重新采背景力矩数据   因为这些值会改变动力学系统
+      follower_kp: [1.0, 1.0, 2.0, 4.0, 1.0, 1.0, 8.0]   # q
+      follower_kd: [0.1, 0.1, 0.25, 0.5, 0.1, 0.1, 0.5]  # v
       # 首次实机逐轴确认 sign，再逐步增加 gain/limit。
-      # force_feedback_gain: [1, 1, 1, 1, 1, 1, 1]
-      force_feedback_gain: [0, 0, 0, 0, 0, 0, 0]
+      force_feedback_gain: [1, 1, 1, 1, 1, 1, 1]
+      # force_feedback_gain: [0, 0, 0, 0, 0, 0, 0]
       force_feedback_sign: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
       force_feedback_deadband_nm: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
       # force_feedback_limit_nm: [5, 5, 5, 5, 5, 5, 5]
-      force_feedback_limit_nm: [5, 5, 5, 5, 5, 5, 5]
+      force_feedback_limit_nm: [5, 10, 10, 10, 10, 10, 10]
       force_feedback_lowpass_hz: 10.0
     joint_step_limit_rad: 0.3
     reset_on_start: true
@@ -34,44 +35,46 @@ teleop:
       - name: main
         leader:
           name: master_arm
-          channel: can0
+          # Stable binding: this adapter is physically wired to the master arm.
+          channel: can_master
+          usb_serial: "004300304148570D20343133"
           interface: socketcan
           bitrate: 1000000
           firmware: V120
           # 主臂始终使用固件 follower/CAN 模式；软件 MIT 实现重力补偿拖动和力反馈。
         follower:
           name: slave_arm
-          channel: can1
+          # Stable binding: this adapter is physically wired to the slave arm.
+          channel: can_slave
+          usb_serial: "004400424148570A20343133"
           interface: socketcan
           bitrate: 1000000
           firmware: V120
-          rest_q: [+0.00000, -0.14689, -0.01138, +1.80020, -0.02033, +0.02744, +1.50378]
+          # +0.00000, -0.14689, -0.01138, +1.80020, -0.02033, +0.02744, +1.50378
+          rest_q: [+0.00000, +0.000, +0.0000, +1.80020, -0.000, +0.000, +1.50378]
 output:
   # directory: ../runs/insert_usb
-  directory: ../runs/test
+  # directory: ../runs/next_data
+  # 新事件驱动底层的数据与旧固定网格数据分目录保存。
+  directory: ../runs/next_human_data
   prefix: episode
   # 每个 episode 开始后先运行控制和滤波，但不保存或可视化这段数据。
-  discard_initial_s: 0.2
+  discard_initial_s: 1.2
 
-# 两个模型在同一个对齐时刻共享 [q, dq, q_cmd-q]，各自维护 50 帧固定窗口。
-# episode 开始后先采满 50 个真实样本；预热期间不执行模型前向，力反馈保持为零。
-# checkpoint_path 可指向具体 .pt 或 checkpoints 目录；目录会选择最低 val_loss。
+# 数采仍保存全部真实 CAN 对齐帧；每个已配置模型独立按训练频率取样推理。
 tau_ext_inference:
   enabled: true
+  # 相邻被选模型观测超过该间隔时只记录警告；模型仍使用历史 49 帧 + 当前 1 帧。
+  observation_gap_warning_s: 0.06
+  maximum_prediction_age_s: 0.06
+  # checkpoint_path 为空时不加载、不调用该分支；两个分支都为空时完全不运行在线推理。
   tau_f:
-    # This path intentionally targets the matched-filter label contract. Old
-    # tau_f checkpoints are rejected by runtime metadata validation.
-    checkpoint_path: model/epoch_234_val_loss_0.016139.pt
-    device: cpu
-    horizon: 50
-    input_keys: [q, dq, delta_q]
-    output_key: tau_f
+    checkpoint_path: null
+    observation_sample_rate_hz: 100.0
   tau_next:
-    checkpoint_path: model/epoch_185_val_tau_mse_nm2_0.004962.pt
-    device: cpu
-    horizon: 50
-    input_keys: [q, dq, delta_q]
-    output_key: tau
+    checkpoint_path: model/tau_free/epoch_095_val_tau_mse_nm2_0.006872.pt
+    # Unix epoch 固定相位；每个 20 ms tick 只用 tick 前最新完整帧推进 tau-free。
+    observation_sample_rate_hz: 50.0
   # 与 PINN offline_tau_labels 的 forward Kalman 参数一致；RTS 仅用于离线标签。
   state_estimator:
     position_std: 5.0e-4
@@ -82,15 +85,23 @@ tau_ext_inference:
     initial_acceleration_std: 5.0
     max_gap_s: 0.1
   # 与 PINN 数据推理一致：tau_ext 只在残差生成后处理一次。
-  # 先做 21 点因果滑动均值，再做 20 Hz 一阶因果低通；原始残差另存为 *_raw。
+  # 先用 5 点因果 Hampel 去除离群值，再做 4 阶 8 Hz 因果 Butterworth；
+  # 原始残差另存为 *_raw；该滤波器只作用于模型选择后的真实观测序列。
   tau_ext_filter:
     enabled: true
+    # mode: hampel_butterworth
+    # window: 5
+    # hampel_n_sigma: 3.0
+    # cutoff_hz: 8.0
+    # order: 4
+    # sample_rate_hz: 100.0
     mode: moving_average
-    window: 21
-    cutoff_hz: 20.0
+    window: 40
+    cutoff_hz: 10.0
 
 # 左列显示 tau_ext_cal/tau_ext_pred，右列显示 wrench_cal/wrench_pred。
 realtime_plot:
+  # 当前图中预测量依赖 PINN/NEXT；新模型可用前必须关闭。
   enabled: true
   window_s: 20.0
   update_rate_hz: 20.0
@@ -102,7 +113,7 @@ realtime_plot:
   wrench_mapping:
     frame_name: gripper_tcp
     reference_frame: local
-    damping: 0.02
+    damping: 0.01
 
 # cameras:
 #   - name: side
@@ -116,7 +127,7 @@ realtime_plot:
 #     frame_timeout_s: 0.5
 #     width: 640
 #     height: 480
-#     fps: 25
+#     fps: 30
 #     exposure: 400
 #     # 保持自动曝光，但禁止相机通过延长曝光主动降低采集帧率。
 #     exposure_dynamic_framerate: false
@@ -154,29 +165,22 @@ gripper:
   min_width_m: 0.0
   max_width_m: 0.1
   force_n: 1.0
-  command_rate_hz: 30.0
+  command_rate_hz: 50.0
   deadband_m: 0.0005
   keepalive_s: 0.5
 
 robot_states:
   q:
     enabled: true
-    # q 保存原始观测值；mean_window/lowpass 为兼容字段，不参与在线 dq/ddq 计算。
-    mean_window: 1
-    lowpass: true
-    lowpass_cutoff_hz: 10.0
+    lowpass: false
 
   velocity:
     enabled: true
-    lowpass: true
-    lowpass_cutoff_hz: 6.0
+    lowpass: false
 
   acceleration:
-    enabled: true
-    lowpass: true
-    lowpass_cutoff_hz: 3.0
-
-
+    enabled: false
+    lowpass: false
 
   ee_pose:
     enabled: true
@@ -184,31 +188,19 @@ robot_states:
 
   torque:
     enabled: true
-    # measured tau 的唯一源端滤波：10 Hz 因果一阶 IIR；tau_ext_filter 从其残差
-    # 输出继续处理，不会再次调用这一级 source filter。
-    lowpass: true
-    lowpass_cutoff_hz: 10
-    median_window: 1
+    lowpass: false
 
   tau_id:
-    enabled: true
-    # Raw RNEA output retained for diagnostics.
+    enabled: false
     lowpass: false
-    lowpass_cutoff_hz: 10
-    median_window: 1
 
   tau_id_filtered:
-    enabled: true
-    # Already filtered inside tau_ext_inference with the torque checkpoint contract.
+    enabled: false
     lowpass: false
-    lowpass_cutoff_hz: 10
-    median_window: 1
 
   current:
-    enabled: true
+    enabled: false
     lowpass: false
-    lowpass_cutoff_hz: 8
-    median_window: 1
 
 
 
@@ -218,7 +210,7 @@ robot_states:
 
 
 
-# q 保存原始值；dq 使用 V120 motor_state velocity，ddq 仅由滤波后 dq 的一阶导得到。
+# q/dq/ddq/tau 均按对齐后的原始值保存；训练滤波只由 checkpoint 配置定义。
 dynamics_processing:
   enabled: false
   state_method: finite_difference
@@ -226,6 +218,4 @@ dynamics_processing:
   spline_smoothing_rad2: 1.0e-5
   fourier_fundamental_hz: 0.1
   fourier_harmonics: 8
-  torque_lowpass_hz: 12.0
-  torque_median_window: 3
   min_samples: 3

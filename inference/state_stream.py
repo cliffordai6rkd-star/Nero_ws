@@ -270,6 +270,7 @@ class ContinuousInferenceStateStream:
                     timestamp_us,
                     acquired_timestamp_us,
                     tau_result,
+                    state.ddq,
                 )
             )
             self._last_timestamp_us = timestamp_us
@@ -280,6 +281,7 @@ class ContinuousInferenceStateStream:
         timestamp_us: int,
         acquired_timestamp_us: int,
         tau_result: OnlineTauExtResult,
+        ddq: np.ndarray,
     ) -> ContinuousInferenceSample:
         wrench_estimate = self.wrench_estimator.map_joint_torque(
             tau_result.q,
@@ -333,7 +335,7 @@ class ContinuousInferenceStateStream:
             acquired_timestamp_us=acquired_timestamp_us,
             q=np.asarray(tau_result.q, dtype=np.float64).copy(),
             dq=np.asarray(tau_result.dq, dtype=np.float64).copy(),
-            ddq=np.asarray(tau_result.ddq_kf_causal, dtype=np.float64).copy(),
+            ddq=np.asarray(ddq, dtype=np.float64).copy(),
             tau=np.asarray(tau_result.tau, dtype=np.float64).copy(),
             tau_result=tau_result,
             raw_wrench=raw_wrench.copy(),

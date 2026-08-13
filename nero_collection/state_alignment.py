@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+import logging
 from threading import Lock
 
 import numpy as np
 
 from nero_collection.filters import OnePoleLowPass
+
+
+log = logging.getLogger(__name__)
 
 
 class StateTimingError(RuntimeError):
@@ -62,16 +66,21 @@ class _JointGroupDerivativeState:
     previous_dq_filtered: np.ndarray | None = None
 
 
-class DelayedStateTimeline:
-    """Build filtered joint-group derivatives, then sample a delayed timeline."""
+class CanStateAssembler:
+    """Assemble complete arm states on the real CAN source timeline.
+
+    A state is finalized when every required source has reached a new watermark.
+    The watermark is itself one of the source timestamps; no periodic timestamp is
+    synthesized. Each source contributes its nearest real observation and the
+    complete frame is rejected when its source skew exceeds the configured limit.
+    """
 
     def __init__(
         self,
         *,
         dof: int,
         q_groups: tuple[tuple[str, tuple[int, ...]], ...],
-        delay_s: float,
-        output_rate_hz: float,
+        maximum_source_skew_s: float,
         q_mean_window_samples: int = 5,
         q_lowpass_cutoff_hz: float | None = 10.0,
         dq_lowpass_cutoff_hz: float | None = 6.0,
@@ -81,23 +90,20 @@ class DelayedStateTimeline:
     ) -> None:
         self.dof = int(dof)
         self.q_groups = q_groups
-        self.delay_us = int(round(float(delay_s) * 1_000_000.0))
-        self.output_rate_hz = float(output_rate_hz)
+        self.maximum_source_skew_us = int(
+            round(float(maximum_source_skew_s) * 1_000_000.0)
+        )
         if self.dof <= 0:
             raise ValueError("state timeline dof must be positive")
-        if self.delay_us <= 0:
-            raise ValueError("state alignment delay must be positive")
-        if not np.isfinite(self.output_rate_hz) or self.output_rate_hz <= 0:
-            raise ValueError("state timeline output rate must be positive and finite")
+        if self.maximum_source_skew_us <= 0:
+            raise ValueError("maximum state source skew must be positive")
         if not np.isfinite(maximum_input_gap_s) or maximum_input_gap_s <= 0:
             raise ValueError("maximum input gap must be positive and finite")
         self.maximum_input_gap_us = int(round(maximum_input_gap_s * 1_000_000.0))
         configured_q_mean_window = int(q_mean_window_samples)
         if configured_q_mean_window <= 0:
             raise ValueError("q-mean window must be a positive integer")
-        # Keep accepting the old configuration field, but do not use a sliding
-        # q mean in the production derivative path.
-        self.q_mean_window_samples = 1
+        self.q_mean_window_samples = configured_q_mean_window
         covered = sorted(index for _, indices in q_groups for index in indices)
         if covered != list(range(self.dof)):
             raise ValueError(f"q groups must cover joints 0..{self.dof - 1}; got {covered}")
@@ -125,9 +131,10 @@ class DelayedStateTimeline:
         ]
         self._motor_previous_timestamp_us: list[int | None] = [None] * self.dof
         self._motor_previous_dq: list[float | None] = [None] * self.dof
-        self._last_aligned_sample: AlignedArmSample | None = None
-        output_period_us = int(np.ceil(1_000_000.0 / self.output_rate_hz))
-        self._max_nearest_age_us = max(self.delay_us, 2 * output_period_us)
+        self._completed: deque[AlignedArmSample] = deque()
+        self._last_watermark_us = 0
+        self._consumed_q_timestamp_us = {name: 0 for name, _ in self.q_groups}
+        self._consumed_motor_timestamp_us = [0] * self.dof
         self._lock = Lock()
 
     def append_q_group(self, name: str, timestamp_us: int, value: np.ndarray) -> None:
@@ -149,6 +156,7 @@ class DelayedStateTimeline:
             if state is None:
                 return
             _append_joint_state(self._q_state_history[name], state)
+            self._finalize_available_locked()
 
     def append_motor(
         self,
@@ -211,9 +219,37 @@ class DelayedStateTimeline:
                     current=float(current),
                 )
             )
+            self._finalize_available_locked()
 
-    def aligned_sample(self, now_timestamp_us: int) -> AlignedArmSample | None:
-        target_us = self._target_timestamp_us(int(now_timestamp_us))
+    def drain_completed(self) -> tuple[AlignedArmSample, ...]:
+        with self._lock:
+            samples = tuple(self._completed)
+            self._completed.clear()
+            return samples
+
+    def _finalize_available_locked(self) -> None:
+        histories = list(self._q_state_history.values()) + self._motor_history
+        if any(not history for history in histories):
+            return
+        if any(
+            history[-1].timestamp_us <= self._consumed_q_timestamp_us[name]
+            for name, history in self._q_state_history.items()
+        ) or any(
+            history[-1].timestamp_us <= self._consumed_motor_timestamp_us[index]
+            for index, history in enumerate(self._motor_history)
+        ):
+            return
+        watermark_us = min(history[-1].timestamp_us for history in histories)
+        if watermark_us <= self._last_watermark_us:
+            return
+        sample = self._assemble_locked(watermark_us)
+        if sample is None:
+            return
+        self._completed.append(sample)
+        self._last_watermark_us = watermark_us
+        self._discard_consumed_locked(sample)
+
+    def _assemble_locked(self, watermark_us: int) -> AlignedArmSample | None:
         q = np.empty(self.dof, dtype=np.float64)
         dq = np.empty(self.dof, dtype=np.float64)
         ddq = np.empty(self.dof, dtype=np.float64)
@@ -221,44 +257,103 @@ class DelayedStateTimeline:
         current = np.empty(self.dof, dtype=np.float64)
         q_source_timestamp_us = np.empty(self.dof, dtype=np.int64)
         motor_source_timestamp_us = np.empty(self.dof, dtype=np.int64)
-        with self._lock:
-            if (
-                self._last_aligned_sample is not None
-                and self._last_aligned_sample.timestamp_us == target_us
-            ):
-                return self._last_aligned_sample
-            for name, indices in self.q_groups:
-                state = _nearest(self._q_state_history[name], target_us)
-                if state is None or abs(state.timestamp_us - target_us) > self._max_nearest_age_us:
-                    return None
-                joint_indices = list(indices)
-                q[joint_indices] = state.q
-                q_source_timestamp_us[joint_indices] = state.timestamp_us
-            for joint_index, history in enumerate(self._motor_history):
-                motor = _nearest(history, target_us)
-                if motor is None or abs(motor.timestamp_us - target_us) > self._max_nearest_age_us:
-                    return None
-                dq[joint_index] = motor.velocity
-                ddq[joint_index] = motor.ddq
-                torque[joint_index] = motor.torque
-                current[joint_index] = motor.current
-                motor_source_timestamp_us[joint_index] = motor.timestamp_us
-            self._last_aligned_sample = AlignedArmSample(
-                timestamp_us=target_us,
-                q=q,
-                dq=dq,
-                ddq=ddq,
-                torque=torque,
-                current=current,
-                q_source_timestamp_us=q_source_timestamp_us,
-                motor_source_timestamp_us=motor_source_timestamp_us,
+        for name, indices in self.q_groups:
+            state = _nearest(
+                self._q_state_history[name],
+                watermark_us,
             )
-            return self._last_aligned_sample
+            if state is None:
+                return None
+            joint_indices = list(indices)
+            q[joint_indices] = state.q
+            q_source_timestamp_us[joint_indices] = state.timestamp_us
+        for joint_index, history in enumerate(self._motor_history):
+            motor = _nearest(
+                history,
+                watermark_us,
+            )
+            if motor is None:
+                return None
+            dq[joint_index] = motor.velocity
+            ddq[joint_index] = motor.ddq
+            torque[joint_index] = motor.torque
+            current[joint_index] = motor.current
+            motor_source_timestamp_us[joint_index] = motor.timestamp_us
+        source_timestamps = np.concatenate(
+            (q_source_timestamp_us, motor_source_timestamp_us)
+        )
+        source_skew_us = int(np.max(source_timestamps) - np.min(source_timestamps))
+        if source_skew_us > self.maximum_source_skew_us:
+            # This candidate is incomplete in time, but the CAN stream itself is
+            # still healthy. Retire only its oldest source observation so a
+            # later real observation can form the next complete state.
+            oldest_source_timestamp_us = int(np.min(source_timestamps))
+            self._discard_oldest_sources_locked(
+                q_source_timestamp_us,
+                motor_source_timestamp_us,
+                oldest_source_timestamp_us,
+            )
+            log.warning(
+                "rejected complete CAN state candidate due to source skew: "
+                "watermark=%d skew=%.3fms limit=%.3fms oldest_source=%d",
+                watermark_us,
+                source_skew_us * 1e-3,
+                self.maximum_source_skew_us * 1e-3,
+                oldest_source_timestamp_us,
+            )
+            return None
+        return AlignedArmSample(
+            timestamp_us=watermark_us,
+            q=q,
+            dq=dq,
+            ddq=ddq,
+            torque=torque,
+            current=current,
+            q_source_timestamp_us=q_source_timestamp_us,
+            motor_source_timestamp_us=motor_source_timestamp_us,
+        )
 
-    def _target_timestamp_us(self, now_timestamp_us: int) -> int:
-        delayed_us = now_timestamp_us - self.delay_us
-        index = int(np.floor(delayed_us * self.output_rate_hz / 1_000_000.0))
-        return int(round(index * 1_000_000.0 / self.output_rate_hz))
+    def _discard_consumed_locked(self, sample: AlignedArmSample) -> None:
+        for name, indices in self.q_groups:
+            selected_us = int(sample.q_source_timestamp_us[indices[0]])
+            self._consumed_q_timestamp_us[name] = selected_us
+            history = self._q_state_history[name]
+            # A physical source observation may contribute to at most one
+            # complete state.  Remove the selected sample itself as well as
+            # anything older so nearest matching cannot silently reuse it.
+            while history and history[0].timestamp_us <= selected_us:
+                history.popleft()
+        for index, history in enumerate(self._motor_history):
+            selected_us = int(sample.motor_source_timestamp_us[index])
+            self._consumed_motor_timestamp_us[index] = selected_us
+            while history and history[0].timestamp_us <= selected_us:
+                history.popleft()
+
+    def _discard_oldest_sources_locked(
+        self,
+        q_source_timestamp_us: np.ndarray,
+        motor_source_timestamp_us: np.ndarray,
+        oldest_source_timestamp_us: int,
+    ) -> None:
+        for name, indices in self.q_groups:
+            selected_us = int(q_source_timestamp_us[indices[0]])
+            if selected_us != oldest_source_timestamp_us:
+                continue
+            self._consumed_q_timestamp_us[name] = max(
+                self._consumed_q_timestamp_us[name], selected_us
+            )
+            history = self._q_state_history[name]
+            while history and history[0].timestamp_us <= selected_us:
+                history.popleft()
+        for index, history in enumerate(self._motor_history):
+            selected_us = int(motor_source_timestamp_us[index])
+            if selected_us != oldest_source_timestamp_us:
+                continue
+            self._consumed_motor_timestamp_us[index] = max(
+                self._consumed_motor_timestamp_us[index], selected_us
+            )
+            while history and history[0].timestamp_us <= selected_us:
+                history.popleft()
 
 
 def _append_sample(
@@ -401,16 +496,30 @@ def _apply_lowpass(
     return filt.apply(value, timestamp_us) if filt is not None else value.copy()
 
 
-def _nearest(history: deque, target_us: int):
+def _nearest(
+    history: deque,
+    target_us: int,
+    *,
+    maximum_timestamp_us: int | None = None,
+):
     if not history:
         return None
-    nearest = history[0]
-    nearest_distance = abs(nearest.timestamp_us - target_us)
+    nearest = None
+    nearest_distance = None
     for sample in history:
-        distance = abs(sample.timestamp_us - target_us)
-        if distance > nearest_distance and sample.timestamp_us > target_us:
+        if (
+            maximum_timestamp_us is not None
+            and sample.timestamp_us > maximum_timestamp_us
+        ):
             break
-        if distance < nearest_distance:
+        distance = abs(sample.timestamp_us - target_us)
+        if (
+            nearest_distance is not None
+            and distance > nearest_distance
+            and sample.timestamp_us > target_us
+        ):
+            break
+        if nearest_distance is None or distance < nearest_distance:
             nearest = sample
             nearest_distance = distance
     return nearest
