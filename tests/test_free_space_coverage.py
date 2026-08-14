@@ -2,20 +2,24 @@ from __future__ import annotations
 
 from dataclasses import replace
 from importlib.util import find_spec
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import yaml
+import h5py
 
 from calibration.free_space_cli import (
     FREE_SPACE_EPISODE_MAX_SAMPLES,
     _SampleTiming,
     _check_measurement,
+    _execute_trajectory,
     _format_sample_timing,
     _format_timing_diagnostics,
     _verify_hardware_preflight,
+    _wait_for_static_stability,
 )
 from calibration.free_space_coverage import (
     JOINT_POSE_COVERAGE_SEGMENT_NAMES,
@@ -23,8 +27,12 @@ from calibration.free_space_coverage import (
     TAU_REFINEMENT_SEGMENT_NAMES,
     _build_joint_pose_coverage_tree,
     _fit_joint_pose_coverage_route,
+    _select_safe_joint_pose_root,
     config_sha256,
+    empirical_joint_range_statistics,
+    effective_joint_position_limits,
     generate_coverage_trajectory,
+    hardware_joint_position_limits,
     load_coverage_plan,
     trajectory_sha256,
     validate_coverage_trajectory,
@@ -68,20 +76,113 @@ def test_config_defines_thirty_minute_tau_refinement_run() -> None:
     assert (stored + FREE_SPACE_EPISODE_MAX_SAMPLES - 1) // FREE_SPACE_EPISODE_MAX_SAMPLES == 6
 
 
-def test_joint_pose_coverage_config_is_50hz_with_half_second_holds() -> None:
+def test_joint_pose_coverage_config_is_short_conservative_static_run() -> None:
     plan = load_coverage_plan(JOINT_COVERAGE_CONFIG)
 
     assert plan.excitation.planner == "joint_pose_coverage"
-    assert plan.excitation.sample_rate_hz == pytest.approx(50.0)
-    assert plan.excitation.static_hold_s == pytest.approx(0.5)
-    assert plan.excitation.joint_pose_count == 160
-    assert plan.excitation.joint_candidate_count == 8192
-    assert plan.excitation.joint_position_min_rad == pytest.approx(
-        [-1.10, -0.60, -0.95, 0.55, -1.35, -0.62, -0.10]
+    assert plan.excitation.sample_rate_hz == pytest.approx(100.0)
+    assert plan.excitation.run.duration_s == pytest.approx(1200.0)
+    assert plan.excitation.static_hold_s == pytest.approx(0.8)
+    assert plan.excitation.joint_pose_count == 20
+    assert plan.excitation.joint_route_passes == 8
+    assert plan.excitation.joint_candidate_count == 4096
+    assert plan.excitation.joint_range_fraction == pytest.approx(0.75)
+    assert plan.excitation.joint_position_min_rad is None
+    assert plan.excitation.joint_position_max_rad is None
+    assert plan.excitation.joint_range_source_directory.name == (
+        "next_background_data"
     )
-    assert plan.excitation.joint_position_max_rad == pytest.approx(
-        [1.15, 1.00, 1.10, 2.08, 1.30, 0.88, 1.51]
+    assert plan.excitation.joint_range_quantiles == pytest.approx([0.01, 0.99])
+    assert plan.excitation.joint_range_exclude_sources == ("free_space_coverage",)
+    assert plan.excitation.reference_h5_path is None
+    assert plan.excitation.static_position_threshold_rad == pytest.approx(0.04)
+    assert plan.excitation.static_velocity_threshold_rad_s == pytest.approx(0.03)
+    assert plan.excitation.static_stability_duration_s == pytest.approx(0.25)
+    assert plan.excitation.static_stability_timeout_s == pytest.approx(3.0)
+
+
+def test_effective_limits_apply_margin_then_centered_range_fraction() -> None:
+    plan = load_coverage_plan(JOINT_COVERAGE_CONFIG)
+    model = SimpleNamespace(
+        lowerPositionLimit=np.full(7, -2.0),
+        upperPositionLimit=np.full(7, 2.0),
     )
+
+    lower, upper = effective_joint_position_limits(model, plan.excitation)
+
+    stats = empirical_joint_range_statistics(plan.excitation)
+    centered_lower = np.full(7, -1.44)
+    centered_upper = np.full(7, 1.44)
+    assert lower == pytest.approx(
+        np.maximum(centered_lower, stats["quantile_minimum"])
+    )
+    assert upper == pytest.approx(
+        np.minimum(centered_upper, stats["quantile_maximum"])
+    )
+
+
+def test_empirical_joint_range_excludes_automatic_collection(tmp_path: Path) -> None:
+    manual = np.asarray(
+        [
+            np.linspace(-0.7, 0.1, 7),
+            np.linspace(-0.3, 0.5, 7),
+            np.linspace(0.1, 0.9, 7),
+        ],
+        dtype=np.float64,
+    )
+    automatic = np.full((3, 7), 10.0, dtype=np.float64)
+
+    def write_episode(path: Path, q: np.ndarray, metadata: dict) -> None:
+        with h5py.File(path, "w") as h5:
+            teleop = h5.create_group("teleop")
+            teleop.create_dataset("q_follower", data=q)
+            meta = h5.create_group("metadata")
+            meta.create_dataset("episode_json", data=json.dumps(metadata))
+
+    write_episode(tmp_path / "manual.h5", manual, {"source": "teleop"})
+    write_episode(
+        tmp_path / "automatic.h5",
+        automatic,
+        {"source": "free_space_coverage"},
+    )
+    cfg = SimpleNamespace(
+        joint_range_source_directory=tmp_path,
+        joint_range_exclude_sources=("free_space_coverage",),
+        joint_range_quantiles=np.asarray([0.0, 1.0]),
+        reference_dataset="teleop/q_follower",
+    )
+
+    stats = empirical_joint_range_statistics(cfg)
+
+    assert stats["sample_count"] == 3
+    assert [path.name for path in stats["included_paths"]] == ["manual.h5"]
+    assert [path.name for path in stats["excluded_paths"]] == ["automatic.h5"]
+    assert stats["minimum"] == pytest.approx(np.min(manual, axis=0))
+    assert stats["maximum"] == pytest.approx(np.max(manual, axis=0))
+
+
+def test_hardware_limits_do_not_apply_target_coverage_bounds() -> None:
+    plan = load_coverage_plan(JOINT_COVERAGE_CONFIG)
+    model = SimpleNamespace(
+        lowerPositionLimit=np.full(7, -2.0),
+        upperPositionLimit=np.full(7, 2.0),
+    )
+
+    lower, upper = hardware_joint_position_limits(model, plan.excitation)
+
+    assert lower == pytest.approx(np.full(7, -1.92))
+    assert upper == pytest.approx(np.full(7, 1.92))
+
+
+def test_safe_joint_pose_root_prefers_center_and_is_deterministic() -> None:
+    lower = np.full(7, -1.0)
+    upper = np.full(7, 1.0)
+    first = _select_safe_joint_pose_root(lower, upper, _AlwaysSafeChecker(), seed=31)
+    second = _select_safe_joint_pose_root(lower, upper, _AlwaysSafeChecker(), seed=31)
+
+    assert first.shape == (1, 7)
+    assert first == pytest.approx(np.zeros((1, 7)))
+    assert second == pytest.approx(first)
 
 
 def test_representative_replay_selects_traceable_teleop_episodes() -> None:
@@ -129,17 +230,193 @@ def test_joint_pose_tree_spans_multiple_joints_and_route_contains_holds() -> Non
     )
     q, segment_id = _fit_joint_pose_coverage_route(cfg, 2000, nodes, parents)
 
+    repeated_nodes, repeated_parents = _build_joint_pose_coverage_tree(
+        np.zeros(7),
+        lower,
+        upper,
+        candidate_count=128,
+        pose_count=12,
+        connection_step_rad=0.4,
+        checker=_AlwaysSafeChecker(),
+        seed=17,
+    )
+
     assert nodes.shape == (12, 7)
     assert parents.shape == (12,)
-    assert np.all(parents[1:] < np.arange(1, 12))
+    assert np.array_equal(parents[1:], np.arange(11))
+    assert repeated_nodes == pytest.approx(nodes)
+    assert np.array_equal(repeated_parents, parents)
     assert np.count_nonzero(np.abs(np.diff(nodes, axis=0)) > 1e-4, axis=1).min() >= 2
+    normalized = (nodes - lower) / (upper - lower)
+    pair_distance = np.linalg.norm(
+        normalized[:, None, :] - normalized[None, :, :], axis=2
+    )
+    pair_distance += np.eye(nodes.shape[0]) * 100.0
+    assert np.min(pair_distance) > 0.05
     assert q.shape == (2000, 7)
     assert set(np.unique(segment_id)) == {0, 1}
-    assert np.count_nonzero(segment_id == 1) >= 12 * 25
+    assert np.count_nonzero(segment_id == 1) == 12 * 25
     assert JOINT_POSE_COVERAGE_SEGMENT_NAMES == (
         "joint_pose_transition",
         "joint_pose_hold",
     )
+
+
+def test_static_stability_requires_one_continuous_stable_window(monkeypatch) -> None:
+    class Clock:
+        now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, duration):
+            self.now += duration
+
+    class Arm:
+        def __init__(self):
+            self.reads = 0
+            self.commands = 0
+
+        def command_joint_positions(self, _target):
+            self.commands += 1
+
+        def read_state(self):
+            velocity = 0.04 if self.reads == 2 else 0.0
+            self.reads += 1
+            return SimpleNamespace(
+                q=np.full(7, 0.005),
+                dq=np.full(7, velocity),
+                torque=np.zeros(7),
+            )
+
+    clock = Clock()
+    monkeypatch.setattr("calibration.free_space_cli.time.monotonic", clock.monotonic)
+    monkeypatch.setattr("calibration.free_space_cli.time.sleep", clock.sleep)
+    plan = SimpleNamespace(
+        excitation=SimpleNamespace(
+            sample_rate_hz=10.0,
+            static_stability_timeout_s=2.0,
+            static_stability_duration_s=0.25,
+            static_position_threshold_rad=0.02,
+            static_velocity_threshold_rad_s=0.03,
+        ),
+        hardware=SimpleNamespace(
+            max_timestamp_gap_s=0.2,
+            max_tracking_error_rad=np.ones(7),
+            max_abs_torque_nm=np.ones(7),
+        ),
+    )
+    arm = Arm()
+
+    def capture_state():
+        if arm.reads:
+            clock.sleep(0.1)
+        arm.command_joint_positions(np.zeros(7))
+        state = arm.read_state()
+        return SimpleNamespace(state=state)
+
+    _wait_for_static_stability(
+        capture_state,
+        np.zeros(7),
+        plan,
+        sample_index=8,
+        trajectory_time_s=1.6,
+    )
+
+    assert arm.reads == 7
+    assert arm.commands == arm.reads
+    assert clock.now == pytest.approx(0.6)
+
+
+def test_static_settling_commands_and_reads_are_recorded_continuously(monkeypatch) -> None:
+    class Clock:
+        now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, duration):
+            self.now += duration
+
+    class Arm:
+        def __init__(self):
+            self.commands = 0
+            self.reads = 0
+
+        def command_joint_positions(self, _target):
+            self.commands += 1
+
+        def read_state(self):
+            self.reads += 1
+            return SimpleNamespace(
+                q=np.zeros(7),
+                dq=np.zeros(7),
+                torque=np.zeros(7),
+                current=np.zeros(7),
+                ee_pose=np.eye(4),
+            )
+
+    class Buffer:
+        def __init__(self):
+            self.config = SimpleNamespace(
+                output=SimpleNamespace(discard_initial_s=0.0)
+            )
+            self.sample_count = 0
+            self.timestamps = []
+
+        def append_teleop(self, timestamp, _values, *, store):
+            self.sample_count += int(store)
+            if store:
+                self.timestamps.append(timestamp)
+
+    clock = Clock()
+    monkeypatch.setattr("calibration.free_space_cli.time.monotonic", clock.monotonic)
+    monkeypatch.setattr("calibration.free_space_cli.time.sleep", clock.sleep)
+    monkeypatch.setattr("nero_collection.fixed_rate.time.monotonic", clock.monotonic)
+    monkeypatch.setattr("nero_collection.fixed_rate.time.sleep", clock.sleep)
+    monkeypatch.setattr(
+        "nero_collection.fixed_rate.now_us",
+        lambda: int(round(clock.now * 1.0e6)) + 1,
+    )
+    trajectory = SimpleNamespace(
+        q=np.zeros((3, 7)),
+        dq=np.zeros((3, 7)),
+        time_s=np.arange(3, dtype=np.float64) * 0.1,
+        segment_id=np.ones(3, dtype=np.int8),
+        segment_names=JOINT_POSE_COVERAGE_SEGMENT_NAMES,
+    )
+    plan = SimpleNamespace(
+        excitation=SimpleNamespace(
+            planner="joint_pose_coverage",
+            sample_rate_hz=10.0,
+            static_stability_timeout_s=1.0,
+            static_stability_duration_s=0.2,
+            static_position_threshold_rad=0.02,
+            static_velocity_threshold_rad_s=0.03,
+        ),
+        hardware=SimpleNamespace(
+            max_timestamp_gap_s=0.2,
+            max_tracking_error_rad=np.ones(7),
+            max_abs_torque_nm=np.ones(7),
+        ),
+    )
+    arm = Arm()
+    buffer = Buffer()
+
+    _execute_trajectory(
+        arm,
+        SimpleNamespace(poll=lambda: ()),
+        buffer,
+        trajectory,
+        plan,
+        np.full(7, -1.0),
+        np.full(7, 1.0),
+    )
+
+    assert buffer.sample_count == 6
+    assert arm.reads == 6
+    assert arm.commands == 6
+    assert np.diff(buffer.timestamps) == pytest.approx(np.full(5, 100_000))
 
 
 @pytest.mark.skipif(find_spec("pinocchio") is None, reason="Pinocchio is not installed")

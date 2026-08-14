@@ -23,7 +23,7 @@ chunk；PINN condition 是否同步裁剪由 `action_condition_fill` 决定。
 checkpoint 声明的 `n_obs_steps` 个 image/wrench 观测，冻结该窗口并同步执行一次 DP，然后
 完整执行所选 action 计划。执行期间到达的图像不会写入下一轮观测；计划结束后清空旧窗口，
 重新采满一批才再次推理。相机 freshness 只在采样阶段作为准入条件，动作执行期间不因图像
-超过 `maximum_state_age_s` 而中断，但机械臂状态与 CAN watchdog 始终有效。`asynchronous` 保留旧 worker
+超过 `maximum_state_age_s` 而中断，但机械臂控制状态检查与控制超时始终有效。`asynchronous` 保留旧 worker
 模式；当它与 `all` 组合时，后台结果只缓存为下一计划，不会中断正在执行的 chunk。
 在线纯开环批次以实际相机时间戳为锚点，将 CAN 派生的 wrench 历史按时间戳最近邻对齐；
 相机先到时等待 CAN 时间线追上，CAN 先到时等待相机。任一匹配的绝对误差超过
@@ -189,10 +189,9 @@ DP/PINN 的网络参数、输入维度、horizon、action condition 模式、末
 完整在线观测链为：
 
 ```text
-follower CAN joint groups + motor states
-  -> 与数采相同的 delayed state timeline
-     (15 ms delay, 100 Hz, q mean + q/dq/ddq causal low-pass)
-  -> aligned q/dq/ddq/tau
+follower pyAgxArm latest SDK cache
+  -> 由 teleop.command.sample_rate_hz 驱动的固定 tick
+  -> 同一 tick 的 q/dq/ddq/tau
   -> tau-ext estimate_aligned(timestamp,q,dq,tau,q_cmd)
   -> tau_id - tau - tau_f_pred
   -> tau_ext
@@ -204,27 +203,26 @@ follower CAN joint groups + motor states
 
 ```text
 isolated hardware process
-  pyagx CAN sampler -> delayed/aligned q,dq,ddq,tau timeline
-                    -> shared state ring (4096 aligned states)
-inference process  <- ordered ring drain -> causal KF + dual fixed windows
+  pyagx getters     -> fixed-rate latest SDK state stream
+inference process  <- ordered state history -> causal KF + dual fixed windows
                    -> tau_ext_cal_raw -> one tau_ext filter -> wrench_cal
                    -> bounded wrench history (4096 canonical samples)
 main runtime       <- latest state for control
                    <- drain all accumulated wrench samples for DP history
 ```
 
-每个 ring 样本的 `q/dq/ddq/tau/tau_f/wrench` 都使用同一个 aligned CAN
-`timestamp_us`；`acquired_timestamp_us` 只用于检查状态是否过期。PyAgx SDK、CAN parser、
+每个状态样本的 `q/dq/ddq/tau/tau_f/wrench` 都使用同一个固定 tick
+`timestamp_us`；`acquired_timestamp_us` 只用于控制侧检查状态是否过期。PyAgx SDK、CAN parser、
 状态采样和机械臂指令只存在于独立硬件子进程。主循环忙于 DP 推理或 minimum-jerk 动作执行
-时，子进程仍持续采样，共享环保留中间状态；推理状态线程恢复运行后按时间顺序排空共享环，
-推进 tau-f/tau-next 两个 50 帧滑动窗口，并把期间产生的每一帧 wrench 补回 open-loop 的带时间戳 CAN 历史。相机帧仍由
-`CameraManager` 连续采集，DP 在形成完整窗口时再按相机时间戳与 CAN 历史对齐；因此
-不会用重复 CAN 帧填充 checkpoint 所需的历史（例如一张图像对应 8 个互不重复的 CAN
+时，固定频率状态线程仍持续调用 SDK getter，进程内有界历史保留中间状态；主循环随后按时间顺序消费这些状态，
+推进 tau-f/tau-next 两个 50 帧滑动窗口，并把期间产生的每一帧 wrench 补回 open-loop 的带时间戳状态历史。相机帧仍由
+`CameraManager` 连续采集，DP 在形成完整窗口时再按相机时间戳与状态历史对齐；因此
+不会重复消费同一个 tick 来填充 checkpoint 所需的历史（例如一张图像对应 8 个互不重复的状态
 样本）。
 
 实机 backend 默认启用该流；`mock` backend 默认保留同步读取，仅用于测试和离线回放。
 episode reset、startup recovery 和 shutdown 会先停止并清空连续流，再重置两个 torque 窗口、因果 Kalman
-与 DP 历史，避免复位运动污染下一段窗口输入。CAN watchdog 或 tau-ext/wrench
+与 DP 历史，避免复位运动污染下一段窗口输入。状态流异常或 tau-ext/wrench
 计算异常会记录为 stream fault，主循环随后 fail-closed，而不是继续使用旧状态。
 
 相机预览与状态流完全隔离：每台真实 V4L2 相机由独立 `spawn` 子进程持续采集，并将配置中
@@ -234,13 +232,20 @@ episode reset、startup recovery 和 shutdown 会先停止并清空连续流，�
 因此不会阻塞或改变 `q/dq/ddq_kf_causal/tau_ext/wrench` 的计算时间线。数采和推理都复用同一个
 `configs/master_slave_can.yaml` 相机配置；当前 `wrist` 预览默认开启。
 
-在线 runtime 的 state-alignment 参数全部读取 `runtime.collection_config` 的
-`teleop.command.state_alignment_delay_s/sample_rate_hz` 和 `robot_states`，与数采
-`MasterSlaveTeleop.start()` 使用同一组参数。外力矩 RNEA 不使用普通状态字段 `ddq_follower`，
-而是由与 PINN offline forward pass 一致的因果 Kalman 从 aligned `q/dq` 估计 `ddq_kf_causal`。
-episode 复位会重建 arm delayed timeline，并清空两个固定窗口、Kalman 状态和两条 tau_ext 滤波状态，等待新的 aligned
+在线 runtime 读取 `runtime.collection_config` 的 `teleop.command.sample_rate_hz`，与数采
+`MasterSlaveTeleop` 使用同一固定频率最新缓存语义。外力矩 RNEA 不使用普通状态字段 `ddq_follower`，
+而是由与 PINN offline forward pass 一致的因果 Kalman 从同一 tick 的 `q/dq` 估计 `ddq_kf_causal`。
+episode 复位会重启固定频率状态流，并清空两个固定窗口、Kalman 状态和两条 tau_ext 滤波状态，等待新的有限
 `q/dq/tau/q_cmd` 有效后才恢复推理。collection runtime 要求 `tau_ext_inference.enabled: true`
-且同时配置 `tau_f` 与 `tau_next` checkpoint，不再提供七维零预测兼容路径。
+并至少配置实际使用的 checkpoint。主从遥操作通过
+`tau_ext_inference.feedback_source: tau_f | tau_free` 选择反馈分支：`tau_f` 对应
+`tau_ext_cal`，`tau_free` 对应内部历史名 `tau_next` 的 `tau_ext_pred`。两路同时配置时仍会同时推理和记录，
+选择项只影响主臂反馈；每路独立执行 history-ready 和 prediction-age 判定，所选分支未就绪时反馈为零。
+模型输入不在运行时代码中固定为三路：加载器按 checkpoint 的 `model.inputs` 顺序组装
+`q/dq/delta_q/tau` 的任意有序子集。配置中的 `input_keys` 仅作为可选的严格校验，省略时采用
+checkpoint 自带列表。对于 `causal_rnea_residual_v1`，在线侧还会恢复并校验 checkpoint 中的
+Kalman、`dq_sign`、RNEA state source 和 torque filter 契约；滤波后的同一份 `tau` 同时进入模型和
+`tau_f=tau_filtered-tau_id_filtered` 残差链，避免二次滤波造成训练/部署偏差。
 
 DP 的 observation 也按 checkpoint 时间契约取样：只把新相机 timestamp 加入图像时间线，
 以训练配置的 `timestamp_step_sec=0.1` 选择 10 Hz image anchors；每个 anchor 从带时间戳的

@@ -59,9 +59,6 @@ class _Arm:
     def set_follower_mode(self):
         self.follower_mode_count += 1
 
-    def configure_state_capture(self, *args):
-        self.state_alignment_args = args
-
     def validate_joint_impedance_support(self):
         pass
 
@@ -341,13 +338,11 @@ def test_observation_warmup_samples_tau_f_and_wrench_without_inference() -> None
 
     first = runtime.step()
     second = runtime.step()
-    ready = runtime.step()
 
     assert first is None
-    assert second is None
-    assert ready is not None
-    assert tau_ext.estimate_count == 3
-    assert wrench.map_count == 3
+    assert second is not None
+    assert tau_ext.estimate_count == 2
+    assert wrench.map_count == 2
     assert len(pipeline.inputs) == 1
     assert arm.commands == []
     runtime.stop()
@@ -406,7 +401,7 @@ def test_observation_wrench_lowpass_smooths_step_input() -> None:
     runtime.step()
     runtime.step()
 
-    alpha = 1.0 - np.exp(-2.0 * np.pi * cutoff_hz * 0.001)
+    alpha = 1.0 - np.exp(-2.0 * np.pi * cutoff_hz * 0.01)
     np.testing.assert_allclose(
         pipeline.inputs[-1].wrench_ext,
         np.full(6, alpha * 10.0),
@@ -459,21 +454,20 @@ def test_episode_reset_restarts_warmup_and_clears_wrench_filter() -> None:
         arm=_Arm(),
         cameras=_Cameras(),
         online_tau_ext=_TauExt(),
-        wrench_estimator=_Wrench([10.0, 10.0, 10.0, 0.0, 0.0, 0.0]),
+        wrench_estimator=_Wrench([10.0, 10.0, 0.0, 0.0]),
     )
     _use_fast_reset(runtime)
     runtime.start()
 
-    assert [runtime.step(), runtime.step(), runtime.step()][-1] is not None
+    assert [runtime.step(), runtime.step()][-1] is not None
     runtime._restart_episode()
-    restarted = [runtime.step(), runtime.step(), runtime.step()]
+    restarted = [runtime.step(), runtime.step()]
 
     assert restarted[0] is None
-    assert restarted[1] is None
-    assert restarted[2] is not None
+    assert restarted[1] is not None
     assert len(pipeline.inputs) == 2
     np.testing.assert_allclose(pipeline.inputs[0].wrench_ext, np.full(6, 10.0))
-    np.testing.assert_allclose(pipeline.inputs[1].wrench_ext, np.zeros(6))
+    np.testing.assert_allclose(pipeline.inputs[-1].wrench_ext, np.zeros(6))
     runtime.stop()
 
 
@@ -493,7 +487,6 @@ def test_predictor_control_mode_and_commands_wait_for_observation_warmup() -> No
     runtime.start()
 
     assert arm.impedance_mode_count == 0
-    assert runtime.step() is None
     assert runtime.step() is None
     assert runtime.step() is None
     assert arm.impedance_mode_count == 1
@@ -529,7 +522,7 @@ def test_runtime_computes_wrench_and_requires_explicit_command_enable() -> None:
     assert pipeline.closed
 
 
-def test_runtime_uses_aligned_dq_and_tau_ext_kalman_acceleration() -> None:
+def test_runtime_uses_sdk_dq_and_internal_kalman_acceleration() -> None:
     arm, pipeline = _Arm(), _Pipeline()
     arm.dq = np.linspace(0.1, 0.7, 7)
     arm.ddq = np.linspace(-0.7, -0.1, 7)
@@ -549,19 +542,9 @@ def test_runtime_uses_aligned_dq_and_tau_ext_kalman_acceleration() -> None:
     runtime.step()
     runtime.stop()
 
-    command = runtime.collection.teleop.command
-    q_state = runtime.collection.robot_states["q"]
-    dq_state = runtime.collection.robot_states["velocity"]
-    ddq_state = runtime.collection.robot_states["acceleration"]
-    assert arm.state_alignment_args == (
-        command.maximum_state_source_skew_s,
-        q_state.lowpass_cutoff_hz if q_state.lowpass else None,
-        dq_state.lowpass_cutoff_hz if dq_state.lowpass else None,
-        ddq_state.lowpass_cutoff_hz if ddq_state.lowpass else None,
-        command.maximum_can_frame_gap_s,
-    )
     np.testing.assert_allclose(pipeline.inputs[-1].dq, arm.dq)
-    np.testing.assert_allclose(pipeline.inputs[-1].ddq, arm.ddq)
+    np.testing.assert_allclose(pipeline.inputs[-1].ddq, 0.0)
+    assert not np.array_equal(pipeline.inputs[-1].ddq, arm.ddq)
 
 
 def test_runtime_skips_transient_incomplete_aligned_state() -> None:

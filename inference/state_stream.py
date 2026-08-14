@@ -21,7 +21,7 @@ log = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class ContinuousInferenceSample:
-    """One timestamp-consistent state/tau_ext sample produced by the CAN stream."""
+    """One fixed-rate state/tau_ext sample read from the latest SDK cache."""
 
     timestamp_us: int
     acquired_timestamp_us: int
@@ -36,7 +36,7 @@ class ContinuousInferenceSample:
 
 
 class ContinuousInferenceStateStream:
-    """Continuously consume aligned CAN state independently of DP inference."""
+    """Read one latest SDK state per fixed-rate inference tick."""
 
     def __init__(
         self,
@@ -159,22 +159,21 @@ class ContinuousInferenceStateStream:
     def _run(self) -> None:
         while not self._stop_event.is_set():
             try:
-                states = self._read_pending_states()
+                state = self.arm.read_state()
                 started_s = time.perf_counter()
-                samples = self.process_states(states)
+                sample = self.process_state(state)
                 elapsed_s = time.perf_counter() - started_s
                 with self._updated:
-                    self._last_batch_size = len(states)
+                    self._last_batch_size = 1
                     self._last_batch_processing_s = elapsed_s
-                    for sample in samples:
+                    if sample is not None:
                         if len(self._samples) == self._samples.maxlen:
                             self._history_rollover_count += 1
                         self._samples.append(sample)
                         self._latest = sample
                     self._updated.notify_all()
-                for sample in samples:
-                    if self.on_sample is not None:
-                        self.on_sample(sample)
+                if sample is not None and self.on_sample is not None:
+                    self.on_sample(sample)
             except BaseException as exc:  # keep the main loop fail-closed
                 with self._updated:
                     self._fault = exc
@@ -184,97 +183,44 @@ class ContinuousInferenceStateStream:
                 return
             self._stop_event.wait(self.poll_interval_s)
 
-    def _read_pending_states(self) -> tuple[Any, ...]:
-        drain = getattr(self.arm, "drain_states", None)
-        if not callable(drain):
-            return (self.arm.read_state(),)
-        result = drain()
-        dropped = int(getattr(result, "dropped", 0))
-        if dropped > 0:
-            raise RuntimeError(
-                "isolated hardware state history overrun: "
-                f"{dropped} aligned states were overwritten before inference consumed them"
-            )
-        return tuple(getattr(result, "states", ()))
-
     def process_state(self, state: Any) -> ContinuousInferenceSample | None:
-        """Convert one aligned arm state into the canonical inference record."""
-        samples = self.process_states((state,))
-        return samples[0] if samples else None
-
-    def process_states(
-        self,
-        states: tuple[Any, ...],
-    ) -> tuple[ContinuousInferenceSample, ...]:
-        candidates: list[tuple[Any, int, int]] = []
-        newest_timestamp_us = self._last_timestamp_us
-        for state in states:
-            vectors = (state.q, state.dq, state.torque)
-            if not all(
-                np.asarray(value, dtype=np.float64).shape == (7,)
-                and np.all(np.isfinite(value))
-                for value in vectors
-            ):
-                continue
-            timestamp_us = int(
-                getattr(state, "q_timestamp_us", 0)
-                or getattr(state, "q_acquired_timestamp_us", 0)
-                or getattr(state, "timestamp_us", 0)
-                or getattr(state, "acquired_timestamp_us", 0)
-            )
-            if timestamp_us <= newest_timestamp_us:
-                continue
-            acquired_timestamp_us = int(
-                getattr(state, "acquired_timestamp_us", 0) or now_us()
-            )
-            candidates.append((state, timestamp_us, acquired_timestamp_us))
-            newest_timestamp_us = timestamp_us
-        if not candidates:
-            return ()
-
-        q_cmds: list[np.ndarray] = []
-        for _, timestamp_us, _ in candidates:
-            q_cmd = (
-                None
-                if self.q_cmd_provider is None
-                else self.q_cmd_provider(timestamp_us)
-            )
-            q_cmd = np.asarray(q_cmd, dtype=np.float64).reshape(-1)
-            if q_cmd.shape != (7,) or not np.all(np.isfinite(q_cmd)):
-                raise RuntimeError(
-                    "tau_ext inference requires a finite seven-joint q_cmd"
-                )
-            q_cmds.append(q_cmd.copy())
-
-        tau_results = tuple(
-            self.online_tau_ext.estimate_aligned(
-                timestamp_us,
-                state.q,
-                state.dq,
-                state.torque,
-                q_cmds[index],
-            )
-            for index, (state, timestamp_us, _) in enumerate(candidates)
-        )
-        if len(tau_results) != len(candidates):
-            raise RuntimeError(
-                "tau_ext result length does not match aligned state batch"
-            )
-        samples = []
-        for (_, timestamp_us, acquired_timestamp_us), tau_result in zip(
-            candidates,
-            tau_results,
+        """Convert the current tick's SDK snapshot into one inference record."""
+        vectors = (state.q, state.dq, state.torque)
+        if not all(
+            np.asarray(value, dtype=np.float64).shape == (7,)
+            and np.all(np.isfinite(value))
+            for value in vectors
         ):
-            samples.append(
-                self._build_sample(
-                    timestamp_us,
-                    acquired_timestamp_us,
-                    tau_result,
-                    state.ddq,
-                )
+            return None
+        timestamp_us = max(
+            now_us(),
+            self._last_timestamp_us + int(round(self.poll_interval_s * 1.0e6)),
+        )
+        acquired_timestamp_us = now_us()
+        q_cmd = (
+            None
+            if self.q_cmd_provider is None
+            else self.q_cmd_provider(timestamp_us)
+        )
+        q_cmd = np.asarray(q_cmd, dtype=np.float64).reshape(-1)
+        if q_cmd.shape != (7,) or not np.all(np.isfinite(q_cmd)):
+            raise RuntimeError(
+                "tau_ext inference requires a finite seven-joint q_cmd"
             )
-            self._last_timestamp_us = timestamp_us
-        return tuple(samples)
+        tau_result = self.online_tau_ext.estimate_aligned(
+            timestamp_us,
+            state.q,
+            state.dq,
+            state.torque,
+            q_cmd,
+        )
+        self._last_timestamp_us = timestamp_us
+        return self._build_sample(
+            timestamp_us,
+            acquired_timestamp_us,
+            tau_result,
+            tau_result.ddq_kf_causal,
+        )
 
     def _build_sample(
         self,

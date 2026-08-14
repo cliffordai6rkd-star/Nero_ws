@@ -9,6 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from nero_collection.cameras import CameraManager, CameraVisualizer
+from nero_collection.fixed_rate import FixedRateTicker
 from nero_collection.config import CollectionConfig, load_config
 from nero_collection.episode_output import episode_path, next_episode_index
 from nero_collection.h5_writer import EpisodeBuffer
@@ -207,6 +208,11 @@ def _record_episode(
     realtime_plot: RealtimeJointPlotter,
 ) -> None:
     start_t = time.monotonic()
+    sample_rate_hz = config.teleop.command.sample_rate_hz
+    ticker = FixedRateTicker(
+        sample_rate_hz,
+        config.teleop.command.control_watchdog_timeout_s,
+    )
     discard_initial_s = config.output.discard_initial_s
     discard_complete_logged = discard_initial_s <= 0.0
     if discard_initial_s > 0.0:
@@ -215,6 +221,7 @@ def _record_episode(
             discard_initial_s,
         )
     while True:
+        ticker.wait("master-slave recording")
         loop_t = time.monotonic()
         key = keys.read_key(0.0)
         if key == " ":
@@ -224,32 +231,17 @@ def _record_episode(
         if dry_run_duration_s is not None and loop_t - start_t >= dry_run_duration_s:
             return
 
-        frame_reader = getattr(teleop, "teleop_frames", None)
-        if callable(frame_reader):
-            teleop_frames = tuple(
-                (frame.timestamp_us, frame.values)
-                for frame in frame_reader()
-            )
-        else:
-            timestamp_us, values = teleop.teleop_step()
-            teleop_frames = ((timestamp_us, values),)
+        timestamp_us, values = teleop.teleop_step()
         store = loop_t - start_t >= discard_initial_s
         if store and not discard_complete_logged:
             log.info("initial episode discard complete; saving and visualization started")
             discard_complete_logged = True
-        for timestamp_us, values in teleop_frames:
-            accepted = buffer.append_teleop(
-                timestamp_us,
-                values,
-                store=store,
-            )
-            if accepted is not None:
-                realtime_plot.append(accepted.timestamp_us, accepted.values)
+        accepted = buffer.append_teleop(timestamp_us, values, store=store)
+        if accepted is not None:
+            realtime_plot.append(accepted.timestamp_us, accepted.values)
         for frame in cameras.poll():
             if store:
                 buffer.append_camera(frame.camera_name, frame.timestamp_us, frame.frame)
-
-        time.sleep(0.001)
 
 
 def _wait_for_save_choice(keys: TerminalKeys, auto_save: bool) -> bool:

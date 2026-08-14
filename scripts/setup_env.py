@@ -11,6 +11,7 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
+PYAGXARM_COMMIT = "799b8412fbe8b9156bc9892d3dbeb2df7e98be71"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -104,18 +105,12 @@ def main(argv: list[str] | None = None) -> int:
 
     print("Installing AgileX pyAgxArm SDK", flush=True)
     _pip(env_python, args.pypi_index_url, "python-can>=3.3.4")
-    available = subprocess.run(
-        [str(env_python), "-c", "import pyAgxArm"],
-        check=False,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+    _pip(
+        env_python,
+        args.pypi_index_url,
+        "--force-reinstall",
+        f"git+https://github.com/agilexrobotics/pyAgxArm.git@{PYAGXARM_COMMIT}",
     )
-    if available.returncode != 0:
-        _pip(
-            env_python,
-            args.pypi_index_url,
-            "git+https://github.com/agilexrobotics/pyAgxArm.git",
-        )
 
     print(f"\nEnvironment is ready. Activate it with:\n  conda activate {args.env_name}")
     if shutil.which("candump") is None or shutil.which("v4l2-ctl") is None:

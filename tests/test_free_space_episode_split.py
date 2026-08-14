@@ -72,10 +72,6 @@ class _Arm:
             motor_timestamp_us=np.full(7, timestamp_us, dtype=np.int64),
         )
 
-    def read_pending_states(self):
-        return (self.read_state(),)
-
-
 def test_collect_cli_accepts_fresh_native_can_recollection() -> None:
     args = _parse_args(
         [
@@ -320,19 +316,7 @@ def test_resume_rejects_a_gap_in_chunk_ranges(tmp_path: Path) -> None:
     assert resume.next_trajectory_index == 5
 
 
-def test_event_state_gap_is_preserved_without_synthetic_repair() -> None:
-    class EventArm(_Arm):
-        def __init__(self):
-            super().__init__()
-            self.batches = [
-                (_state(1_000_000), _state(1_013_000)),
-                (_state(1_027_000),),
-                (_state(1_041_000),),
-            ]
-
-        def read_pending_states(self):
-            return self.batches.pop(0) if self.batches else ()
-
+def test_each_command_tick_stores_one_latest_sdk_state() -> None:
     trajectory = SimpleNamespace(
         q=np.zeros((3, 7)),
         dq=np.zeros((3, 7)),
@@ -349,7 +333,7 @@ def test_event_state_gap_is_preserved_without_synthetic_repair() -> None:
         ),
     )
     buffer, _, _ = _execute_trajectory(
-        EventArm(),
+        _Arm(),
         SimpleNamespace(poll=lambda: ()),
         _Buffer(discard_initial_s=0.0),
         trajectory,
@@ -358,32 +342,21 @@ def test_event_state_gap_is_preserved_without_synthetic_repair() -> None:
         np.full(7, 1.0),
     )
 
-    assert buffer.stored_timestamps == [
-        1_000_000, 1_013_000, 1_027_000, 1_041_000
-    ]
+    assert buffer.sample_count == 3
+    assert np.all(np.diff(buffer.stored_timestamps) > 0)
     assert all(
-        "q_source_timestamp_follower_us" in values
-        and "motor_source_timestamp_follower_us" in values
-        and "state_source_skew_follower_us" in values
-        and "state_interpolated_follower" not in values
+        "q_follower" in values
+        and "tau_follower" in values
+        and "q_source_timestamp_follower_us" not in values
+        and "state_source_skew_follower_us" not in values
         for values in buffer.stored_values
     )
 
 
-def test_50_hz_commands_store_every_100_hz_state_from_common_ring() -> None:
-    class RingArm(_Arm):
-        def drain_states(self):
-            base_us = 1_000_000 + self.command_count * 20_000
-            return SimpleNamespace(
-                states=(
-                    _state(base_us - 10_000),
-                    _state(base_us),
-                ),
-                dropped=0,
-            )
-
+def test_repeated_sdk_timestamp_is_stored_on_every_command_tick() -> None:
+    class CachedArm(_Arm):
         def read_state(self):
-            raise AssertionError("common drain_states path must be used")
+            return _state(1_000_000)
 
     command_count = 4
     trajectory = SimpleNamespace(
@@ -401,7 +374,7 @@ def test_50_hz_commands_store_every_100_hz_state_from_common_ring() -> None:
             max_abs_torque_nm=np.ones(7),
         ),
     )
-    arm = RingArm()
+    arm = CachedArm()
 
     buffer, _, _ = _execute_trajectory(
         arm,
@@ -414,38 +387,5 @@ def test_50_hz_commands_store_every_100_hz_state_from_common_ring() -> None:
     )
 
     assert arm.command_count == command_count
-    assert buffer.sample_count == command_count * 2
-    assert np.all(np.diff(buffer.stored_timestamps) == 10_000)
-
-
-def test_common_state_ring_overrun_aborts_trajectory_collection() -> None:
-    class OverrunArm(_Arm):
-        def drain_states(self):
-            return SimpleNamespace(states=(), dropped=1)
-
-    trajectory = SimpleNamespace(
-        q=np.zeros((1, 7)),
-        dq=np.zeros((1, 7)),
-        time_s=np.zeros(1),
-        segment_id=np.zeros(1, dtype=np.int64),
-        segment_names=("test",),
-    )
-    plan = SimpleNamespace(
-        excitation=SimpleNamespace(sample_rate_hz=50.0),
-        hardware=SimpleNamespace(
-            max_timestamp_gap_s=0.1,
-            max_tracking_error_rad=np.ones(7),
-            max_abs_torque_nm=np.ones(7),
-        ),
-    )
-
-    with pytest.raises(RuntimeError, match="state ring overrun.*dropped=1"):
-        _execute_trajectory(
-            OverrunArm(),
-            SimpleNamespace(poll=lambda: ()),
-            _Buffer(discard_initial_s=0.0),
-            trajectory,
-            plan,
-            np.full(7, -1.0),
-            np.full(7, 1.0),
-        )
+    assert buffer.sample_count == command_count
+    assert np.all(np.diff(buffer.stored_timestamps) > 0)

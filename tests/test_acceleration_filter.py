@@ -87,13 +87,12 @@ def test_state_config_rejects_invalid_median_window(window: int) -> None:
         _parse_state_param({"median_window": window})
 
 
-def test_episode_buffer_preserves_aligned_q_dq_ddq_without_redifferentiating() -> None:
+def test_episode_buffer_drops_acceleration_inputs() -> None:
     config = CollectionConfig(
         teleop=TeleopConfig(),
         output=OutputConfig(directory=Path(".")),
         robot_states={
             "velocity": StateParamConfig(enabled=True, lowpass=False),
-            "acceleration": StateParamConfig(enabled=True, lowpass=False),
         },
     )
     buffer = EpisodeBuffer(config=config, arm_names=("main",))
@@ -129,7 +128,7 @@ def test_episode_buffer_preserves_aligned_q_dq_ddq_without_redifferentiating() -
     assert accepted.timestamp_us == 1_020_000
     assert accepted.values["q_follower"][1] == pytest.approx([0.0004])
     assert accepted.values["dq_follower"][1] == pytest.approx([999.0])
-    assert accepted.values["ddq_follower"][1] == pytest.approx([999.0])
+    assert "ddq_follower" not in accepted.values
     assert buffer.teleop_timestamps_us == [1_000_000, 1_010_000, 1_020_000]
 
 
@@ -149,11 +148,6 @@ def test_finalize_teleop_data_preserves_aligned_derivatives_without_h5py(
         robot_states={
             "q": StateParamConfig(enabled=True),
             "velocity": StateParamConfig(enabled=True, lowpass=True, lowpass_cutoff_hz=5.0),
-            "acceleration": StateParamConfig(
-                enabled=True,
-                lowpass=True,
-                lowpass_cutoff_hz=5.0,
-            ),
             "tau_id": StateParamConfig(enabled=True, lowpass=True, lowpass_cutoff_hz=5.0),
             "torque": StateParamConfig(enabled=True),
         },
@@ -165,7 +159,6 @@ def test_finalize_teleop_data_preserves_aligned_derivatives_without_h5py(
     q_scalar = np.asarray([0.0, 0.01, 0.03, 0.06, 0.10], dtype=np.float64)
     q = np.repeat(q_scalar[:, None], 7, axis=1)
     dq = np.repeat(np.arange(5, dtype=np.float64)[:, None], 7, axis=1)
-    ddq = np.repeat((10.0 + np.arange(5, dtype=np.float64))[:, None], 7, axis=1)
     tau = np.repeat(
         np.asarray([[0.0], [1.0], [0.0], [0.0], [0.0]], dtype=np.float64),
         7,
@@ -177,7 +170,6 @@ def test_finalize_teleop_data_preserves_aligned_derivatives_without_h5py(
                 {
                     "q_follower": ("q", q[index]),
                     "dq_follower": ("velocity", dq[index]),
-                    "ddq_follower": ("acceleration", ddq[index]),
                     "tau_follower": ("torque", tau[index]),
                 },
             )
@@ -194,16 +186,9 @@ def test_finalize_teleop_data_preserves_aligned_derivatives_without_h5py(
     assert attrs["dq_follower"]["coordinate_frame"] == (
         "nero_joint_position_coordinates"
     )
-    assert attrs["ddq_follower"]["derivative_method"] == (
-        "causal_first_derivative_of_sign_corrected_raw_official_velocity"
-    )
-    assert attrs["ddq_follower"]["derived_from_json"] == '["dq_follower"]'
-    assert attrs["ddq_follower"]["formula"] == (
-        "ddq_raw[k]=(dq[k]-dq[k-1])/measured_dt"
-    )
     assert data["q_follower"] == pytest.approx(q)
     assert data["dq_follower"] == pytest.approx(dq)
-    assert data["ddq_follower"] == pytest.approx(ddq)
+    assert "ddq_follower" not in data
     assert "tau_f" not in data
 
 
@@ -229,7 +214,6 @@ def test_episode_save_preserves_raw_aligned_state_and_torque(
         robot_states={
             "q": StateParamConfig(enabled=True),
             "velocity": StateParamConfig(enabled=True),
-            "acceleration": StateParamConfig(enabled=True),
             "torque": StateParamConfig(enabled=True),
         },
     )
@@ -268,9 +252,9 @@ def test_episode_save_preserves_raw_aligned_state_and_torque(
 
     with h5py.File(output, "r") as h5:
         teleop = h5["teleop"]
-        assert h5.attrs["format"] == "factr_multimodal_episode/v9"
+        assert h5.attrs["format"] == "factr_multimodal_episode/v11"
         assert np.allclose(teleop["dq_follower"][:], 0.0)
-        assert np.allclose(teleop["ddq_follower"][:], 999.0)
+        assert "ddq_follower" not in teleop
         assert "dq_follower_firmware_raw" not in teleop
         assert "ddq_follower_adapter_raw" not in teleop
         assert "q_follower_raw" not in teleop
@@ -284,9 +268,6 @@ def test_episode_save_preserves_raw_aligned_state_and_torque(
         assert np.allclose(teleop["timestamp_us"][:], timestamps)
         assert teleop["dq_follower"].attrs["derivative_method"] == (
             "sign_corrected_official_motor_velocity_unfiltered"
-        )
-        assert teleop["ddq_follower"].attrs["derivative_method"] == (
-            "causal_first_derivative_of_sign_corrected_raw_official_velocity"
         )
         assert teleop["dq_follower"].attrs["timestamp_path"] == "teleop/timestamp_us"
         assert bool(teleop["tau_follower"].attrs["zero_phase"]) is False

@@ -53,18 +53,26 @@ class CoverageExcitationConfig:
     planner: str
     sample_rate_hz: float
     joint_limit_margin_rad: float
+    joint_range_fraction: float
     joint_position_min_rad: np.ndarray | None
     joint_position_max_rad: np.ndarray | None
+    joint_range_source_directory: Path | None
+    joint_range_quantiles: np.ndarray
+    joint_range_exclude_sources: tuple[str, ...]
     max_velocity_rad_s: np.ndarray
     max_acceleration_rad_s2: np.ndarray
     section_fractions: np.ndarray
-    reference_h5_path: Path
+    reference_h5_path: Path | None
     reference_dataset: str
     waypoint_min_delta_rad: float
     workspace_voxel_counts: np.ndarray
     replay_speed_scale: float
     static_transition_speed_scale: float
     static_hold_s: float
+    static_position_threshold_rad: float
+    static_velocity_threshold_rad_s: float
+    static_stability_duration_s: float
+    static_stability_timeout_s: float
     static_pose_count: int
     replay_pose_count: int
     jump_pose_count: int
@@ -74,6 +82,7 @@ class CoverageExcitationConfig:
     jump_hold_s: float
     joint_candidate_count: int
     joint_pose_count: int
+    joint_route_passes: int
     joint_connection_step_rad: float
     joint_transition_speed_scale: float
     replay_source_directory: Path | None
@@ -195,10 +204,19 @@ def load_coverage_plan(path: str | Path) -> CoveragePlan:
     )
     if np.any(section_fractions <= 0) or not np.isclose(np.sum(section_fractions), 1.0):
         raise ValueError("trajectory.section_fractions must be positive and sum to one")
-    reference_h5_path = _path(trajectory_raw.get("reference_h5_path"), base)
+    reference_h5_path = (
+        _path(trajectory_raw.get("reference_h5_path"), base)
+        if trajectory_raw.get("reference_h5_path") is not None
+        else None
+    )
     replay_source_directory = (
         _path(trajectory_raw.get("replay_source_directory"), base)
         if trajectory_raw.get("replay_source_directory") is not None
+        else None
+    )
+    joint_range_source_directory = (
+        _path(trajectory_raw.get("joint_range_source_directory"), base)
+        if trajectory_raw.get("joint_range_source_directory") is not None
         else None
     )
     if planner == "representative_replay":
@@ -206,8 +224,18 @@ def load_coverage_plan(path: str | Path) -> CoveragePlan:
             raise ValueError(
                 "trajectory.replay_source_directory must be an existing directory"
             )
-    elif not reference_h5_path.is_file():
+    elif planner != "joint_pose_coverage" and (
+        reference_h5_path is None or not reference_h5_path.is_file()
+    ):
         raise ValueError(f"trajectory reference H5 does not exist: {reference_h5_path}")
+    if (
+        planner == "joint_pose_coverage"
+        and joint_range_source_directory is not None
+        and not joint_range_source_directory.is_dir()
+    ):
+        raise ValueError(
+            "trajectory.joint_range_source_directory must be an existing directory"
+        )
     workspace_voxel_counts = np.asarray(
         trajectory_raw.get("workspace_voxel_counts", [6, 8, 5]), dtype=np.int64
     ).reshape(-1)
@@ -218,6 +246,11 @@ def load_coverage_plan(path: str | Path) -> CoveragePlan:
         planner=planner,
         sample_rate_hz=_positive(trajectory_raw.get("sample_rate_hz", 100.0), "trajectory.sample_rate_hz"),
         joint_limit_margin_rad=_nonnegative(trajectory_raw.get("joint_limit_margin_rad", 0.10), "trajectory.joint_limit_margin_rad"),
+        joint_range_fraction=_fraction(
+            trajectory_raw.get("joint_range_fraction", 1.0),
+            "trajectory.joint_range_fraction",
+            include_one=True,
+        ),
         joint_position_min_rad=_optional_vector(
             trajectory_raw.get("joint_position_min_rad"),
             DOF,
@@ -227,6 +260,19 @@ def load_coverage_plan(path: str | Path) -> CoveragePlan:
             trajectory_raw.get("joint_position_max_rad"),
             DOF,
             "trajectory.joint_position_max_rad",
+        ),
+        joint_range_source_directory=joint_range_source_directory,
+        joint_range_quantiles=_vector(
+            trajectory_raw.get("joint_range_quantiles", [0.01, 0.99]),
+            2,
+            "trajectory.joint_range_quantiles",
+        ),
+        joint_range_exclude_sources=tuple(
+            str(value)
+            for value in trajectory_raw.get(
+                "joint_range_exclude_sources",
+                ["free_space_coverage"],
+            )
         ),
         max_velocity_rad_s=_positive_vector(trajectory_raw.get("max_velocity_rad_s"), DOF, "trajectory.max_velocity_rad_s"),
         max_acceleration_rad_s2=_positive_vector(trajectory_raw.get("max_acceleration_rad_s2"), DOF, "trajectory.max_acceleration_rad_s2"),
@@ -254,6 +300,22 @@ def load_coverage_plan(path: str | Path) -> CoveragePlan:
             trajectory_raw.get("static_hold_s", 0.50),
             "trajectory.static_hold_s",
         ),
+        static_position_threshold_rad=_positive(
+            trajectory_raw.get("static_position_threshold_rad", 0.02),
+            "trajectory.static_position_threshold_rad",
+        ),
+        static_velocity_threshold_rad_s=_positive(
+            trajectory_raw.get("static_velocity_threshold_rad_s", 0.03),
+            "trajectory.static_velocity_threshold_rad_s",
+        ),
+        static_stability_duration_s=_positive(
+            trajectory_raw.get("static_stability_duration_s", 0.25),
+            "trajectory.static_stability_duration_s",
+        ),
+        static_stability_timeout_s=_positive(
+            trajectory_raw.get("static_stability_timeout_s", 3.0),
+            "trajectory.static_stability_timeout_s",
+        ),
         static_pose_count=int(trajectory_raw.get("static_pose_count", 48)),
         replay_pose_count=int(trajectory_raw.get("replay_pose_count", 128)),
         jump_pose_count=int(trajectory_raw.get("jump_pose_count", 64)),
@@ -276,6 +338,7 @@ def load_coverage_plan(path: str | Path) -> CoveragePlan:
         ),
         joint_candidate_count=int(trajectory_raw.get("joint_candidate_count", 4096)),
         joint_pose_count=int(trajectory_raw.get("joint_pose_count", 128)),
+        joint_route_passes=int(trajectory_raw.get("joint_route_passes", 1)),
         joint_connection_step_rad=_positive(
             trajectory_raw.get("joint_connection_step_rad", 0.40),
             "trajectory.joint_connection_step_rad",
@@ -313,6 +376,15 @@ def load_coverage_plan(path: str | Path) -> CoveragePlan:
         )
     if excitation.joint_pose_count < 8:
         raise ValueError("trajectory.joint_pose_count must be at least eight")
+    if excitation.joint_pose_count > 30:
+        raise ValueError("trajectory.joint_pose_count must not exceed thirty")
+    if excitation.joint_route_passes < 1:
+        raise ValueError("trajectory.joint_route_passes must be positive")
+    if excitation.static_stability_timeout_s <= excitation.static_stability_duration_s:
+        raise ValueError(
+            "trajectory.static_stability_timeout_s must exceed "
+            "static_stability_duration_s"
+        )
     if excitation.representative_episode_count < 1:
         raise ValueError("trajectory.representative_episode_count must be positive")
     if not excitation.replay_include_sources:
@@ -335,6 +407,14 @@ def load_coverage_plan(path: str | Path) -> CoveragePlan:
         raise ValueError(
             "trajectory.joint_position_min_rad must be below "
             "joint_position_max_rad on every axis"
+        )
+    if not (
+        0.0 <= excitation.joint_range_quantiles[0]
+        < excitation.joint_range_quantiles[1]
+        <= 1.0
+    ):
+        raise ValueError(
+            "trajectory.joint_range_quantiles must be increasing values in [0, 1]"
         )
 
     workspace_min = _vector(simulation_raw.get("workspace_min_m"), 3, "simulation.workspace_min_m")
@@ -384,6 +464,12 @@ def generate_coverage_trajectory(plan: CoveragePlan) -> CoverageTrajectory:
     cfg = plan.excitation
     run = cfg.run
     lower, upper = effective_joint_position_limits(model, cfg)
+    joint_range_stats = (
+        empirical_joint_range_statistics(cfg)
+        if cfg.planner == "joint_pose_coverage"
+        and cfg.joint_range_source_directory is not None
+        else None
+    )
     checker = MujocoPoseSafetyChecker(plan)
     if cfg.planner == "representative_replay":
         selected = _select_representative_episodes(cfg)
@@ -401,36 +487,37 @@ def generate_coverage_trajectory(plan: CoveragePlan) -> CoverageTrajectory:
             cfg.replay_source_directory,
             ", ".join(Path(path).name for path in source_h5_paths),
         )
+    elif cfg.planner == "joint_pose_coverage":
+        required_reference_q = _select_safe_joint_pose_root(
+            lower,
+            upper,
+            checker,
+            run.seed,
+        )
+        source_h5_paths = (
+            tuple(str(path) for path in joint_range_stats["included_paths"])
+            if joint_range_stats is not None
+            else ()
+        )
+        reference_h5_path = (
+            str(joint_range_stats["source_directory"])
+            if joint_range_stats is not None
+            else ""
+        )
+        reference_h5_sha256 = (
+            _combined_file_sha256(joint_range_stats["included_paths"])
+            if joint_range_stats is not None
+            else ""
+        )
     else:
         reference_q = _load_reference_joint_path(cfg)
+        assert cfg.reference_h5_path is not None
         source_h5_paths = (str(cfg.reference_h5_path),)
         reference_h5_path = str(cfg.reference_h5_path)
         reference_h5_sha256 = _file_sha256(cfg.reference_h5_path)
-    if cfg.planner == "joint_pose_coverage":
-        inside = np.all(
-            (reference_q >= lower[None, :]) & (reference_q <= upper[None, :]),
-            axis=1,
-        )
-        root_candidates = reference_q[inside]
-        if not root_candidates.size:
-            raise ValueError(
-                "reference H5 has no pose inside the configured URDF soft limits "
-                "for the joint-pose coverage root"
-            )
-        center = 0.5 * (lower + upper)
-        scale = np.maximum(upper - lower, 1.0e-9)
-        order = np.argsort(
-            np.linalg.norm((root_candidates - center[None, :]) / scale[None, :], axis=1)
-        )
-        safe_root = checker.safe_mask(root_candidates[order])
-        if not np.any(safe_root):
-            raise ValueError(
-                "reference H5 has no collision-free pose for the joint-pose coverage root"
-            )
-        required_reference_q = root_candidates[order[np.flatnonzero(safe_root)[0]]][None, :]
-    elif cfg.planner != "representative_replay":
         required_reference_q = reference_q
-    if cfg.planner != "representative_replay":
+    if cfg.planner not in ("joint_pose_coverage", "representative_replay"):
+        required_reference_q = reference_q
         outside = np.any(
             (required_reference_q < lower[None, :])
             | (required_reference_q > upper[None, :]),
@@ -470,13 +557,28 @@ def generate_coverage_trajectory(plan: CoveragePlan) -> CoverageTrajectory:
         segment_names = JOINT_POSE_COVERAGE_SEGMENT_NAMES
         log.info(
             "joint-pose coverage candidates=%d poses=%d tree_edges=%d "
-            "transition_speed_scale=%.3f hold=%.3fs",
+            "transition_speed_scale=%.3f hold=%.3fs q_lower=%s q_upper=%s",
             cfg.joint_candidate_count,
             nodes.shape[0],
             nodes.shape[0] - 1,
             cfg.joint_transition_speed_scale,
             cfg.static_hold_s,
+            np.array2string(lower, precision=4),
+            np.array2string(upper, precision=4),
         )
+        if joint_range_stats is not None:
+            log.info(
+                "empirical joint range files=%d excluded=%d samples=%d "
+                "quantiles=%s raw_min=%s raw_max=%s",
+                len(joint_range_stats["included_paths"]),
+                len(joint_range_stats["excluded_paths"]),
+                joint_range_stats["sample_count"],
+                np.array2string(
+                    joint_range_stats["quantile_levels"], precision=4
+                ),
+                np.array2string(joint_range_stats["minimum"], precision=4),
+                np.array2string(joint_range_stats["maximum"], precision=4),
+            )
     else:
         reference_xyz = _forward_kinematics_positions(
             model,
@@ -651,7 +753,37 @@ def validate_coverage_trajectory(
         source_paths = tuple(Path(value).resolve() for value in trajectory.source_h5_paths)
         if not source_paths or trajectory.reference_h5_sha256 != _combined_file_sha256(source_paths):
             raise ValueError("selected replay H5 changed after trajectory generation; regenerate")
+    elif cfg.planner == "joint_pose_coverage":
+        if cfg.joint_range_source_directory is None:
+            if (
+                trajectory.reference_h5_path
+                or trajectory.reference_h5_sha256
+                or trajectory.source_h5_paths
+            ):
+                raise ValueError(
+                    "joint-pose coverage trajectory has unexpected range-source data"
+                )
+        else:
+            stats = empirical_joint_range_statistics(cfg)
+            source_paths = tuple(
+                Path(value).resolve() for value in trajectory.source_h5_paths
+            )
+            if Path(trajectory.reference_h5_path).resolve() != (
+                cfg.joint_range_source_directory
+            ):
+                raise ValueError(
+                    "joint-pose coverage range source directory changed; regenerate"
+                )
+            if source_paths != stats["included_paths"] or (
+                trajectory.reference_h5_sha256
+                != _combined_file_sha256(source_paths)
+            ):
+                raise ValueError(
+                    "manual range-source H5 data changed after trajectory generation; "
+                    "regenerate"
+                )
     else:
+        assert cfg.reference_h5_path is not None
         if Path(trajectory.reference_h5_path).resolve() != cfg.reference_h5_path:
             raise ValueError("coverage trajectory was generated from a different reference H5")
         if trajectory.reference_h5_sha256 != _file_sha256(cfg.reference_h5_path):
@@ -792,6 +924,95 @@ def _load_reference_joint_path(cfg: CoverageExcitationConfig) -> np.ndarray:
     if not np.isfinite(q).all():
         raise ValueError("reference joint dataset contains non-finite values")
     return q
+
+
+def empirical_joint_range_statistics(
+    cfg: CoverageExcitationConfig,
+) -> dict[str, Any]:
+    """Summarize manual q coverage used to bound joint-pose planning.
+
+    Files produced by an automatic free-space planner are excluded by episode
+    metadata so generated data can never expand the empirical planning range.
+    """
+    source = cfg.joint_range_source_directory
+    if source is None:
+        raise ValueError(
+            "trajectory.joint_range_source_directory is required for empirical "
+            "joint-range statistics"
+        )
+    try:
+        import h5py
+    except ImportError as exc:
+        raise RuntimeError("empirical joint-range statistics require h5py") from exc
+
+    candidates = sorted(
+        {
+            *source.glob("*.h5"),
+            *source.glob("*.hdf5"),
+        }
+    )
+    if not candidates:
+        raise ValueError(f"joint-range source contains no H5 files: {source}")
+
+    arrays: list[np.ndarray] = []
+    included_paths: list[Path] = []
+    excluded_paths: list[Path] = []
+    for path in candidates:
+        with h5py.File(path, "r") as h5:
+            metadata: dict[str, Any] = {}
+            if "metadata/episode_json" in h5:
+                raw_metadata = h5["metadata/episode_json"][()]
+                if isinstance(raw_metadata, bytes):
+                    raw_metadata = raw_metadata.decode("utf-8")
+                metadata = json.loads(str(raw_metadata))
+                if not isinstance(metadata, dict):
+                    raise ValueError(
+                        f"H5 episode metadata must be a mapping: {path}"
+                    )
+            if str(metadata.get("source", "")) in cfg.joint_range_exclude_sources:
+                excluded_paths.append(path.resolve())
+                continue
+            if cfg.reference_dataset not in h5:
+                raise ValueError(
+                    f"joint-range H5 {path} is missing dataset "
+                    f"{cfg.reference_dataset!r}"
+                )
+            q = np.asarray(h5[cfg.reference_dataset], dtype=np.float64)
+        if q.ndim != 2 or q.shape[1] != DOF or q.shape[0] == 0:
+            raise ValueError(
+                f"joint-range dataset must have shape (N, {DOF}); "
+                f"got {q.shape} in {path}"
+            )
+        if not np.isfinite(q).all():
+            raise ValueError(f"joint-range dataset contains non-finite values: {path}")
+        arrays.append(q)
+        included_paths.append(path.resolve())
+
+    if not arrays:
+        raise ValueError(
+            "joint-range source contains no eligible manual samples after source "
+            f"exclusion: {source}"
+        )
+    values = np.concatenate(arrays, axis=0)
+    quantile_low, quantile_high = cfg.joint_range_quantiles
+    quantiles = np.quantile(
+        values,
+        [float(quantile_low), float(quantile_high)],
+        axis=0,
+    )
+    return {
+        "source_directory": source.resolve(),
+        "dataset": cfg.reference_dataset,
+        "sample_count": int(values.shape[0]),
+        "included_paths": tuple(included_paths),
+        "excluded_paths": tuple(excluded_paths),
+        "minimum": np.min(values, axis=0),
+        "maximum": np.max(values, axis=0),
+        "median": np.median(values, axis=0),
+        "quantile_levels": cfg.joint_range_quantiles.copy(),
+        "quantile_minimum": quantiles[0],
+        "quantile_maximum": quantiles[1],
+    }
 
 
 def _forward_kinematics_positions(model, q: np.ndarray, frame_name: str) -> np.ndarray:
@@ -1080,7 +1301,7 @@ def _build_joint_pose_coverage_tree(
     checker,
     seed: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Grow a collision-checked tree toward maximin samples in normalized 7D q."""
+    """Build an ordered collision-checked route toward maximin samples in 7D q."""
     start = np.asarray(start, dtype=np.float64).reshape(DOF)
     lower = np.asarray(lower, dtype=np.float64).reshape(DOF)
     upper = np.asarray(upper, dtype=np.float64).reshape(DOF)
@@ -1108,32 +1329,44 @@ def _build_joint_pose_coverage_tree(
     while len(nodes) < pose_count and np.any(active) and attempts < maximum_attempts:
         attempts += 1
         node_matrix = np.stack(normalized_nodes)
+        parent_index = len(nodes) - 1
+        parent = nodes[parent_index]
+        delta = candidates - parent[None, :]
+        scales = np.minimum(
+            1.0,
+            connection_step_rad
+            / np.maximum(np.max(np.abs(delta), axis=1), 1.0e-12),
+        )
+        proposals = parent[None, :] + scales[:, None] * delta
+        normalized_proposals = (proposals - lower[None, :]) / span[None, :]
         distance = np.linalg.norm(
-            normalized_candidates[:, None, :] - node_matrix[None, :, :],
+            normalized_proposals[:, None, :] - node_matrix[None, :, :],
             axis=2,
         )
         minimum_distance = np.min(distance, axis=1)
         minimum_distance[~active] = -1.0
-        candidate_index = int(np.argmax(minimum_distance))
-        parent_index = int(np.argmin(distance[candidate_index]))
-        parent = nodes[parent_index]
-        target = candidates[candidate_index]
-        delta = target - parent
-        scale = min(1.0, connection_step_rad / max(np.max(np.abs(delta)), 1.0e-12))
-        proposal = parent + scale * delta
-        if (
-            np.min(np.linalg.norm((np.stack(nodes) - proposal[None, :]) / span[None, :], axis=1))
-            < 1.0e-4
-            or not bool(checker.safe_mask(proposal[None, :])[0])
-            or not checker.leg_is_safe(parent, proposal)
-        ):
-            active[candidate_index] = False
-            continue
-        nodes.append(proposal.copy())
-        normalized_nodes.append((proposal - lower) / span)
-        parents.append(parent_index)
-        if scale >= 1.0 - 1.0e-12:
-            active[candidate_index] = False
+        selected = False
+        for candidate_index in np.argsort(-minimum_distance):
+            if not active[candidate_index]:
+                break
+            proposal = proposals[candidate_index]
+            proposal_separation = minimum_distance[candidate_index]
+            if (
+                proposal_separation < 1.0e-4
+                or not bool(checker.safe_mask(proposal[None, :])[0])
+                or not checker.leg_is_safe(parent, proposal)
+            ):
+                active[candidate_index] = False
+                continue
+            nodes.append(proposal.copy())
+            normalized_nodes.append((proposal - lower) / span)
+            parents.append(parent_index)
+            if scales[candidate_index] >= 1.0 - 1.0e-12:
+                active[candidate_index] = False
+            selected = True
+            break
+        if not selected:
+            break
 
     if len(nodes) < pose_count:
         raise ValueError(
@@ -1150,6 +1383,35 @@ def _low_discrepancy_joint_samples(count: int, seed: int) -> np.ndarray:
     multipliers = np.sqrt(np.asarray((2, 3, 5, 7, 11, 13, 17), dtype=np.float64))
     index = np.arange(1, int(count) + 1, dtype=np.float64)[:, None]
     return np.mod(offset[None, :] + index * multipliers[None, :], 1.0)
+
+
+def _select_safe_joint_pose_root(
+    lower: np.ndarray,
+    upper: np.ndarray,
+    checker,
+    seed: int,
+) -> np.ndarray:
+    """Choose a deterministic collision-free root near the safe-range center."""
+    lower = np.asarray(lower, dtype=np.float64).reshape(DOF)
+    upper = np.asarray(upper, dtype=np.float64).reshape(DOF)
+    center = 0.5 * (lower + upper)
+    span = upper - lower
+    if np.any(span <= 0.0):
+        raise ValueError("joint-pose coverage has an empty soft-limit range")
+    nearby = _low_discrepancy_joint_samples(512, seed)
+    candidates = np.vstack(
+        (
+            center,
+            center[None, :] + (nearby - 0.5) * (0.25 * span)[None, :],
+        )
+    )
+    safe = checker.safe_mask(candidates)
+    if not np.any(safe):
+        raise ValueError(
+            "joint-pose coverage could not find a collision-free root near the "
+            "center of the configured safe range"
+        )
+    return candidates[np.flatnonzero(safe)[0]][None, :]
 
 
 def _joint_tree_depth_first_edges(parents: np.ndarray) -> list[tuple[int, int]]:
@@ -1180,45 +1442,64 @@ def _fit_joint_pose_coverage_route(
     nodes: np.ndarray,
     parents: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    edges = _joint_tree_depth_first_edges(parents)
+    parents = np.asarray(parents, dtype=np.int64).reshape(-1)
+    if parents.shape != (nodes.shape[0],) or parents[0] != -1:
+        raise ValueError("joint-pose coverage route has invalid parent metadata")
+    if not np.array_equal(parents[1:], np.arange(nodes.shape[0] - 1)):
+        raise ValueError("joint-pose coverage targets must form one ordered safe route")
     hold_count = max(1, int(round(cfg.static_hold_s * cfg.sample_rate_hz)))
-    events = []
-    for source, target in edges:
-        required = _required_leg_samples(
-            cfg,
-            nodes[source],
-            nodes[target],
-            cfg.joint_transition_speed_scale,
-        )
-        events.append((nodes[target], required))
-    minimum = 1 + hold_count + sum(required + hold_count for _, required in events)
+    route_passes = int(getattr(cfg, "joint_route_passes", 1))
+    target_indices: list[int] = []
+    for pass_index in range(route_passes):
+        if pass_index % 2 == 0:
+            target_indices.extend(range(1, nodes.shape[0]))
+        else:
+            target_indices.extend(range(nodes.shape[0] - 2, -1, -1))
+    leg_indices = list(zip([0, *target_indices[:-1]], target_indices))
+    required = np.asarray(
+        [
+            _required_leg_samples(
+                cfg,
+                nodes[source],
+                nodes[target],
+                cfg.joint_transition_speed_scale,
+            )
+            for source, target in leg_indices
+        ],
+        dtype=np.int64,
+    )
+    hold_event_count = 1 + len(target_indices)
+    minimum = hold_event_count * hold_count + int(np.sum(required))
     if minimum > int(count):
         raise ValueError(
-            "joint-pose coverage trajectory is too short for one complete safe-tree "
-            f"traversal: needs {minimum / cfg.sample_rate_hz:.2f}s, "
+            "joint-pose coverage trajectory is too short for all unique targets: "
+            f"needs {minimum / cfg.sample_rate_hz:.2f}s, "
             f"allocated {int(count) / cfg.sample_rate_hz:.2f}s"
         )
+    transition_counts = required + _proportional_extra_counts(
+        int(count) - minimum,
+        required,
+    )
 
     values = [nodes[0].copy()]
     segments = [1]
-    values.extend(nodes[0].copy() for _ in range(hold_count))
-    segments.extend([1] * hold_count)
+    values.extend(nodes[0].copy() for _ in range(hold_count - 1))
+    segments.extend([1] * (hold_count - 1))
     current = nodes[0].copy()
-    event_index = 0
-    while True:
-        target, required = events[event_index]
-        event_size = required + hold_count
-        if len(values) + event_size > int(count):
-            break
+    for target_index, transition_count in zip(target_indices, transition_counts):
+        target = nodes[target_index]
         before = len(values)
-        current = _append_leg_with_count(values, current, target, required)
+        current = _append_leg_with_count(
+            values,
+            current,
+            target,
+            int(transition_count),
+        )
         segments.extend([0] * (len(values) - before))
         values.extend(current.copy() for _ in range(hold_count))
         segments.extend([1] * hold_count)
-        event_index = (event_index + 1) % len(events)
-    remainder = int(count) - len(values)
-    values.extend(current.copy() for _ in range(remainder))
-    segments.extend([1] * remainder)
+    if len(values) != int(count):
+        raise RuntimeError("joint-pose coverage route produced the wrong sample count")
     return np.stack(values), np.asarray(segments, dtype=np.int8)
 
 
@@ -1463,14 +1744,15 @@ def effective_joint_position_limits(
     model,
     cfg: CoverageExcitationConfig,
 ) -> tuple[np.ndarray, np.ndarray]:
-    lower = (
-        np.asarray(model.lowerPositionLimit, dtype=np.float64)
-        + cfg.joint_limit_margin_rad
-    )
-    upper = (
-        np.asarray(model.upperPositionLimit, dtype=np.float64)
-        - cfg.joint_limit_margin_rad
-    )
+    margin_lower, margin_upper = hardware_joint_position_limits(model, cfg)
+    center = 0.5 * (margin_lower + margin_upper)
+    half_range = 0.5 * (margin_upper - margin_lower) * cfg.joint_range_fraction
+    lower = center - half_range
+    upper = center + half_range
+    if cfg.joint_range_source_directory is not None:
+        stats = empirical_joint_range_statistics(cfg)
+        lower = np.maximum(lower, stats["quantile_minimum"])
+        upper = np.minimum(upper, stats["quantile_maximum"])
     if cfg.joint_position_min_rad is not None:
         lower = np.maximum(lower, cfg.joint_position_min_rad)
         upper = np.minimum(upper, cfg.joint_position_max_rad)
@@ -1480,6 +1762,24 @@ def effective_joint_position_limits(
             "configured joint-position range has no overlap with the URDF soft "
             f"limits for joints {failed.tolist()}"
         )
+    return lower, upper
+
+
+def hardware_joint_position_limits(
+    model,
+    cfg: CoverageExcitationConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return measured-q safety limits, independent of target coverage bounds."""
+    lower = (
+        np.asarray(model.lowerPositionLimit, dtype=np.float64)
+        + cfg.joint_limit_margin_rad
+    )
+    upper = (
+        np.asarray(model.upperPositionLimit, dtype=np.float64)
+        - cfg.joint_limit_margin_rad
+    )
+    if np.any(lower >= upper):
+        raise ValueError("URDF joint limits are empty after applying the safety margin")
     return lower, upper
 
 

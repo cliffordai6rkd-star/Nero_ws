@@ -3,12 +3,8 @@ teleop:
   protocol: can
   backend: pyagxarm
   command:
-    # CAN 任一状态流超过 30 ms 未更新，禁止继续使用缓存状态或推进模型。
-    maximum_can_frame_gap_s: 0.03
-    # 完整机械臂状态内 q 组和 7 路电机源时间戳的最大跨度。
-    maximum_state_source_skew_s: 0.015
-    # 主从臂真实状态配对时允许的最大时间差。
-    maximum_arm_pair_skew_s: 0.015
+    # 固定频率读取 pyAgxArm 的最新 CAN 缓存；控制和 robot-state 数采共用此频率。
+    sample_rate_hz: 100.0
     # 双边控制周期超过 50 ms 时，在下一次命令下发前触发紧急复位。
     control_watchdog_timeout_s: 0.05
     # 只切换从臂下发方式；主臂始终使用 MIT 重力补偿和力反馈。
@@ -17,16 +13,16 @@ teleop:
       # 主臂拖动阻尼；主臂 kp 固定使用代码默认值 0。
       leader_kd: [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]
       # 下面的两个值尽量都不要修改，比较危险  并且改了的话需要重新采背景力矩数据   因为这些值会改变动力学系统
-      follower_kp: [1.0, 1.0, 2.0, 4.0, 1.0, 1.0, 8.0]   # q
-      follower_kd: [0.1, 0.1, 0.25, 0.5, 0.1, 0.1, 0.5]  # v
+      follower_kp: [4.0, 5.0, 2.0, 3.5, 2.0, 2.0, 3.0]   # q
+      follower_kd: [0.1, 0.1, 0.25, 0.25, 0.1, 0.1, 0.1]  # v
       # 首次实机逐轴确认 sign，再逐步增加 gain/limit。
-      force_feedback_gain: [1, 1, 1, 1, 1, 1, 1]
-      # force_feedback_gain: [0, 0, 0, 0, 0, 0, 0]
+      # force_feedback_gain: [1, 1, 1, 1, 1, 1, 1]
+      force_feedback_gain: [0, 0, 0, 0, 0, 0, 0]
       force_feedback_sign: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
       force_feedback_deadband_nm: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
       # force_feedback_limit_nm: [5, 5, 5, 5, 5, 5, 5]
       force_feedback_limit_nm: [5, 10, 10, 10, 10, 10, 10]
-      force_feedback_lowpass_hz: 10.0
+      force_feedback_lowpass_hz: 20
     joint_step_limit_rad: 0.3
     reset_on_start: true
     reset_after_episode: true
@@ -51,37 +47,47 @@ teleop:
           bitrate: 1000000
           firmware: V120
           # +0.00000, -0.14689, -0.01138, +1.80020, -0.02033, +0.02744, +1.50378
-          rest_q: [+0.00000, +0.000, +0.0000, +1.80020, -0.000, +0.000, +1.50378]
+          rest_q: [+0.00000, -0.14689, 0, +1.80020, 0, +0.02744, +1.50378]
+
+
 output:
   # directory: ../runs/insert_usb
   # directory: ../runs/next_data
   # 新事件驱动底层的数据与旧固定网格数据分目录保存。
-  directory: ../runs/next_human_data
+  directory: ../runs/wipe_board
   prefix: episode
   # 每个 episode 开始后先运行控制和滤波，但不保存或可视化这段数据。
-  discard_initial_s: 1.2
+  discard_initial_s: 0.5
 
-# 数采仍保存全部真实 CAN 对齐帧；每个已配置模型独立按训练频率取样推理。
+
 tau_ext_inference:
   enabled: true
+  # 主臂力反馈来源：tau_f 使用 RNEA+tau_f residual；tau_free 使用自由空间
+  # torque 模型 residual。两路若都配置，仍会同时推理、绘图并写入 H5。
+  feedback_source: tau_f
   # 相邻被选模型观测超过该间隔时只记录警告；模型仍使用历史 49 帧 + 当前 1 帧。
   observation_gap_warning_s: 0.06
   maximum_prediction_age_s: 0.06
-  # checkpoint_path 为空时不加载、不调用该分支；两个分支都为空时完全不运行在线推理。
+
   tau_f:
-    checkpoint_path: null
-    observation_sample_rate_hz: 100.0
+    checkpoint_path: ../../PINN/outputs/tau_f_sequence/lstm_causal_derived/checkpoints/epoch_083_val_loss_0.003087.pt
+    observation_sample_rate_hz: 50.0
+    # 可选的显式契约校验；顺序必须与 checkpoint 的 model.inputs 完全一致。
+    # 删除本项时将直接采用 checkpoint 自带的输入列表。
+    input_keys: [q, dq, delta_q, tau]
+
   tau_next:
-    checkpoint_path: model/tau_free/epoch_095_val_tau_mse_nm2_0.006872.pt
+    # 历史内部名称 tau_next；该分支对应 tau_free torque checkpoint。
+    checkpoint_path: null
     # Unix epoch 固定相位；每个 20 ms tick 只用 tick 前最新完整帧推进 tau-free。
     observation_sample_rate_hz: 50.0
   # 在 tau_f/tau_next 各自二次采样前，共享同一份原始帧因果抗混叠结果。
-  # 只处理 q、dq、tau；q_cmd 保持事件/ZOH 信号，不参与低通。
   source_butterworth_filter:
     enabled: true
-    cutoff_hz: 15.0
+    cutoff_hz: 10.0
     order: 2
-  # 与 PINN offline_tau_labels 的 forward Kalman 参数一致；RTS 仅用于生成ddq离线标签。
+  # 必须与 tau_f checkpoint 的 derived_target_config.state_estimator 一致；
+  # 在线恢复 forward Kalman，RTS 不参与部署。
   state_estimator:
     position_std: 5.0e-4
     velocity_std: 3.0e-2
@@ -90,25 +96,17 @@ tau_ext_inference:
     initial_velocity_std: 2.0e-1
     initial_acceleration_std: 5.0
     max_gap_s: 0.1
-  # 与 PINN 数据推理一致：tau_ext 只在残差生成后处理一次。
-  # 先用 5 点因果 Hampel 去除离群值，再做 4 阶 8 Hz 因果 Butterworth；
-  # 原始残差另存为 *_raw；该滤波器只作用于模型选择后的真实观测序列。
+
   tau_ext_filter:
     enabled: true
-    # mode: hampel_butterworth
-    # window: 5
-    # hampel_n_sigma: 3.0
-    # cutoff_hz: 8.0
-    # order: 4
-    # sample_rate_hz: 100.0
     mode: moving_average
-    window: 40
+    window: 5
     cutoff_hz: 10.0
 
 # 左列显示 tau_ext_cal/tau_ext_pred，右列显示 wrench_cal/wrench_pred。
 realtime_plot:
   # 当前图中预测量依赖 PINN/NEXT；新模型可用前必须关闭。
-  enabled: true
+  enabled: false
   window_s: 20.0
   update_rate_hz: 20.0
   inverse_dynamics:
@@ -121,45 +119,45 @@ realtime_plot:
     reference_frame: local
     damping: 0.01
 
-# cameras:
-#   - name: side
-#     enabled: true
-#     visualize: true
-#     backend: v4l2
-#     serial_number: CC1N16200XL
-#     pixel_format: MJPG
-#     buffer_size: 1
-#     startup_timeout_s: 2.0
-#     frame_timeout_s: 0.5
-#     width: 640
-#     height: 480
-#     fps: 30
-#     exposure: 400
-#     # 保持自动曝光，但禁止相机通过延长曝光主动降低采集帧率。
-#     exposure_dynamic_framerate: false
-#     depth: false
-#     # crop: [0, null, 0, null]
-#     output_size: [256, 192]
+cameras:
+  - name: side
+    enabled: true
+    visualize: true
+    backend: v4l2
+    serial_number: CC1N16200XL
+    pixel_format: MJPG
+    buffer_size: 1
+    startup_timeout_s: 2.0
+    frame_timeout_s: 0.5
+    width: 640
+    height: 480
+    fps: 25
+    exposure: 400
+    # 保持自动曝光，但禁止相机通过延长曝光主动降低采集帧率。
+    exposure_dynamic_framerate: false
+    depth: false
+    # crop: [0, null, 0, null]
+    output_size: [256, 192]
 
-#   - name: wrist
-#     enabled: true
-#     # 数采和推理共用独立 GUI 进程显示最新帧；预览慢时丢旧帧，不阻塞控制。
-#     visualize: true
-#     backend: v4l2
-#     serial_number: CC1WC520122
-#     pixel_format: MJPG
-#     buffer_size: 1
-#     startup_timeout_s: 2.0
-#     frame_timeout_s: 0.5
-#     width: 640
-#     height: 480
-#     fps: 25
-#     exposure: 400
-#     # 保持自动曝光，但禁止相机通过延长曝光主动降低采集帧率。
-#     exposure_dynamic_framerate: false
-#     depth: false
-#     # crop: [0, null, 0, null]
-#     output_size: [256, 192]
+  - name: wrist
+    enabled: true
+    # 数采和推理共用独立 GUI 进程显示最新帧；预览慢时丢旧帧，不阻塞控制。
+    visualize: true
+    backend: v4l2
+    serial_number: CC1WC520122
+    pixel_format: MJPG
+    buffer_size: 1
+    startup_timeout_s: 2.0
+    frame_timeout_s: 0.5
+    width: 640
+    height: 480
+    fps: 25
+    exposure: 400
+    # 保持自动曝光，但禁止相机通过延长曝光主动降低采集帧率。
+    exposure_dynamic_framerate: false
+    depth: false
+    # crop: [0, null, 0, null]
+    output_size: [256, 192]
 
 gripper:
   enabled: true
@@ -182,10 +180,6 @@ robot_states:
 
   velocity:
     enabled: true
-    lowpass: false
-
-  acceleration:
-    enabled: false
     lowpass: false
 
   ee_pose:

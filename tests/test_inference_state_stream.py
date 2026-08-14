@@ -209,20 +209,12 @@ def test_continuous_state_stream_reports_bounded_history_rollover() -> None:
     assert len(stream.drain_after(0)) <= 2
 
 
-def test_continuous_state_stream_drains_all_isolated_process_states() -> None:
+def test_continuous_state_stream_reads_one_latest_state_per_tick() -> None:
     class Arm:
-        def __init__(self) -> None:
-            self.sent = False
+        source = _Arm()
 
-        def drain_states(self):
-            if self.sent:
-                return SimpleNamespace(states=(), dropped=0)
-            self.sent = True
-            source = _Arm()
-            return SimpleNamespace(
-                states=(source.read_state(), source.read_state(), source.read_state()),
-                dropped=0,
-            )
+        def read_state(self):
+            return self.source.read_state()
 
     ready = threading.Event()
     seen = []
@@ -238,21 +230,21 @@ def test_continuous_state_stream_drains_all_isolated_process_states() -> None:
     stream.start()
     assert ready.wait(timeout=1.0)
     for _ in range(100):
-        if len(seen) == 3:
+        if len(seen) >= 3:
             break
         threading.Event().wait(0.001)
     stream.stop()
 
     assert stream.fault is None
-    assert len(seen) == 3
+    assert len(seen) >= 3
     assert seen == sorted(seen)
 
 
-def test_continuous_state_stream_fails_closed_on_hardware_ring_overrun() -> None:
+def test_continuous_state_stream_fails_closed_on_sdk_read_error() -> None:
     class Arm:
         @staticmethod
-        def drain_states():
-            return SimpleNamespace(states=(), dropped=2)
+        def read_state():
+            raise RuntimeError("SDK read failed")
 
     stream = ContinuousInferenceStateStream(
         Arm(),
@@ -270,22 +262,15 @@ def test_continuous_state_stream_fails_closed_on_hardware_ring_overrun() -> None
     stream.stop()
 
     assert isinstance(stream.fault, RuntimeError)
-    assert "2 aligned states were overwritten" in str(stream.fault)
+    assert "SDK read failed" in str(stream.fault)
 
 
-def test_continuous_state_stream_processes_every_ring_backlog_sample() -> None:
+def test_continuous_state_stream_does_not_expand_sdk_backlog() -> None:
     class Arm:
-        def __init__(self) -> None:
-            source = _Arm()
-            self.states = (
-                source.read_state(),
-                source.read_state(),
-                source.read_state(),
-            )
+        source = _Arm()
 
-        def drain_states(self):
-            states, self.states = self.states, ()
-            return SimpleNamespace(states=states, dropped=0)
+        def read_state(self):
+            return self.source.read_state()
 
     ready = threading.Event()
     tau_ext = _TauExt()
@@ -303,5 +288,5 @@ def test_continuous_state_stream_processes_every_ring_backlog_sample() -> None:
     stream.stop()
 
     assert stream.fault is None
-    assert tau_ext.count == 3
-    assert len(stream.drain_after(0)) == 3
+    assert tau_ext.count >= 1
+    assert len(stream.drain_after(0)) >= 1

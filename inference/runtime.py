@@ -128,6 +128,7 @@ class NeroInferenceRuntime:
             wrench_processor=self._process_stream_wrench,
             on_sample=self._on_stream_sample,
             q_cmd_provider=self._get_q_cmd,
+            poll_interval_s=1.0 / collection.teleop.command.sample_rate_hz,
         )
         self._observation_warmup_started_us: int | None = None
         self._inference_control_mode_ready = False
@@ -138,7 +139,7 @@ class NeroInferenceRuntime:
         wrench_from_filtered_tau: np.ndarray,
         timestamp_us: int,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Filter/gate each CAN-derived wrench before it enters DP history."""
+        """Filter/gate each fixed-rate wrench sample before it enters DP history."""
         wrench = np.asarray(wrench_from_filtered_tau, dtype=np.float64).reshape(-1)
         if (
             self.config.observation_protection.enabled
@@ -185,17 +186,16 @@ class NeroInferenceRuntime:
             return
         self.arm.connect()
         try:
-            self._configure_observation_state_alignment()
             self.arm.set_follower_mode()
             self.arm.enable()
             if self.command_enabled:
                 self._reset_arm_to_rest("startup")
             else:
-                self._wait_for_valid_aligned_state()
+                self._wait_for_finite_arm_state()
             if not self.config.observation_protection.enabled:
                 self._prepare_inference_control_mode()
                 self._inference_control_mode_ready = True
-            initial_state = self._wait_for_valid_aligned_state()
+            initial_state = self._wait_for_finite_arm_state()
             self._set_q_cmd(
                 initial_state.q,
                 timestamp_us=int(
@@ -387,23 +387,10 @@ class NeroInferenceRuntime:
                 "observation protection settled after %.3fs; inference control mode ready",
                 elapsed_s,
             )
-            # The mode transition consumes fresh aligned states. Start inference
-            # from the next complete control sample.
+            # The mode transition consumes a state read. Start inference from
+            # the next complete control sample.
             return False
         return True
-
-    def _configure_observation_state_alignment(self) -> None:
-        q_state = self.collection.robot_states["q"]
-        dq_state = self.collection.robot_states["velocity"]
-        ddq_state = self.collection.robot_states["acceleration"]
-        command = self.collection.teleop.command
-        self.arm.configure_state_capture(
-            command.maximum_state_source_skew_s,
-            q_state.lowpass_cutoff_hz if q_state.lowpass else None,
-            dq_state.lowpass_cutoff_hz if dq_state.lowpass else None,
-            ddq_state.lowpass_cutoff_hz if ddq_state.lowpass else None,
-            command.maximum_can_frame_gap_s,
-        )
 
     def _reset_online_tau_ext_episode(self) -> None:
         self.online_tau_ext.reset_episode()
@@ -413,9 +400,9 @@ class NeroInferenceRuntime:
             return
         self.arm.validate_joint_impedance_support()
         self.arm.configure_joint_impedance_mode()
-        # A firmware motion-mode transition can briefly interrupt CAN motor
-        # samples. Do not begin inference until the delayed timeline is whole.
-        self._wait_for_valid_aligned_state()
+        # A firmware motion-mode transition can briefly expose incomplete SDK
+        # cache values. Do not begin control until one finite snapshot arrives.
+        self._wait_for_finite_arm_state()
 
     def _best_effort_follower_enabled_hold(
         self,
@@ -467,7 +454,7 @@ class NeroInferenceRuntime:
         )
         self.arm.set_follower_mode()
         self.arm.enable()
-        self._wait_for_valid_aligned_state()
+        self._wait_for_finite_arm_state()
         reset_target = rest_q.copy()
         self._move_arm_to_reset_target(reset_target)
         deadline = time.monotonic() + command.reset_timeout_s
@@ -478,11 +465,10 @@ class NeroInferenceRuntime:
             samples = []
             sample_period_s = 1.0 / max(float(command.idle_rate_hz), 1.0)
             for sample_index in range(sample_count):
-                # Position/motion-mode transitions can briefly leave the delayed
-                # CAN timeline incomplete. Use the same readiness gate as online
-                # inference instead of treating one transient NaN frame as fatal.
-                aligned_state = self._wait_for_valid_aligned_state()
-                q = np.asarray(aligned_state.q, dtype=np.float64).reshape(-1)
+                # Position/motion-mode transitions can briefly expose incomplete
+                # SDK cache values. Retry until one finite control snapshot arrives.
+                state = self._wait_for_finite_arm_state()
+                q = np.asarray(state.q, dtype=np.float64).reshape(-1)
                 samples.append(q)
                 if sample_index + 1 < sample_count:
                     time.sleep(sample_period_s)
@@ -496,7 +482,7 @@ class NeroInferenceRuntime:
             if maximum_error <= command.reset_error_limit_rad:
                 self.arm.set_follower_mode()
                 self.arm.enable()
-                final_state = self._wait_for_valid_aligned_state()
+                final_state = self._wait_for_finite_arm_state()
                 self._set_q_cmd(
                     final_state.q,
                     timestamp_us=int(
@@ -522,13 +508,13 @@ class NeroInferenceRuntime:
             )
             self._move_arm_to_reset_target(reset_target)
 
-    def _wait_for_valid_aligned_state(self):
+    def _wait_for_finite_arm_state(self):
         timeout_s = self.collection.teleop.command.input_ready_timeout_s
         deadline_s = time.monotonic() + timeout_s
         last_state = None
         while time.monotonic() < deadline_s:
             last_state = self.arm.read_state()
-            vectors = (last_state.q, last_state.dq, last_state.ddq, last_state.torque)
+            vectors = (last_state.q, last_state.dq, last_state.torque)
             if all(
                 np.asarray(value, dtype=np.float64).shape == (7,)
                 and np.all(np.isfinite(value))
@@ -538,7 +524,7 @@ class NeroInferenceRuntime:
                 return last_state
             time.sleep(0.002)
         raise RuntimeError(
-            "timed out waiting for collection-aligned q/dq/ddq/tau after mode reset; "
+            "timed out waiting for finite q/dq/tau after mode reset; "
             f"last_state={last_state}"
         )
 
@@ -601,7 +587,7 @@ class NeroInferenceRuntime:
                 if invalid_duration_s <= self.config.runtime.maximum_state_age_s:
                     return None
                 raise RuntimeError(
-                    "collection-aligned arm state remained incomplete for "
+                    "arm SDK cache remained incomplete for "
                     f"{invalid_duration_s:.3f}s"
                 )
 
@@ -679,7 +665,7 @@ class NeroInferenceRuntime:
         return sample
 
     def _drain_state_observations(self) -> None:
-        """Backfill every canonical CAN record produced while the main loop was busy."""
+        """Backfill fixed-rate state records produced while the main loop was busy."""
         if not self._continuous_state_stream_enabled:
             return
         records = self._state_stream.drain_after(
@@ -695,19 +681,6 @@ class NeroInferenceRuntime:
                 self._state_stream.history_size,
             )
             self._last_state_stream_rollover_count = rollover_count
-        if self._last_consumed_state_timestamp_us:
-            history_gap_us = (
-                records[0].timestamp_us - self._last_consumed_state_timestamp_us
-            )
-            allowed_gap_us = int(
-                round(self.collection.teleop.command.maximum_can_frame_gap_s * 1e6)
-            )
-            if history_gap_us > allowed_gap_us:
-                raise RuntimeError(
-                    "continuous inference state history overrun: "
-                    f"unconsumed CAN-derived samples span {history_gap_us * 1.0e-6:.3f}s "
-                    f"(limit {allowed_gap_us * 1.0e-6:.3f}s)"
-                )
         for record in records:
             self.pipeline.append_continuous_can_observation(
                 q=record.q,

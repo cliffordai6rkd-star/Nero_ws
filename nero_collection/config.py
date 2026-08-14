@@ -120,6 +120,7 @@ class SourceButterworthFilterConfig:
 @dataclass(frozen=True)
 class TauExtInferenceConfig:
     enabled: bool = False
+    feedback_source: str = "tau_free"
     observation_gap_warning_s: float = 0.06
     maximum_prediction_age_s: float = 0.06
     tau_f: SequenceCheckpointConfig = field(default_factory=SequenceCheckpointConfig)
@@ -198,9 +199,7 @@ class BilateralMitConfig:
 
 @dataclass(frozen=True)
 class CommandConfig:
-    maximum_state_source_skew_s: float = 0.015
-    maximum_arm_pair_skew_s: float = 0.015
-    maximum_can_frame_gap_s: float = 0.03
+    sample_rate_hz: float = 100.0
     control_watchdog_timeout_s: float = 0.05
     idle_rate_hz: float = 30.0
     input_ready_timeout_s: float = 3.0
@@ -268,7 +267,6 @@ DEFAULT_STATE_PARAMS = {
         mean_window=5,
     ),
     "velocity": StateParamConfig(enabled=True, lowpass=True, lowpass_cutoff_hz=6.0),
-    "acceleration": StateParamConfig(enabled=False, lowpass=True, lowpass_cutoff_hz=3.0),
     "ee_pose": StateParamConfig(enabled=True, lowpass=False),
     "torque": StateParamConfig(enabled=True, lowpass=False),
     "tau_id": StateParamConfig(enabled=True, lowpass=False),
@@ -363,31 +361,30 @@ def _parse_command(data: dict[str, Any]) -> CommandConfig:
     reset_min_duration_s = float(data.get("reset_min_duration_s", 0.2))
     reset_max_step_rad = float(data.get("reset_max_step_rad", 0.05))
     control_mode = str(data.get("control_mode", "mit")).lower()
-    removed_timing = {"sample_rate_hz", "state_alignment_delay_s"}.intersection(data)
+    removed_timing = {
+        "state_alignment_delay_s",
+        "maximum_state_source_skew_s",
+        "maximum_arm_pair_skew_s",
+        "maximum_can_frame_gap_s",
+    }.intersection(data)
     if removed_timing:
         raise ValueError(
-            "fixed-grid teleop.command timing fields were removed: "
+            "event-alignment teleop.command fields were removed: "
             + ", ".join(sorted(removed_timing))
         )
-    maximum_state_source_skew_s = float(
-        data.get("maximum_state_source_skew_s", 0.015)
-    )
-    maximum_arm_pair_skew_s = float(data.get("maximum_arm_pair_skew_s", 0.015))
-    maximum_can_frame_gap_s = float(data.get("maximum_can_frame_gap_s", 0.03))
+    sample_rate_hz = float(data.get("sample_rate_hz", 100.0))
     control_watchdog_timeout_s = float(data.get("control_watchdog_timeout_s", 0.05))
     if control_mode not in {"mit", "position"}:
         raise ValueError("teleop.command.control_mode must be mit or position")
-    if not isfinite(maximum_state_source_skew_s) or maximum_state_source_skew_s <= 0:
-        raise ValueError("teleop.command.maximum_state_source_skew_s must be positive and finite")
-    if not isfinite(maximum_arm_pair_skew_s) or maximum_arm_pair_skew_s <= 0:
-        raise ValueError("teleop.command.maximum_arm_pair_skew_s must be positive and finite")
-    if not isfinite(maximum_can_frame_gap_s) or maximum_can_frame_gap_s <= 0:
-        raise ValueError(
-            "teleop.command.maximum_can_frame_gap_s must be positive and finite"
-        )
+    if not isfinite(sample_rate_hz) or sample_rate_hz <= 0:
+        raise ValueError("teleop.command.sample_rate_hz must be positive and finite")
     if not isfinite(control_watchdog_timeout_s) or control_watchdog_timeout_s <= 0:
         raise ValueError(
             "teleop.command.control_watchdog_timeout_s must be positive and finite"
+        )
+    if control_watchdog_timeout_s <= 1.0 / sample_rate_hz:
+        raise ValueError(
+            "teleop.command.control_watchdog_timeout_s must exceed one sample period"
         )
     if role_switch_settle_s < 0:
         raise ValueError("teleop.command.role_switch_settle_s must be non-negative")
@@ -402,9 +399,7 @@ def _parse_command(data: dict[str, Any]) -> CommandConfig:
     if reset_max_step_rad <= 0:
         raise ValueError("teleop.command.reset_max_step_rad must be positive")
     return CommandConfig(
-        maximum_state_source_skew_s=maximum_state_source_skew_s,
-        maximum_arm_pair_skew_s=maximum_arm_pair_skew_s,
-        maximum_can_frame_gap_s=maximum_can_frame_gap_s,
+        sample_rate_hz=sample_rate_hz,
         control_watchdog_timeout_s=control_watchdog_timeout_s,
         idle_rate_hz=float(data.get("idle_rate_hz", 30.0)),
         input_ready_timeout_s=float(data.get("input_ready_timeout_s", 3.0)),
@@ -820,6 +815,7 @@ def _parse_tau_ext_inference(
         )
     unknown = set(data) - {
         "enabled",
+        "feedback_source",
         "observation_gap_warning_s",
         "maximum_prediction_age_s",
         "tau_f",
@@ -834,6 +830,11 @@ def _parse_tau_ext_inference(
         )
 
     enabled = bool(data.get("enabled", False))
+    feedback_source = str(data.get("feedback_source", "tau_free")).strip().lower()
+    if feedback_source not in {"tau_f", "tau_free"}:
+        raise ValueError(
+            "tau_ext_inference.feedback_source must be tau_f or tau_free"
+        )
     observation_gap_warning_s = float(data.get("observation_gap_warning_s", 0.06))
     maximum_prediction_age_s = float(data.get("maximum_prediction_age_s", 0.06))
     for name, value in (
@@ -862,6 +863,7 @@ def _parse_tau_ext_inference(
     tau_ext_filter = _parse_tau_ext_filter(data.get("tau_ext_filter", {}))
     return TauExtInferenceConfig(
         enabled=enabled,
+        feedback_source=feedback_source,
         observation_gap_warning_s=observation_gap_warning_s,
         maximum_prediction_age_s=maximum_prediction_age_s,
         tau_f=tau_f,
@@ -1038,7 +1040,7 @@ def _parse_sequence_checkpoint(
 
     input_value = data.get("input_keys")
     input_keys = None if input_value is None else tuple(str(key) for key in input_value)
-    allowed_inputs = {"q", "dq", "delta_q"}
+    allowed_inputs = {"q", "dq", "delta_q", "tau"}
     if input_keys is not None:
         if not input_keys or len(set(input_keys)) != len(input_keys):
             raise ValueError(f"{name}.input_keys must be non-empty and unique")

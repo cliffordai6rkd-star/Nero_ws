@@ -50,35 +50,6 @@ def test_select_endpoints_defaults_to_both_arms_in_all_pairs() -> None:
     assert _select_endpoints(config, ["main"], "follower") == [follower]
 
 
-def test_read_only_arm_setup_only_configures_state_alignment() -> None:
-    calls = []
-
-    class Arm:
-        def configure_state_alignment(self, *args):
-            calls.append(args)
-
-        def __getattr__(self, name):
-            if name.startswith(("enable", "disable", "set_", "move_", "command_")):
-                raise AssertionError(f"unexpected control lookup: {name}")
-            raise AttributeError(name)
-
-    state = SimpleNamespace(mean_window=10, lowpass=True, lowpass_cutoff_hz=5.0)
-    config = SimpleNamespace(
-        robot_states={"q": state, "velocity": state, "acceleration": state},
-        teleop=SimpleNamespace(
-            command=SimpleNamespace(
-                state_alignment_delay_s=0.015,
-                sample_rate_hz=100.0,
-                maximum_can_frame_gap_s=0.03,
-            )
-        ),
-    )
-
-    _configure_read_only_alignment(Arm(), config)
-
-    assert calls == [(0.015, 100.0, 10, 5.0, 5.0, 5.0, 0.03)]
-
-
 def test_evaluate_findings_detects_camera_induced_can_gap_growth() -> None:
     thresholds = Thresholds(
         poll_rate_hz=100.0,

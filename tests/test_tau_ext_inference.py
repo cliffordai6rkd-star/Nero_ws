@@ -21,11 +21,11 @@ from nero_collection.config import (
     load_config,
 )
 from nero_collection.filters import (
-    ButterworthLowPass,
     CausalFilterPipeline,
     CausalHampelButterworth,
     CausalWindowLowPass,
     OnePoleLowPass,
+    VariableStepButterworthLowPass,
 )
 from nero_collection.tau_ext_inference import (
     OnlineTauExtInference,
@@ -257,7 +257,6 @@ def test_source_butterworth_filters_q_dq_tau_once_before_both_model_grids() -> N
             source_butterworth_filter=SourceButterworthFilterConfig(
                 enabled=True,
                 cutoff_hz=15.0,
-                sample_rate_hz=117.0,
                 order=2,
             ),
         ),
@@ -281,9 +280,9 @@ def test_source_butterworth_filters_q_dq_tau_once_before_both_model_grids() -> N
         4.0 * ones,
     )
 
-    q_reference = ButterworthLowPass(15.0, 117.0, 2)
-    dq_reference = ButterworthLowPass(15.0, 117.0, 2)
-    tau_reference = ButterworthLowPass(15.0, 117.0, 2)
+    q_reference = VariableStepButterworthLowPass(15.0)
+    dq_reference = VariableStepButterworthLowPass(15.0)
+    tau_reference = VariableStepButterworthLowPass(15.0)
     q_reference.apply(zeros, 1_000_000)
     dq_reference.apply(zeros, 1_000_000)
     tau_reference.apply(zeros, 1_000_000)
@@ -390,6 +389,72 @@ def test_tau_f_checkpoint_rejects_missing_label_contract() -> None:
     tau_f.metadata = replace(tau_f.metadata, target_contract=None)
     with pytest.raises(RuntimeError, match="rebuild matched-filter labels"):
         _inference(tau_f, tau_next, inverse_dynamics, state_estimator)
+
+
+def test_derived_tau_f_reuses_one_filtered_tau_for_model_and_residual() -> None:
+    tau_f = _Predictor("tau_f", np.zeros(7))
+    operations = [{"type": "lowpass", "cutoff_hz": 10.0}]
+    tau_f.metadata = replace(
+        tau_f.metadata,
+        input_keys=("q", "dq", "delta_q", "tau"),
+        input_dims={"q": 7, "dq": 7, "delta_q": 7, "tau": 7},
+        target_contract="causal_rnea_residual_v1",
+        dataloader_filters={
+            "q": {"enabled": False, "operations": []},
+            "dq": {"enabled": False, "operations": []},
+            "tau": {"enabled": True, "operations": operations},
+        },
+        derived_target_config={
+            "enabled": True,
+            "method": "causal_rnea_residual_v1",
+            "target_key": "tau_f",
+            "source_keys": {"q": "q", "dq": "dq", "tau": "tau"},
+            "state_estimator": {
+                "position_std": 5.0e-4,
+                "velocity_std": 3.0e-2,
+                "jerk_std": 2.0,
+                "initial_position_std": 1.0e-2,
+                "initial_velocity_std": 2.0e-1,
+                "initial_acceleration_std": 5.0,
+                "max_gap_s": 0.1,
+            },
+            "dq_sign": [1.0] * 7,
+            "rnea_state_source": "measured",
+            "torque_filter_key": "tau",
+            "torque_filter_operations": operations,
+            "ddq_source": "variable_dt_kalman_forward_filter",
+            "residual_formula": "tau_f=tau_filtered-tau_id_filtered",
+        },
+    )
+    inverse_dynamics = _InverseDynamics(np.zeros(7))
+    inference = OnlineTauExtInference(
+        TauExtInferenceConfig(
+            enabled=True,
+            tau_f=SequenceCheckpointConfig(observation_sample_rate_hz=50.0),
+        ),
+        InverseDynamicsConfig(),
+        DynamicsProcessingConfig(),
+        {},
+        tau_f_predictor=tau_f,
+        estimator=inverse_dynamics,
+        state_estimator=_StateEstimator(np.zeros(7)),
+    )
+    zeros = np.zeros(7)
+    inference.estimate_aligned(1_000_000, zeros, zeros, zeros, zeros)
+    result = inference.estimate_aligned(
+        1_020_000,
+        zeros,
+        zeros,
+        np.full(7, 10.0),
+        zeros,
+    )
+
+    alpha = 1.0 - np.exp(-2.0 * np.pi * 10.0 * 0.02)
+    expected_tau = np.full(7, alpha * 10.0)
+    np.testing.assert_allclose(tau_f.features[-1]["tau"], expected_tau)
+    np.testing.assert_allclose(inverse_dynamics.calls[-1][3], expected_tau)
+    np.testing.assert_allclose(result.tau_ext_cal_raw, -expected_tau)
+
 
 def test_same_timestamp_returns_cached_dual_result_without_advancing_models() -> None:
     tau_f = _Predictor("tau_f", np.zeros(7))
@@ -852,7 +917,7 @@ def test_tau_ext_config_allows_independent_or_empty_checkpoints(tmp_path: Path) 
             "enabled": True,
             "tau_f": {
                 "checkpoint_path": "tau_f.pt",
-                "input_keys": ["q", "dq", "delta_q"],
+                "input_keys": ["q", "dq", "delta_q", "tau"],
                 "output_key": "tau_f",
             },
             "tau_next": {
@@ -864,6 +929,7 @@ def test_tau_ext_config_allows_independent_or_empty_checkpoints(tmp_path: Path) 
         tmp_path,
     )
     assert config.tau_f.output_key == "tau_f"
+    assert config.tau_f.input_keys == ("q", "dq", "delta_q", "tau")
     assert config.tau_next.output_key == "tau"
     assert config.tau_ext_filter.enabled
     assert config.tau_ext_filter.mode == "hampel_butterworth"
@@ -881,7 +947,6 @@ def test_source_butterworth_config_is_explicit_and_validated(tmp_path: Path) -> 
             "source_butterworth_filter": {
                 "enabled": True,
                 "cutoff_hz": 15.0,
-                "sample_rate_hz": 117.0,
                 "order": 2,
             },
         },
@@ -889,19 +954,23 @@ def test_source_butterworth_config_is_explicit_and_validated(tmp_path: Path) -> 
     )
     assert config.source_butterworth_filter.enabled
     assert config.source_butterworth_filter.cutoff_hz == pytest.approx(15.0)
-    assert config.source_butterworth_filter.sample_rate_hz == pytest.approx(117.0)
     assert config.source_butterworth_filter.order == 2
 
-    with pytest.raises(ValueError, match="Nyquist"):
+    with pytest.raises(ValueError, match="positive and finite"):
         _parse_tau_ext_inference(
             {
                 "source_butterworth_filter": {
                     "enabled": True,
-                    "cutoff_hz": 60.0,
-                    "sample_rate_hz": 117.0,
+                    "cutoff_hz": 0.0,
                     "order": 2,
                 }
             },
+            tmp_path,
+        )
+
+    with pytest.raises(ValueError, match="unknown options"):
+        _parse_tau_ext_inference(
+            {"source_butterworth_filter": {"sample_rate_hz": 117.0}},
             tmp_path,
         )
 
@@ -965,6 +1034,27 @@ def test_tau_ext_filter_config_is_explicit_and_validated(tmp_path: Path) -> None
         )
 
 
+@pytest.mark.parametrize("source", ("tau_f", "tau_free"))
+def test_force_feedback_source_is_configurable(
+    source: str,
+    tmp_path: Path,
+) -> None:
+    config = _parse_tau_ext_inference(
+        {"enabled": True, "feedback_source": source},
+        tmp_path,
+    )
+
+    assert config.feedback_source == source
+
+
+def test_force_feedback_source_rejects_unknown_value(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="must be tau_f or tau_free"):
+        _parse_tau_ext_inference(
+            {"enabled": True, "feedback_source": "tau_next"},
+            tmp_path,
+        )
+
+
 def test_collection_config_rejects_removed_tau_f_inference_key(tmp_path: Path) -> None:
     source = Path(__file__).resolve().parents[1] / "configs/master_slave_can.yaml"
     config_path = tmp_path / "config.yaml"
@@ -990,8 +1080,8 @@ def test_sequence_checkpoint_restores_configured_recurrent_type(
 
     model_config = {
         "architecture": architecture,
-        "inputs": ["q", "dq", "delta_q"],
-        "input_dims": {"q": 7, "dq": 7, "delta_q": 7},
+        "inputs": ["q", "dq", "delta_q", "tau"],
+        "input_dims": {"q": 7, "dq": 7, "delta_q": 7, "tau": 7},
         "target_key": "tau_f",
         "output_dim": 7,
         "hidden_dim": 8,
@@ -1012,7 +1102,7 @@ def test_sequence_checkpoint_restores_configured_recurrent_type(
     )
     stats = {
         key: {"mean": np.zeros(7), "std": np.ones(7)}
-        for key in ("q", "dq", "delta_q", "tau_f")
+        for key in ("q", "dq", "delta_q", "tau", "tau_f")
     }
     path = tmp_path / f"{architecture}.pt"
     torch.save(
@@ -1039,11 +1129,14 @@ def test_sequence_checkpoint_restores_configured_recurrent_type(
         SequenceCheckpointConfig(checkpoint_path=path),
         name="tau_f",
     )
-    features = {key: np.zeros(7) for key in ("q", "dq", "delta_q")}
+    features = {
+        key: np.zeros(7) for key in ("q", "dq", "delta_q", "tau")
+    }
     for _ in range(3):
         assert predictor.append_and_predict(features) is None
     prediction = predictor.append_and_predict(features)
     assert predictor.metadata.architecture == architecture
+    assert predictor.metadata.input_keys == ("q", "dq", "delta_q", "tau")
     assert predictor.metadata.target_filter_enabled
     assert predictor.metadata.target_filter_median_window == 1
     assert not predictor.metadata.target_filter_apply_additional_lowpass

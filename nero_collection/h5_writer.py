@@ -17,17 +17,16 @@ from nero_collection.tau_ext_inference import OnlineTauExtInference
 from nero_collection.time_utils import now_us
 
 
-FORMAT_VERSION = "factr_multimodal_episode/v9"
+FORMAT_VERSION = "factr_multimodal_episode/v11"
 
 FOLLOWER_TELEOP_DATASETS = frozenset(
     {
         "q_follower",
         "q_leader",
         "q_cmd",
+        "dq_cmd",
         "dq_follower",
         "dq_leader",
-        "ddq_follower",
-        "ddq_leader",
         "ee_pose_follower",
         "tau_follower",
         "tau_leader",
@@ -35,7 +34,6 @@ FOLLOWER_TELEOP_DATASETS = frozenset(
         "current_leader",
         "gripper_follower",
         "gripper_cmd",
-        "ddq_kf_causal",
         "tau_id",
         "tau_id_filtered",
         "tau_f_pred",
@@ -48,11 +46,6 @@ FOLLOWER_TELEOP_DATASETS = frozenset(
         "wrench_pred_raw",
         "wrench_cal",
         "wrench_pred",
-        "control_timestamp_us",
-        "state_acquired_timestamp_follower_us",
-        "q_source_timestamp_follower_us",
-        "motor_source_timestamp_follower_us",
-        "state_source_skew_follower_us",
         "model_observation_updated",
         "model_observation_timestamp_us",
         "model_prediction_age_us",
@@ -60,11 +53,6 @@ FOLLOWER_TELEOP_DATASETS = frozenset(
 )
 
 _TIMING_DATASET_SOURCES = {
-    "control_timestamp_us": "teleop_control_loop",
-    "state_acquired_timestamp_follower_us": "host_state_read",
-    "q_source_timestamp_follower_us": "pyagx_can_joint_group_frames",
-    "motor_source_timestamp_follower_us": "pyagx_can_motor_state_frames",
-    "state_source_skew_follower_us": "max_minus_min_q_and_motor_source_timestamp",
     "model_observation_timestamp_us": "causal_real_observation_selector",
     "model_prediction_age_us": "source_timestamp_minus_model_observation_timestamp",
 }
@@ -172,7 +160,6 @@ class EpisodeBuffer:
                 processed_values["q_cmd"][1],
             )
             for name, value in (
-                ("ddq_kf_causal", result.ddq_kf_causal),
                 ("tau_id", result.tau_id),
                 ("tau_id_filtered", result.tau_id_filtered),
                 ("tau_f_pred", result.tau_f_pred),
@@ -204,9 +191,7 @@ class EpisodeBuffer:
                     np.asarray(result.prediction_age_us, dtype=np.int64),
                 ),
             ):
-                if name == "ddq_kf_causal":
-                    state_name = "acceleration"
-                elif name.endswith("timestamp_us"):
+                if name.endswith("timestamp_us"):
                     state_name = "timestamp"
                 elif name.endswith("age_us"):
                     state_name = "duration"
@@ -282,7 +267,7 @@ class EpisodeBuffer:
             teleop.attrs["command_datasets"] = np.asarray(
                 tuple(
                     name
-                    for name in ("q_cmd", "gripper_cmd")
+                    for name in ("q_cmd", "dq_cmd", "gripper_cmd")
                     if name in finalized_data
                 ),
                 dtype=string_dtype,
@@ -298,7 +283,7 @@ class EpisodeBuffer:
                 "timestamp_us",
                 data=np.asarray(self.teleop_timestamps_us, dtype=np.int64),
             )
-            teleop_timestamp.attrs["source"] = "event_driven_can_state_watermark"
+            teleop_timestamp.attrs["source"] = "fixed_rate_robot_state_sample"
             teleop_timestamp.attrs["clock"] = "unix_epoch"
             teleop_timestamp.attrs["unit"] = "us"
             for name, data in sorted(finalized_data.items()):
@@ -312,15 +297,28 @@ class EpisodeBuffer:
                 if name == "ee_pose_follower":
                     dataset.attrs["frame_name"] = "tcp"
                     dataset.attrs["frame_type"] = "end_effector"
-                if state_name == "timestamp":
-                    dataset.attrs["clock"] = (
-                        "monotonic" if name == "control_timestamp_us" else "unix_epoch"
+                if name == "q_cmd":
+                    dataset.attrs["source"] = "actual_follower_command"
+                    dataset.attrs["definition"] = (
+                        "latest successfully issued follower joint-position "
+                        "target effective at the robot-state sample"
                     )
+                    dataset.attrs["command_semantics"] = "causal_zoh_at_state_sample"
+                if name == "dq_cmd":
+                    dataset.attrs["source"] = "actual_follower_command"
+                    dataset.attrs["definition"] = (
+                        "follower joint-velocity target issued with q_cmd"
+                    )
+                    dataset.attrs["command_semantics"] = "same_mit_command_as_q_cmd"
+                if state_name == "timestamp":
+                    dataset.attrs["clock"] = "unix_epoch"
                     dataset.attrs["unit"] = "us"
                 if state_name == "duration":
                     dataset.attrs["unit"] = "us"
                 if name in _TIMING_DATASET_SOURCES:
                     dataset.attrs["source"] = _TIMING_DATASET_SOURCES[name]
+                    dataset.attrs["timestamp_path"] = "teleop/timestamp_us"
+                if state_name not in {"timestamp", "duration"}:
                     dataset.attrs["timestamp_path"] = "teleop/timestamp_us"
                 for key, value in finalized_attrs.get(name, {}).items():
                     dataset.attrs[key] = value
@@ -368,8 +366,8 @@ class EpisodeBuffer:
         if self.online_tau_ext is None:
             return
         metadata = self.online_tau_ext.metadata
-        kalman = self.config.tau_ext_inference.state_estimator
         tau_ext_filter = metadata.tau_ext_filter
+        feedback_source = self.config.tau_ext_inference.feedback_source
         source_filter = self.config.tau_ext_inference.source_butterworth_filter
         sample_rates = {
             name: model_metadata.sample_rate_hz
@@ -387,6 +385,7 @@ class EpisodeBuffer:
             "fixed_observation_interval": True,
             "active_model_sample_rates_hz_json": json.dumps(sample_rates),
             "observation_grid_phase": "per_model",
+            "configured_force_feedback_source": feedback_source,
             "observation_gap_warning_s": (
                 self.config.tau_ext_inference.observation_gap_warning_s
             ),
@@ -406,44 +405,17 @@ class EpisodeBuffer:
             ),
         }
         if metadata.tau_f is not None:
-            attrs["ddq_kf_causal"].update(
-                {
-                **common,
-                "first_valid_sample_index": 0,
-                "definition": "causal Kalman acceleration state",
-                "processing_method": "variable_dt_constant_acceleration_kalman_filter",
-                "lowpass": False,
-                "zero_phase": False,
-                "measurement_datasets_json": json.dumps(
-                    ["teleop/q_follower", "teleop/dq_follower"]
-                ),
-                "process_noise_model": "continuous_white_jerk",
-                "position_std_json": json.dumps(list(kalman.position_std)),
-                "velocity_std_json": json.dumps(list(kalman.velocity_std)),
-                "jerk_std_json": json.dumps(list(kalman.jerk_std)),
-                "initial_position_std_json": json.dumps(
-                    list(kalman.initial_position_std)
-                ),
-                "initial_velocity_std_json": json.dumps(
-                    list(kalman.initial_velocity_std)
-                ),
-                "initial_acceleration_std_json": json.dumps(
-                    list(kalman.initial_acceleration_std)
-                ),
-                "max_gap_s": kalman.max_gap_s,
-                }
-            )
             attrs["tau_id"].update(
                 {
                 **common,
                 "first_valid_sample_index": 0,
-                "definition": "RNEA(q_follower, dq_follower, ddq_kf_causal)",
+                "definition": "RNEA using internal causal Kalman acceleration",
                 "processing_method": "online_pinocchio_rnea",
                 "lowpass": False,
                 "zero_phase": False,
                 "q_source_dataset": "teleop/q_follower",
                 "dq_source_dataset": "teleop/dq_follower",
-                "ddq_source_dataset": "teleop/ddq_kf_causal",
+                "ddq_source": "internal_causal_kalman_not_persisted",
                 "model_urdf": str(
                     self.config.realtime_plot.inverse_dynamics.urdf_path
                 ),
@@ -460,7 +432,6 @@ class EpisodeBuffer:
                 "lowpass": False,
                 "zero_phase": False,
             }
-            attrs["ddq_kf_causal"].update(disabled_dynamics)
             attrs["tau_id"].update(disabled_dynamics)
         if metadata.tau_f is not None:
             attrs["tau_id_filtered"].update(
@@ -574,6 +545,10 @@ class EpisodeBuffer:
                         model_metadata.dataloader_filters,
                         sort_keys=True,
                     ),
+                    "model_derived_target_config_json": json.dumps(
+                        model_metadata.derived_target_config,
+                        sort_keys=True,
+                    ),
                     "model_target_contract": model_metadata.target_contract or "",
                     "model_target_filter_enabled": (
                         model_metadata.target_filter_enabled
@@ -636,7 +611,7 @@ class EpisodeBuffer:
                 "tau_ext_cal",
                 "tau_id_filtered + tau_f_pred - tau_follower",
                 "online_inverse_dynamics_residual",
-                False,
+                feedback_source == "tau_f",
                 metadata.tau_f,
             ),
             (
@@ -644,7 +619,7 @@ class EpisodeBuffer:
                 "tau_ext_pred",
                 f"tau_next_pred - {tau_next_target}",
                 "online_free_space_torque_residual",
-                True,
+                feedback_source == "tau_free",
                 metadata.tau_next,
             ),
         ):
@@ -800,7 +775,6 @@ class EpisodeBuffer:
         for role in ("leader", "follower"):
             q_name = f"q_{role}"
             dq_name = f"dq_{role}"
-            ddq_name = f"ddq_{role}"
             if q_name in data:
                 q_values = np.asarray(data[q_name], dtype=np.float64)
                 if q_values.ndim != 2 or q_values.shape[0] != timeline.size:
@@ -812,12 +786,6 @@ class EpisodeBuffer:
                             f"Centered {dq_name} must match {q_name}; got {np.asarray(data[dq_name]).shape}"
                         )
                     state_names[dq_name] = "velocity"
-                if ddq_name in data:
-                    if np.asarray(data[ddq_name]).shape != q_values.shape:
-                        raise RuntimeError(
-                            f"Centered {ddq_name} must match {q_name}; got {np.asarray(data[ddq_name]).shape}"
-                        )
-                    state_names[ddq_name] = "acceleration"
                 attrs[q_name].update(
                     {
                         "processing_method": "nearest_complete_joint_group_state",
@@ -848,22 +816,6 @@ class EpisodeBuffer:
                             "median_window": 1,
                         }
                     )
-                if ddq_name in data:
-                    attrs[ddq_name].update(
-                        {
-                            "derived_from_json": json.dumps([dq_name]),
-                            "derivative_method": (
-                                "causal_first_derivative_of_sign_corrected_raw_official_velocity"
-                            ),
-                            "timestamp_path": "teleop/timestamp_us",
-                            "first_valid_sample_index": 0,
-                            "uses_measured_intervals": True,
-                            "formula": "ddq_raw[k]=(dq[k]-dq[k-1])/measured_dt",
-                            "lowpass": False,
-                            "median_window": 1,
-                        }
-                    )
-
             tau_name = f"tau_{role}"
             if tau_name not in data:
                 continue

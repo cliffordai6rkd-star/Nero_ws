@@ -87,7 +87,10 @@ class _Inference:
         pass
 
 
-def _config(tmp_path: Path) -> CollectionConfig:
+def _config(
+    tmp_path: Path,
+    feedback_source: str = "tau_free",
+) -> CollectionConfig:
     states = {
         name: StateParamConfig(enabled=True, lowpass=False)
         for name in (
@@ -103,7 +106,10 @@ def _config(tmp_path: Path) -> CollectionConfig:
     return CollectionConfig(
         teleop=TeleopConfig(),
         output=OutputConfig(directory=tmp_path),
-        tau_ext_inference=TauExtInferenceConfig(enabled=True),
+        tau_ext_inference=TauExtInferenceConfig(
+            enabled=True,
+            feedback_source=feedback_source,
+        ),
         robot_states=states,
     )
 
@@ -158,9 +164,11 @@ def test_episode_buffer_passes_raw_tau_to_online_filter_once(tmp_path: Path) -> 
     np.testing.assert_allclose(buffer.teleop_data["tau_follower"][1], 10.0)
 
 
+@pytest.mark.parametrize("feedback_source", ("tau_f", "tau_free"))
 def test_h5_v9_saves_matched_filter_dual_tau_ext_schema(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    feedback_source: str,
 ) -> None:
     try:
         import h5py
@@ -180,7 +188,7 @@ def test_h5_v9_saves_matched_filter_dual_tau_ext_schema(
     )
     inference = _Inference(tmp_path)
     buffer = EpisodeBuffer(
-        config=_config(tmp_path),
+        config=_config(tmp_path, feedback_source),
         arm_names=("main",),
         online_tau_ext=inference,
     )
@@ -201,7 +209,6 @@ def test_h5_v9_saves_matched_filter_dual_tau_ext_schema(
 
     assert inference.calls == 3
     new_fields = {
-        "ddq_kf_causal",
         "tau_id",
         "tau_id_filtered",
         "tau_f_pred",
@@ -225,10 +232,11 @@ def test_h5_v9_saves_matched_filter_dual_tau_ext_schema(
     }
     with h5py.File(output, "r") as h5:
         teleop = h5["teleop"]
-        assert h5.attrs["format"] == "factr_multimodal_episode/v9"
+        assert h5.attrs["format"] == "factr_multimodal_episode/v11"
         assert new_fields <= set(teleop)
         assert removed_fields.isdisjoint(teleop)
-        np.testing.assert_allclose(teleop["ddq_kf_causal"], 3.0)
+        assert "ddq_kf_causal" not in teleop
+        assert "ddq_follower" not in teleop
         np.testing.assert_allclose(teleop["tau_ext_cal_raw"], -7.5)
         np.testing.assert_allclose(teleop["tau_ext_pred_raw"], -6.0)
         np.testing.assert_allclose(teleop["tau_ext_cal"], -7.5)
@@ -243,16 +251,21 @@ def test_h5_v9_saves_matched_filter_dual_tau_ext_schema(
             teleop["tau_ext_pred"].attrs["definition"]
             == "tau_ext_filter(tau_next_pred - checkpoint_causal_filter(tau_follower))"
         )
-        assert not bool(teleop["tau_ext_cal"].attrs["feedback_source"])
-        assert bool(teleop["tau_ext_pred"].attrs["feedback_source"])
+        assert bool(teleop["tau_ext_cal"].attrs["feedback_source"]) == (
+            feedback_source == "tau_f"
+        )
+        assert bool(teleop["tau_ext_pred"].attrs["feedback_source"]) == (
+            feedback_source == "tau_free"
+        )
+        assert (
+            teleop["tau_ext_cal"].attrs["configured_force_feedback_source"]
+            == feedback_source
+        )
         assert teleop["tau_next_pred"].attrs["history_warmup_samples"] == 50
         assert teleop["tau_ext_pred"].attrs["history_warmup_output"] == "zeros"
-        assert teleop["ddq_kf_causal"].attrs["max_gap_s"] == pytest.approx(0.1)
-        assert not bool(teleop["ddq_kf_causal"].attrs["lowpass"])
         assert not bool(teleop["tau_f_pred"].attrs["lowpass"])
         assert not bool(teleop["q_follower"].attrs["lowpass"])
         assert not bool(teleop["dq_follower"].attrs["lowpass"])
-        assert not bool(teleop["ddq_follower"].attrs["lowpass"])
         assert not bool(teleop["tau_follower"].attrs["lowpass"])
         assert teleop["tau_follower"].attrs["processing_method"] == (
             "nearest_motor_sample_unfiltered"
@@ -296,4 +309,73 @@ def test_precomputed_dual_results_are_not_inferred_twice(tmp_path: Path) -> None
 
     assert accepted is not None
     assert inference.calls == 0
-    assert set(values) <= set(accepted.values)
+    assert set(values) - {"ddq_kf_causal"} <= set(accepted.values)
+    assert "ddq_kf_causal" not in accepted.values
+
+
+def test_robot_state_datasets_share_the_frame_timestamp(tmp_path: Path) -> None:
+    try:
+        import h5py
+    except (ImportError, ValueError) as exc:
+        pytest.skip(f"h5py is unavailable or ABI-incompatible: {exc}")
+
+    buffer = EpisodeBuffer(
+        config=_config(tmp_path),
+        arm_names=("main",),
+        enable_online_tau_ext=False,
+    )
+    q = np.arange(7, dtype=np.float64)
+    buffer.append_teleop(
+        999,
+        {
+            "q_follower": ("q", q),
+            "tau_follower": ("torque", q + 10),
+        },
+    )
+
+    output = buffer.save(tmp_path / "raw-timestamps.h5")
+
+    with h5py.File(output, "r") as h5:
+        teleop = h5["teleop"]
+        np.testing.assert_array_equal(teleop["timestamp_us"][:], [999])
+        assert "q_follower_timestamp_us" not in teleop
+        assert "tau_follower_timestamp_us" not in teleop
+        assert (
+            teleop["q_follower"].attrs["timestamp_path"]
+            == "teleop/timestamp_us"
+        )
+        assert (
+            teleop["tau_follower"].attrs["timestamp_path"]
+            == "teleop/timestamp_us"
+        )
+
+
+def test_q_cmd_is_saved_without_measured_q_and_has_causal_zoh_semantics(
+    tmp_path: Path,
+) -> None:
+    try:
+        import h5py
+    except (ImportError, ValueError) as exc:
+        pytest.skip(f"h5py is unavailable or ABI-incompatible: {exc}")
+
+    config = _config(tmp_path)
+    config.robot_states["q"] = StateParamConfig(enabled=False)
+    buffer = EpisodeBuffer(
+        config=config,
+        arm_names=("main",),
+        enable_online_tau_ext=False,
+    )
+    q_cmd = np.linspace(0.1, 0.7, 7)
+    buffer.append_teleop(1_000_000, {"q_cmd": ("q", q_cmd)})
+
+    output = buffer.save(tmp_path / "q-command.h5")
+
+    with h5py.File(output, "r") as h5:
+        teleop = h5["teleop"]
+        assert "q_follower" not in teleop
+        np.testing.assert_allclose(teleop["q_cmd"][0], q_cmd)
+        assert teleop["q_cmd"].attrs["source"] == "actual_follower_command"
+        assert (
+            teleop["q_cmd"].attrs["command_semantics"]
+            == "causal_zoh_at_state_sample"
+        )

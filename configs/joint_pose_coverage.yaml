@@ -1,4 +1,4 @@
-# 20-minute / 50 Hz connected coverage of multi-joint free-space poses.
+# 1200-second / 100 Hz low-speed and static coverage of safe joint configurations.
 # Candidate poses span the URDF soft limits; every pose and connecting leg is
 # checked in MuJoCo before the trajectory can be collected on hardware.
 collection_config: master_slave_can.yaml
@@ -12,35 +12,50 @@ model:
 
 trajectory:
   planner: joint_pose_coverage
-  sample_rate_hz: 50.0
-  # Per-axis range inferred from runs/next_data_raw (479732 samples). The
-  # planner intersects this range with the URDF limits plus the 0.05 rad margin.
-  joint_limit_margin_rad: 0.05
-  joint_position_min_rad: [-1.10, -0.60, -0.95, 0.55, -1.35, -0.62, -0.10]
-  joint_position_max_rad: [+1.15, +1.00, +1.10, 2.08, +1.30, +0.88, +1.51]
-  max_velocity_rad_s: [1.0, 0.9, 1.0, 0.8, 1.0, 0.8, 1.0]
-  max_acceleration_rad_s2: [3.0, 2.5, 3.0, 2.5, 3.0, 2.5, 3.0]
+  # Must match teleop.command.sample_rate_hz in master_slave_can.yaml so each
+  # 100 Hz command tick reads and records one latest pyAgxArm state.
+  sample_rate_hz: 100.0
+  # Start from the URDF limits, reserve an absolute margin, then keep the
+  # centered 75% range. Intersect it with the measured manual-teleop P1-P99
+  # range below; automatically generated free-space episodes are excluded by
+  # metadata so the planner can never expand its own workspace.
+  joint_limit_margin_rad: 0.08
+  joint_range_fraction: 0.75
+  joint_range_source_directory: ../runs/next_background_data
+  joint_range_quantiles: [0.01, 0.99]
+  joint_range_exclude_sources: [free_space_coverage]
+  max_velocity_rad_s: [0.50, 0.45, 0.50, 0.40, 0.50, 0.40, 0.50]
+  max_acceleration_rad_s2: [1.50, 1.25, 1.50, 1.20, 1.50, 1.20, 1.50]
   section_fractions: [1.0]
 
   # Only the first safe pose initializes the connected tree. Coverage targets
   # are generated independently across the full seven-dimensional soft range.
-  reference_h5_path: ../runs/tau_refinement/episode_0000_20260806_144955.h5
   reference_dataset: teleop/q_follower
   workspace_voxel_counts: [6, 8, 5]
 
-  # Grow 160 connected poses from 8192 low-discrepancy candidates. Each new tree
-  # edge changes by at most 0.35 rad on any joint and is collision checked.
-  joint_candidate_count: 8192
-  joint_pose_count: 160
-  joint_connection_step_rad: 0.35
-  joint_transition_speed_scale: 0.65
-  static_hold_s: 0.50
+  # Select 20 maximin configurations from a deterministic low-discrepancy pool.
+  # Every target and direct transition is checked by the existing MuJoCo checker.
+  joint_candidate_count: 4096
+  joint_pose_count: 20
+  # Traverse the same checked target chain in alternating directions. Repeated
+  # passes avoid turning a 20-minute run into mostly dq~=0 minimum-jerk tails.
+  joint_route_passes: 8
+  joint_connection_step_rad: 0.60
+  joint_transition_speed_scale: 0.50
+
+  # The explicit hold begins only after measured q/dq remain inside both
+  # thresholds continuously. Stability-wait ticks are still recorded at 100 Hz.
+  static_position_threshold_rad: 0.04
+  static_velocity_threshold_rad_s: 0.03
+  static_stability_duration_s: 0.25
+  static_stability_timeout_s: 3.0
+  static_hold_s: 0.80
 
   run:
-    name: joint_pose_coverage_low_medium_hold
+    name: joint_pose_static_torque_anchors
     seed: 20260812
     duration_s: 1200.0
-    trajectory_path: ../calibration/data/joint_pose_coverage_low_medium_hold.npz
+    trajectory_path: ../calibration/data/joint_pose_static_torque_anchors.npz
 
 simulation:
   scene_template_path: ../calibration/mujoco/scene_template.xml
@@ -57,8 +72,8 @@ simulation:
 hardware:
   # Keep false until the generated trajectory passes the full MuJoCo preflight
   # and its native preview has been checked against the real workcell.
-  approved: true
-  preflight_report_path: ../calibration/data/joint_pose_coverage_preflight.json
+  approved: false
+  preflight_report_path: ../calibration/data/joint_pose_static_torque_anchors_preflight.json
   max_tracking_error_rad: [0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2]
   max_abs_torque_nm: [20.0, 20.0, 12.0, 12.0, 6.0, 6.0, 6.0]
   max_timestamp_gap_s: 0.10

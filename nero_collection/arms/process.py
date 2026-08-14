@@ -7,104 +7,18 @@ import queue
 import threading
 import time
 import traceback
-from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 
 from nero_collection.arms.base import ArmState, GripperState
 from nero_collection.config import ArmEndpointConfig
-from nero_collection.time_utils import now_us
 
 
 log = logging.getLogger(__name__)
 
 _DOF = 7
-_STATE_FLOAT_WIDTH = 51
-_STATE_INT_WIDTH = 39
-_STATE_PUBLISH_POLL_S = 0.001
-_DEFAULT_HISTORY_SIZE = 4096
 _RPC_TIMEOUT_S = 15.0
-
-
-@dataclass(frozen=True)
-class StateDrainResult:
-    states: tuple[ArmState, ...]
-    dropped: int
-
-
-class SharedArmStateRing:
-    """Single-writer, multi-process ring for complete seven-axis arm states."""
-
-    def __init__(self, context: Any, capacity: int = _DEFAULT_HISTORY_SIZE) -> None:
-        if capacity < 2:
-            raise ValueError("arm state history capacity must be at least two")
-        self.capacity = int(capacity)
-        self._floats = context.RawArray("d", self.capacity * _STATE_FLOAT_WIDTH)
-        self._ints = context.RawArray("q", self.capacity * _STATE_INT_WIDTH)
-        self._sequence = context.Value("Q", 0, lock=True)
-
-    def reset(self) -> None:
-        with self._sequence.get_lock():
-            self._sequence.value = 0
-
-    def append(self, state: ArmState) -> int:
-        float_row, int_row = _encode_arm_state(state)
-        with self._sequence.get_lock():
-            sequence = int(self._sequence.value) + 1
-            index = (sequence - 1) % self.capacity
-            floats = np.frombuffer(self._floats, dtype=np.float64).reshape(
-                self.capacity, _STATE_FLOAT_WIDTH
-            )
-            ints = np.frombuffer(self._ints, dtype=np.int64).reshape(
-                self.capacity, _STATE_INT_WIDTH
-            )
-            floats[index] = float_row
-            ints[index] = int_row
-            self._sequence.value = sequence
-        return sequence
-
-    def read_after(self, sequence: int) -> tuple[tuple[ArmState, ...], int, int]:
-        with self._sequence.get_lock():
-            current = int(self._sequence.value)
-            if current <= 0:
-                return (), 0, 0
-            requested = int(sequence)
-            if requested > current:
-                requested = 0
-            oldest = max(1, current - self.capacity + 1)
-            start = max(requested + 1, oldest)
-            dropped = max(0, oldest - (requested + 1))
-            if start > current:
-                return (), current, dropped
-            indices = [
-                (value - 1) % self.capacity for value in range(start, current + 1)
-            ]
-            floats = np.frombuffer(self._floats, dtype=np.float64).reshape(
-                self.capacity, _STATE_FLOAT_WIDTH
-            )[indices].copy()
-            ints = np.frombuffer(self._ints, dtype=np.int64).reshape(
-                self.capacity, _STATE_INT_WIDTH
-            )[indices].copy()
-        states = tuple(
-            _decode_arm_state(float_row, int_row)
-            for float_row, int_row in zip(floats, ints)
-        )
-        return states, current, dropped
-
-    def latest(self) -> tuple[ArmState | None, int]:
-        with self._sequence.get_lock():
-            current = int(self._sequence.value)
-            if current <= 0:
-                return None, 0
-            index = (current - 1) % self.capacity
-            float_row = np.frombuffer(self._floats, dtype=np.float64).reshape(
-                self.capacity, _STATE_FLOAT_WIDTH
-            )[index].copy()
-            int_row = np.frombuffer(self._ints, dtype=np.int64).reshape(
-                self.capacity, _STATE_INT_WIDTH
-            )[index].copy()
-        return _decode_arm_state(float_row, int_row), current
 
 
 class IsolatedArmProcess:
@@ -114,49 +28,28 @@ class IsolatedArmProcess:
         self,
         config: ArmEndpointConfig,
         backend: str = "pyagxarm",
-        *,
-        history_size: int = _DEFAULT_HISTORY_SIZE,
     ) -> None:
         self.config = config
         self.backend = str(backend)
         self.name = config.name
         self.dof = _DOF
-        self.history_size = int(history_size)
         self._context = mp.get_context("spawn")
-        self._state_ring = SharedArmStateRing(self._context, self.history_size)
         self._requests = self._context.Queue(maxsize=256)
         self._responses = self._context.Queue(maxsize=256)
-        self._faults = self._context.Queue(maxsize=8)
         self._process = None
         self._rpc_lock = threading.Lock()
-        self._state_lock = threading.Lock()
         self._request_id = 0
-        self._state_sequence = 0
-        self._latest_state: ArmState | None = None
-        self._history_drop_count = 0
-        self._remote_fault: tuple[str, str] | None = None
-
-    @property
-    def history_drop_count(self) -> int:
-        with self._state_lock:
-            return self._history_drop_count
 
     def connect(self) -> None:
         if self._process is not None:
             return
-        self._state_ring.reset()
-        self._state_sequence = 0
-        self._latest_state = None
-        self._remote_fault = None
         process = self._context.Process(
             target=_arm_process_worker,
             args=(
                 self.config,
                 self.backend,
-                self._state_ring,
                 self._requests,
                 self._responses,
-                self._faults,
             ),
             name=f"nero-hardware-{self.name}",
             daemon=True,
@@ -176,10 +69,9 @@ class IsolatedArmProcess:
                 f"hardware process startup failed for {self.name}: {response[3]}\n{response[4]}"
             )
         log.info(
-            "isolated hardware process ready arm=%s pid=%s history=%d",
+            "isolated hardware process ready arm=%s pid=%s",
             self.name,
             process.pid,
-            self.history_size,
         )
 
     def disconnect(self) -> None:
@@ -196,8 +88,6 @@ class IsolatedArmProcess:
             process.terminate()
             process.join(timeout=2.0)
         self._process = None
-        self._remote_fault = None
-        self._clear_ipc_queue(self._faults)
         self._clear_ipc_queue(self._responses)
 
     def enable(self) -> None:
@@ -218,50 +108,11 @@ class IsolatedArmProcess:
     def read_control_role(self, refresh: bool = False) -> str | None:
         return self._rpc("read_control_role", bool(refresh))
 
-    def configure_state_capture(
-        self,
-        maximum_source_skew_s: float,
-        q_lowpass_cutoff_hz: float | None,
-        dq_lowpass_cutoff_hz: float | None,
-        ddq_lowpass_cutoff_hz: float | None,
-        maximum_input_gap_s: float = 0.03,
-    ) -> None:
-        self._state_reset_rpc(
-            "configure_state_capture",
-            maximum_source_skew_s,
-            q_lowpass_cutoff_hz,
-            dq_lowpass_cutoff_hz,
-            ddq_lowpass_cutoff_hz,
-            maximum_input_gap_s,
-        )
-
     def read_state(self) -> ArmState:
-        result = self.drain_states()
-        if result.states:
-            return _copy_arm_state(result.states[-1])
-        with self._state_lock:
-            if self._latest_state is not None:
-                return _copy_arm_state(self._latest_state)
-        self._raise_remote_fault()
-        return _empty_arm_state()
-
-    def drain_states(self) -> StateDrainResult:
-        self._ensure_worker_alive()
-        self._raise_remote_fault()
-        with self._state_lock:
-            states, sequence, dropped = self._state_ring.read_after(self._state_sequence)
-            self._state_sequence = sequence
-            self._history_drop_count += dropped
-            if states:
-                self._latest_state = states[-1]
-            return StateDrainResult(states=states, dropped=dropped)
+        return _copy_arm_state(self._rpc("read_state"))
 
     def peek_latest_state(self) -> ArmState:
-        """Inspect producer freshness without advancing any consumer sequence."""
-        self._ensure_worker_alive()
-        self._raise_remote_fault()
-        state, _ = self._state_ring.latest()
-        return _copy_arm_state(state) if state is not None else _empty_arm_state()
+        return self.read_state()
 
     def read_leader_joint_positions(self) -> np.ndarray:
         return self.read_state().q.copy()
@@ -321,12 +172,7 @@ class IsolatedArmProcess:
         self._rpc("command_gripper", float(value), float(force_n), str(mode))
 
     def _state_reset_rpc(self, method: str, *args: Any) -> Any:
-        result = self._rpc(method, *args)
-        with self._state_lock:
-            self._state_sequence = 0
-            self._latest_state = None
-            self._remote_fault = None
-        return result
+        return self._rpc(method, *args)
 
     def _rpc(self, method: str, *args: Any, timeout_s: float = _RPC_TIMEOUT_S) -> Any:
         self._ensure_worker_alive()
@@ -378,24 +224,6 @@ class IsolatedArmProcess:
                 )
             return response[2]
 
-    def _raise_remote_fault(self) -> None:
-        latest = None
-        while True:
-            try:
-                latest = self._faults.get_nowait()
-            except queue.Empty:
-                break
-        if latest is not None:
-            with self._state_lock:
-                self._remote_fault = latest
-        with self._state_lock:
-            remote_fault = self._remote_fault
-        if remote_fault is not None:
-            raise RuntimeError(
-                f"hardware state publisher failed arm={self.name}: "
-                f"{remote_fault[0]}\n{remote_fault[1]}"
-            )
-
     def _ensure_worker_alive(self) -> None:
         process = self._process
         if process is None:
@@ -424,72 +252,23 @@ class IsolatedArmProcess:
 def _arm_process_worker(
     config: ArmEndpointConfig,
     backend: str,
-    state_ring: SharedArmStateRing,
     requests: Any,
     responses: Any,
-    faults: Any,
 ) -> None:
     _configure_hardware_process_environment()
     arm = None
-    publisher_thread = None
-    publisher_stop = threading.Event()
-
-    def stop_publisher() -> None:
-        nonlocal publisher_thread
-        publisher_stop.set()
-        if publisher_thread is not None and publisher_thread.is_alive():
-            publisher_thread.join(timeout=1.0)
-            if publisher_thread.is_alive():
-                raise RuntimeError(
-                    f"state publisher for arm {config.name} did not stop"
-                )
-        publisher_thread = None
-
-    def start_publisher() -> None:
-        nonlocal publisher_thread
-        if publisher_thread is not None and publisher_thread.is_alive():
-            return
-        publisher_stop.clear()
-        publisher_thread = threading.Thread(
-            target=_state_publisher_loop,
-            args=(arm, state_ring, publisher_stop, faults),
-            name=f"nero-state-publisher-{config.name}",
-            daemon=True,
-        )
-        publisher_thread.start()
-
     try:
         arm = _build_worker_arm(config, backend)
         arm.connect()
-        start_publisher()
         responses.put((0, True, None, None, None))
         while True:
             request_id, method, args = requests.get()
             try:
                 if method == "__shutdown__":
-                    stop_publisher()
                     arm.disconnect()
                     responses.put((request_id, True, None, None, None))
                     return
-                if method in {
-                    "set_leader_mode",
-                    "set_follower_mode",
-                    "set_normal_mode",
-                    "configure_state_capture",
-                    "configure_joint_impedance_mode",
-                }:
-                    stop_publisher()
-                    state_ring.reset()
-                    _clear_queue(faults)
                 result = getattr(arm, method)(*args)
-                if method in {
-                    "set_leader_mode",
-                    "set_follower_mode",
-                    "set_normal_mode",
-                    "configure_state_capture",
-                    "configure_joint_impedance_mode",
-                }:
-                    start_publisher()
                 responses.put((request_id, True, result, None, None))
             except BaseException as exc:
                 responses.put(
@@ -501,41 +280,11 @@ def _arm_process_worker(
         except Exception:
             pass
     finally:
-        try:
-            stop_publisher()
-        except Exception:
-            pass
         if arm is not None:
             try:
                 arm.disconnect()
             except Exception:
                 pass
-
-
-def _state_publisher_loop(
-    arm: Any,
-    state_ring: SharedArmStateRing,
-    stop_event: threading.Event,
-    faults: Any,
-) -> None:
-    last_timestamp_us = 0
-    try:
-        while not stop_event.is_set():
-            read_pending = getattr(arm, "read_pending_states", None)
-            states = (
-                tuple(read_pending())
-                if callable(read_pending)
-                else (arm.read_state(),)
-            )
-            for state in states:
-                timestamp_us = int(state.q_timestamp_us or state.timestamp_us)
-                if timestamp_us > last_timestamp_us and _publishable_arm_state(state):
-                    state_ring.append(state)
-                    last_timestamp_us = timestamp_us
-            stop_event.wait(_STATE_PUBLISH_POLL_S)
-    except BaseException as exc:
-        _put_latest(faults, (str(exc), traceback.format_exc()))
-        stop_event.set()
 
 
 def _build_worker_arm(config: ArmEndpointConfig, backend: str) -> Any:
@@ -554,19 +303,6 @@ def _build_worker_arm(config: ArmEndpointConfig, backend: str) -> Any:
 def _configure_hardware_process_environment() -> None:
     for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
         os.environ.setdefault(name, "1")
-
-
-def _publishable_arm_state(state: ArmState) -> bool:
-    vectors = (state.q, state.dq, state.ddq, state.torque, state.current)
-    if not all(
-        np.asarray(value, dtype=np.float64).shape == (_DOF,) for value in vectors
-    ):
-        return False
-    required = (state.q, state.dq, state.torque, state.current)
-    return all(
-        np.all(np.isfinite(np.asarray(value, dtype=np.float64)))
-        for value in required
-    )
 
 
 def _encode_arm_state(state: ArmState) -> tuple[np.ndarray, np.ndarray]:
@@ -625,29 +361,6 @@ def _copy_arm_state(state: ArmState) -> ArmState:
     return _decode_arm_state(floats, ints)
 
 
-def _empty_arm_state() -> ArmState:
-    timestamp_us = now_us()
-    nan = np.full(_DOF, np.nan, dtype=np.float64)
-    zeros = np.zeros(_DOF, dtype=np.int64)
-    return ArmState(
-        q=nan.copy(),
-        dq=nan.copy(),
-        ddq=nan.copy(),
-        ee_pose=np.eye(4, dtype=np.float64),
-        torque=nan.copy(),
-        current=nan.copy(),
-        timestamp_us=timestamp_us,
-        acquired_timestamp_us=timestamp_us,
-        q_timestamp_us=0,
-        q_acquired_timestamp_us=timestamp_us,
-        q_component_timestamp_us=zeros.copy(),
-        q_source_before_timestamp_us=zeros.copy(),
-        q_source_after_timestamp_us=zeros.copy(),
-        motor_timestamp_us=zeros.copy(),
-        motor_acquired_timestamp_us=zeros.copy(),
-    )
-
-
 def _vector(value: Any, dtype: Any) -> np.ndarray:
     result = np.asarray(value, dtype=dtype).reshape(-1)
     if result.shape != (_DOF,):
@@ -662,27 +375,3 @@ def _timestamp_vector(value: Any) -> np.ndarray:
     if result.shape != (_DOF,):
         raise RuntimeError(f"arm timestamp vector must have shape ({_DOF},); got {result}")
     return result.copy()
-
-
-def _put_latest(target: Any, value: Any) -> None:
-    try:
-        target.put_nowait(value)
-        return
-    except queue.Full:
-        pass
-    try:
-        target.get_nowait()
-    except queue.Empty:
-        pass
-    try:
-        target.put_nowait(value)
-    except queue.Full:
-        pass
-
-
-def _clear_queue(target: Any) -> None:
-    while True:
-        try:
-            target.get_nowait()
-        except queue.Empty:
-            return

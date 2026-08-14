@@ -11,6 +11,7 @@ import numpy as np
 
 from nero_collection.causal_kalman import CausalJointKalmanFilter
 from nero_collection.config import (
+    CausalKalmanConfig,
     DynamicsProcessingConfig,
     InverseDynamicsConfig,
     SequenceCheckpointConfig,
@@ -33,8 +34,12 @@ from nero_collection.filters import (
 log = logging.getLogger(__name__)
 
 _DEFAULT_CPU_TORCH_NUM_THREADS = 1
-_MODEL_INPUT_KEYS = frozenset({"q", "dq", "delta_q"})
-_TAU_F_TARGET_CONTRACT = "matched_causal_torque_filter_v1"
+_MODEL_INPUT_KEYS = frozenset({"q", "dq", "delta_q", "tau"})
+_LEGACY_TAU_F_TARGET_CONTRACT = "matched_causal_torque_filter_v1"
+_DERIVED_TAU_F_TARGET_CONTRACT = "causal_rnea_residual_v1"
+_TAU_F_TARGET_CONTRACTS = frozenset(
+    {_LEGACY_TAU_F_TARGET_CONTRACT, _DERIVED_TAU_F_TARGET_CONTRACT}
+)
 
 
 @dataclass(frozen=True)
@@ -49,6 +54,7 @@ class SequenceCheckpointMetadata:
     normalize_mode: str
     sample_rate_hz: float | None = None
     dataloader_filters: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    derived_target_config: Mapping[str, Any] = field(default_factory=dict)
     inference_mode: str = "fixed_window"
     target_contract: str | None = None
     target_filter_enabled: bool = False
@@ -85,6 +91,27 @@ class OnlineTauExtResult:
     prediction_age_us: int = 0
     tau_ext_cal_raw: np.ndarray | None = None
     tau_ext_pred_raw: np.ndarray | None = None
+    tau_f_history_ready: bool | None = None
+    tau_free_history_ready: bool | None = None
+
+    def force_feedback(self, source: str) -> tuple[np.ndarray, bool]:
+        """Return the configured residual and its branch-local readiness."""
+        normalized = str(source).strip().lower()
+        if normalized == "tau_f":
+            ready = (
+                self.history_ready
+                if self.tau_f_history_ready is None
+                else self.tau_f_history_ready
+            )
+            return np.asarray(self.tau_ext_cal, dtype=np.float64).copy(), bool(ready)
+        if normalized == "tau_free":
+            ready = (
+                self.history_ready
+                if self.tau_free_history_ready is None
+                else self.tau_free_history_ready
+            )
+            return np.asarray(self.tau_ext_pred, dtype=np.float64).copy(), bool(ready)
+        raise ValueError(f"force-feedback source must be tau_f or tau_free, got {source!r}")
 
 
 @dataclass(frozen=True)
@@ -255,6 +282,12 @@ class SequenceTorquePredictor:
                 dataloader_config.get("filters", {}),
             )
         )
+        derived_target_value = checkpoint.get("derived_target_config", {})
+        if derived_target_value is None:
+            derived_target_value = {}
+        if not isinstance(derived_target_value, Mapping):
+            raise RuntimeError("checkpoint.derived_target_config must be a mapping")
+        derived_target_config = dict(derived_target_value)
         sample_rate_value = checkpoint.get(
             "sample_rate_hz",
             dataloader_config.get(
@@ -329,7 +362,8 @@ class SequenceTorquePredictor:
         if unknown_inputs:
             raise RuntimeError(
                 f"{name} checkpoint requests inputs forbidden by the online contract: "
-                f"{unknown_inputs}; expected only q, dq, delta_q"
+                f"{unknown_inputs}; supported inputs are "
+                f"{sorted(_MODEL_INPUT_KEYS)}"
             )
         if len(set(input_keys)) != len(input_keys):
             raise RuntimeError(f"{name} checkpoint model inputs contain duplicates")
@@ -413,6 +447,7 @@ class SequenceTorquePredictor:
             normalize_mode=self._normalize_mode,
             sample_rate_hz=sample_rate_hz,
             dataloader_filters=dataloader_filters,
+            derived_target_config=derived_target_config,
             target_contract=target_contract,
             target_filter_enabled=target_filter_enabled,
             target_filter_cutoff_hz=target_filter_cutoff_hz,
@@ -661,7 +696,12 @@ class OnlineTauExtInference:
                 key: VariableStepButterworthLowPass(
                     cutoff_hz=source_filter.cutoff_hz,
                 )
-                for key in ("q", "dq", "tau")
+                for key in (
+                    # "q",
+                    "dq",
+                    "tau",
+                    # "q_cmd"
+                )
             }
             if source_filter.enabled
             else {}
@@ -672,15 +712,42 @@ class OnlineTauExtInference:
         self.tau_filter = None
         self.tau_id_filter = None
         self.tau_f_input_filters: dict[str, CausalFilterPipeline] = {}
+        self.tau_f_state_filters: dict[str, CausalFilterPipeline] = {}
+        self._tau_f_dq_sign = np.ones(7, dtype=np.float64)
+        self._tau_f_rnea_state_source = "measured"
         if self.tau_f_predictor is not None:
             self.estimator = estimator or PinocchioJointTorqueResidualEstimator(
                 inverse_dynamics
             )
-            self.state_estimator = state_estimator or CausalJointKalmanFilter(
-                config.state_estimator
-            )
-            self.tau_f_input_filters = _build_feature_filter_bank(
+            target_config = self.tau_f_predictor.metadata.derived_target_config
+            checkpoint_kalman_config = _derived_kalman_config(
                 self.tau_f_predictor.metadata
+            )
+            if state_estimator is not None:
+                self.state_estimator = state_estimator
+            else:
+                if (
+                    checkpoint_kalman_config is not None
+                    and checkpoint_kalman_config != config.state_estimator
+                ):
+                    raise RuntimeError(
+                        "tau_ext_inference.state_estimator does not match the "
+                        "tau_f checkpoint derived_target_config.state_estimator"
+                    )
+                self.state_estimator = CausalJointKalmanFilter(
+                    checkpoint_kalman_config or config.state_estimator
+                )
+            self._tau_f_dq_sign = _derived_dq_sign(target_config)
+            self._tau_f_rnea_state_source = str(
+                target_config.get("rnea_state_source", "measured")
+            ).strip().lower()
+            self.tau_f_input_filters = _build_feature_filter_bank(
+                self.tau_f_predictor.metadata,
+                exclude_keys={"q", "dq", "tau"},
+            )
+            self.tau_f_state_filters = _build_feature_filter_bank(
+                self.tau_f_predictor.metadata,
+                include_keys={"q", "dq"},
             )
             self.tau_filter = _build_tau_f_source_filter(
                 self.tau_f_predictor.metadata,
@@ -794,6 +861,7 @@ class OnlineTauExtInference:
         if self.state_estimator is not None:
             self.state_estimator.reset()
         _reset_filter_bank(self.tau_f_input_filters)
+        _reset_filter_bank(self.tau_f_state_filters)
         _reset_filter_bank(self.tau_next_input_filters)
         for source_filter in self.source_butterworth_filters.values():
             source_filter.reset()
@@ -925,16 +993,37 @@ class OnlineTauExtInference:
         assert self.tau_filter is not None
         assert self.tau_id_filter is not None
         tau_value = self.tau_filter.apply(source.tau, timestamp_us)
-        kalman_state = self.state_estimator.update(timestamp_us, source.q, source.dq)
+        state_features = _apply_feature_filter_bank(
+            {
+                "q": source.q,
+                "dq": source.dq * self._tau_f_dq_sign,
+            },
+            self.tau_f_state_filters,
+            timestamp_us,
+        )
+        q_value = state_features["q"]
+        dq_value = state_features["dq"]
+        kalman_state = self.state_estimator.update(timestamp_us, q_value, dq_value)
+        if self._tau_f_rnea_state_source == "filtered":
+            q_rnea = kalman_state.q
+            dq_rnea = kalman_state.dq
+        else:
+            q_rnea = q_value
+            dq_rnea = dq_value
         inverse_dynamics = self.estimator.estimate(
-            source.q,
-            source.dq,
+            q_rnea,
+            dq_rnea,
             kalman_state.ddq,
             tau_value,
         )
         tau_id = _finite_vector("tau_id", inverse_dynamics.tau_id, 7)
         tau_id_filtered = self.tau_id_filter.apply(tau_id, timestamp_us)
-        raw_features = _observation_features(source)
+        raw_features = _observation_features(
+            source,
+            q=q_value,
+            dq=dq_value,
+            tau=tau_value,
+        )
         _require_features(raw_features, self.tau_f_predictor.metadata.input_keys, "tau_f")
         features = _apply_feature_filter_bank(
             raw_features,
@@ -1069,6 +1158,8 @@ class OnlineTauExtInference:
             prediction_age_us=age_us,
             tau_ext_cal_raw=(self._tau_ext_cal_raw.copy() if tau_f_valid else zeros.copy()),
             tau_ext_pred_raw=(self._tau_ext_pred_raw.copy() if tau_next_valid else zeros.copy()),
+            tau_f_history_ready=tau_f_valid,
+            tau_free_history_ready=tau_next_valid,
         )
 
 
@@ -1082,11 +1173,18 @@ def _require_features(
         raise RuntimeError(f"{model_name} checkpoint is missing model inputs: {missing}")
 
 
-def _observation_features(source: _SourceObservation) -> dict[str, np.ndarray]:
+def _observation_features(
+    source: _SourceObservation,
+    *,
+    q: np.ndarray | None = None,
+    dq: np.ndarray | None = None,
+    tau: np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
     return {
-        "q": source.q,
-        "dq": source.dq,
+        "q": source.q if q is None else q,
+        "dq": source.dq if dq is None else dq,
         "delta_q": source.q_cmd - source.q,
+        "tau": source.tau if tau is None else tau,
     }
 
 
@@ -1178,9 +1276,15 @@ def _normalize_checkpoint_filters(value: Any) -> dict[str, dict[str, Any]]:
 
 def _build_feature_filter_bank(
     metadata: SequenceCheckpointMetadata,
+    *,
+    include_keys: set[str] | None = None,
+    exclude_keys: set[str] | None = None,
 ) -> dict[str, CausalFilterPipeline]:
     result = {}
-    for key in metadata.input_keys:
+    keys = metadata.input_keys if include_keys is None else tuple(include_keys)
+    for key in keys:
+        if exclude_keys is not None and key in exclude_keys:
+            continue
         spec = metadata.dataloader_filters.get(key) or {}
         if bool(spec.get("enabled", False)):
             result[key] = CausalFilterPipeline(spec["operations"])
@@ -1213,23 +1317,177 @@ def _validate_predictor_contract(
     model_name: str,
     output_key: str,
 ) -> None:
-    expected_inputs = ("q", "dq", "delta_q")
-    if metadata.input_keys != expected_inputs:
+    unknown_inputs = sorted(set(metadata.input_keys) - _MODEL_INPUT_KEYS)
+    if not metadata.input_keys or unknown_inputs:
         raise RuntimeError(
-            f"{model_name} checkpoint inputs must be {expected_inputs}, "
-            f"got {metadata.input_keys}"
+            f"{model_name} checkpoint inputs must be a non-empty ordered subset "
+            f"of {sorted(_MODEL_INPUT_KEYS)}, got {metadata.input_keys}"
+        )
+    if len(set(metadata.input_keys)) != len(metadata.input_keys):
+        raise RuntimeError(f"{model_name} checkpoint inputs contain duplicates")
+    invalid_dims = {
+        key: metadata.input_dims.get(key)
+        for key in metadata.input_keys
+        if metadata.input_dims.get(key) != 7
+    }
+    if invalid_dims:
+        raise RuntimeError(
+            f"{model_name} online inputs must all have dimension 7, got "
+            f"{invalid_dims}"
         )
     if metadata.output_key != output_key:
         raise RuntimeError(
             f"{model_name} checkpoint output must be {output_key!r}, "
             f"got {metadata.output_key!r}"
         )
-    if model_name == "tau_f" and metadata.target_contract != _TAU_F_TARGET_CONTRACT:
+    if model_name == "tau_f":
+        if metadata.target_contract not in _TAU_F_TARGET_CONTRACTS:
+            raise RuntimeError(
+                "tau_f checkpoint target_contract must be one of "
+                f"{sorted(_TAU_F_TARGET_CONTRACTS)}, got "
+                f"{metadata.target_contract!r}; rebuild matched-filter labels "
+                "or use a causal_rnea_residual_v1 checkpoint"
+            )
+        if metadata.target_contract == _DERIVED_TAU_F_TARGET_CONTRACT:
+            _validate_derived_tau_f_contract(metadata)
+
+
+def _validate_derived_tau_f_contract(
+    metadata: SequenceCheckpointMetadata,
+) -> None:
+    target = metadata.derived_target_config
+    if not target:
         raise RuntimeError(
-            "tau_f checkpoint target_contract must be "
-            f"{_TAU_F_TARGET_CONTRACT!r}, got {metadata.target_contract!r}; "
-            "rebuild matched-filter labels and retrain the checkpoint"
+            "causal_rnea_residual_v1 checkpoint is missing "
+            "derived_target_config"
         )
+    required_values = {
+        "enabled": True,
+        "method": _DERIVED_TAU_F_TARGET_CONTRACT,
+        "target_key": metadata.output_key,
+        "ddq_source": "variable_dt_kalman_forward_filter",
+        "residual_formula": "tau_f=tau_filtered-tau_id_filtered",
+    }
+    for key, expected in required_values.items():
+        if target.get(key) != expected:
+            raise RuntimeError(
+                f"tau_f checkpoint derived_target_config.{key} must be "
+                f"{expected!r}, got {target.get(key)!r}"
+            )
+
+    source_keys = target.get("source_keys")
+    if not isinstance(source_keys, Mapping) or set(source_keys) != {"q", "dq", "tau"}:
+        raise RuntimeError(
+            "tau_f checkpoint derived_target_config.source_keys must define "
+            "q, dq, and tau"
+        )
+    rnea_state_source = str(target.get("rnea_state_source", "")).strip().lower()
+    if rnea_state_source not in {"measured", "filtered"}:
+        raise RuntimeError(
+            "tau_f checkpoint derived_target_config.rnea_state_source must be "
+            "measured or filtered"
+        )
+    if str(target.get("torque_filter_key", "")) != "tau":
+        raise RuntimeError(
+            "online tau_f inference requires derived_target_config."
+            "torque_filter_key='tau'"
+        )
+
+    raw_operations = target.get("torque_filter_operations", ())
+    normalized_target_filter = _normalize_checkpoint_filters(
+        {
+            "tau": {
+                "enabled": bool(raw_operations),
+                "operations": raw_operations,
+            }
+        }
+    )["tau"]
+    checkpoint_tau_filter = metadata.dataloader_filters.get("tau") or {
+        "enabled": False,
+        "operations": [],
+    }
+    if (
+        bool(checkpoint_tau_filter.get("enabled", False))
+        != normalized_target_filter["enabled"]
+        or list(checkpoint_tau_filter.get("operations", ()))
+        != normalized_target_filter["operations"]
+    ):
+        raise RuntimeError(
+            "tau_f checkpoint derived torque_filter_operations do not match "
+            "dataloader_filters.tau"
+        )
+    _derived_kalman_config(metadata)
+    _derived_dq_sign(target)
+
+
+def _derived_kalman_config(
+    metadata: SequenceCheckpointMetadata,
+) -> CausalKalmanConfig | None:
+    if metadata.target_contract != _DERIVED_TAU_F_TARGET_CONTRACT:
+        return None
+    raw = metadata.derived_target_config.get("state_estimator")
+    if not isinstance(raw, Mapping):
+        raise RuntimeError(
+            "tau_f checkpoint derived_target_config.state_estimator must be a "
+            "mapping"
+        )
+    parameter_names = (
+        "position_std",
+        "velocity_std",
+        "jerk_std",
+        "initial_position_std",
+        "initial_velocity_std",
+        "initial_acceleration_std",
+    )
+    unknown = sorted(set(raw) - {*parameter_names, "max_gap_s"})
+    missing = [key for key in parameter_names if key not in raw]
+    if "max_gap_s" not in raw:
+        missing.append("max_gap_s")
+    if unknown or missing:
+        raise RuntimeError(
+            "invalid tau_f checkpoint state_estimator; "
+            f"missing={missing}, unknown={unknown}"
+        )
+
+    def joint_values(name: str) -> tuple[float, ...]:
+        value = raw[name]
+        if isinstance(value, (int, float)):
+            result = (float(value),) * 7
+        elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            result = tuple(float(item) for item in value)
+        else:
+            result = ()
+        if len(result) != 7 or any(
+            not np.isfinite(item) or item <= 0.0 for item in result
+        ):
+            raise RuntimeError(
+                "tau_f checkpoint derived_target_config.state_estimator."
+                f"{name} must be a positive scalar or seven positive values"
+            )
+        return result
+
+    max_gap_s = float(raw["max_gap_s"])
+    if not np.isfinite(max_gap_s) or max_gap_s <= 0.0:
+        raise RuntimeError(
+            "tau_f checkpoint state_estimator.max_gap_s must be positive and finite"
+        )
+    return CausalKalmanConfig(
+        **{name: joint_values(name) for name in parameter_names},
+        max_gap_s=max_gap_s,
+    )
+
+
+def _derived_dq_sign(target: Mapping[str, Any]) -> np.ndarray:
+    raw = target.get("dq_sign")
+    if raw is None:
+        return np.ones(7, dtype=np.float64)
+    sign = np.asarray(raw, dtype=np.float64).reshape(-1)
+    if sign.shape != (7,) or not np.all(np.isin(sign, (-1.0, 1.0))):
+        raise RuntimeError(
+            "tau_f checkpoint derived_target_config.dq_sign must contain seven "
+            "values chosen from -1 and 1"
+        )
+    return sign.copy()
 
 
 def _validate_predictor_sample_rate(

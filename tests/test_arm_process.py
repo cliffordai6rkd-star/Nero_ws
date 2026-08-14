@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import multiprocessing as mp
 import time
 
 import numpy as np
 
 from nero_collection.arms.base import ArmState
 from nero_collection.arms.factory import build_arm
-from nero_collection.arms.process import IsolatedArmProcess, SharedArmStateRing
+from nero_collection.arms.process import IsolatedArmProcess
 from nero_collection.config import ArmEndpointConfig
 
 
@@ -33,28 +32,10 @@ def _state(timestamp_us: int, value: float = 0.0) -> ArmState:
     )
 
 
-def test_shared_arm_state_ring_preserves_order_and_reports_overwrite() -> None:
-    ring = SharedArmStateRing(mp.get_context("spawn"), capacity=3)
-    for index in range(1, 6):
-        ring.append(_state(index * 1_000, float(index)))
-
-    states, sequence, dropped = ring.read_after(0)
-
-    assert sequence == 5
-    assert dropped == 2
-    assert [state.timestamp_us for state in states] == [3_000, 4_000, 5_000]
-    np.testing.assert_allclose(states[-1].q, np.full(7, 5.0))
-    np.testing.assert_array_equal(
-        states[-1].motor_acquired_timestamp_us,
-        np.full(7, 5_003, dtype=np.int64),
-    )
-
-
-def test_isolated_mock_arm_publishes_ordered_states_and_restarts() -> None:
+def test_isolated_mock_arm_reads_one_sdk_snapshot_per_request_and_restarts() -> None:
     arm = IsolatedArmProcess(
         ArmEndpointConfig(name="isolated_mock", rest_q=(0.0,) * 7),
         backend="mock",
-        history_size=64,
     )
     arm.connect()
     try:
@@ -65,29 +46,20 @@ def test_isolated_mock_arm_publishes_ordered_states_and_restarts() -> None:
             connected_state = arm.read_state()
         assert np.all(np.isfinite(connected_state.q))
 
-        arm.configure_state_capture(0.015, None, None, None, 0.06)
-        deadline = time.monotonic() + 2.0
-        first = ()
-        while time.monotonic() < deadline:
-            first = arm.drain_states().states
-            if len(first) >= 2:
-                break
-            time.sleep(0.01)
-        assert len(first) >= 2
-        assert [state.timestamp_us for state in first] == sorted(
-            state.timestamp_us for state in first
-        )
+        first = arm.read_state()
+        second = arm.read_state()
+        assert second.timestamp_us >= first.timestamp_us
 
         arm.set_follower_mode()
         deadline = time.monotonic() + 2.0
-        restarted = ()
+        restarted = None
         while time.monotonic() < deadline:
-            restarted = arm.drain_states().states
-            if restarted:
+            restarted = arm.read_state()
+            if np.all(np.isfinite(restarted.q)):
                 break
             time.sleep(0.01)
-        assert restarted
-        assert all(np.all(np.isfinite(state.q)) for state in restarted)
+        assert restarted is not None
+        assert np.all(np.isfinite(restarted.q))
     finally:
         arm.disconnect()
 

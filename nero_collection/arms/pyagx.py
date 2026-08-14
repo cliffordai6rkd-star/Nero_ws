@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import copy
 import logging
-import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -13,7 +11,6 @@ from nero_collection.arms.base import ArmState, GripperState
 from nero_collection.arms.kinematics import pose6_to_matrix
 from nero_collection.coordinates import nero_v120_joint_velocity
 from nero_collection.config import ArmEndpointConfig
-from nero_collection.state_alignment import CanStateAssembler, StateTimingError
 from nero_collection.socketcan import interface_usb_serial
 from nero_collection.time_utils import now_us
 
@@ -21,7 +18,6 @@ log = logging.getLogger(__name__)
 
 _LEADER_MODE_SEND_ATTEMPTS = 3
 _LEADER_MODE_SEND_INTERVAL_S = 0.15
-_ASYNC_STATE_POLL_INTERVAL_S = 0.001
 _NERO_SAFE_MIT_TORQUE_LIMIT_NM = 16.0
 
 
@@ -36,26 +32,6 @@ class PyAgxArmAdapter:
     _leader_mode_commanded: bool = False
     _leader_feedback_timestamp: float | None = None
     _leader_gripper_feedback_baseline: float | None = None
-    _maximum_source_skew_s: float | None = None
-    _q_mean_window_samples: int = 5
-    _q_lowpass_cutoff_hz: float | None = 10.0
-    _dq_lowpass_cutoff_hz: float | None = 10.0
-    _ddq_lowpass_cutoff_hz: float | None = 10.0
-    _maximum_input_gap_s: float = 0.03
-    _state_timeline: CanStateAssembler | None = None
-    _state_sampler_stop: threading.Event = field(
-        init=False, default_factory=threading.Event
-    )
-    _state_sampler_thread: threading.Thread | None = field(init=False, default=None)
-    _state_capture_timestamps_us: dict[str, int] = field(
-        init=False, default_factory=dict
-    )
-    _state_sampler_fault: StateTimingError | None = field(init=False, default=None)
-    _aligned_state_lock: threading.Lock = field(
-        init=False, default_factory=threading.Lock
-    )
-    _last_published_aligned_timestamp_us: int = field(init=False, default=0)
-    _last_aligned_arm_state: ArmState | None = field(init=False, default=None)
 
     def __post_init__(self) -> None:
         self.name = self.config.name
@@ -113,7 +89,6 @@ class PyAgxArmAdapter:
         self._robot.connect()
 
     def disconnect(self) -> None:
-        self._stop_state_sampler()
         if self._robot is not None:
             _call_if_exists(self._robot, ("disconnect", "close", "shutdown"))
 
@@ -201,7 +176,6 @@ class PyAgxArmAdapter:
             raise RuntimeError(f"Failed to send leader mode command to {self.name}") from last_error
         self._configured_role = "leader"
         self._leader_mode_commanded = True
-        self._reset_state_alignment_cache()
 
     def set_follower_mode(self) -> None:
         ret = self._require_robot().set_follower_mode()
@@ -211,117 +185,6 @@ class PyAgxArmAdapter:
         self._leader_mode_commanded = False
         self._leader_feedback_timestamp = None
         self._leader_gripper_feedback_baseline = None
-        self._reset_state_alignment_cache()
-
-    def _reset_state_alignment_cache(self) -> None:
-        if not self._stop_state_sampler():
-            raise RuntimeError(
-                f"CAN state sampler for arm {self.name} did not stop before reset"
-            )
-        self._state_capture_timestamps_us.clear()
-        self._state_sampler_fault = None
-        with self._aligned_state_lock:
-            self._last_published_aligned_timestamp_us = 0
-            self._last_aligned_arm_state = None
-        if self._maximum_source_skew_s is None:
-            self._state_timeline = None
-            return
-        self._state_timeline = CanStateAssembler(
-            dof=self.dof,
-            q_groups=_q_group_layout(self._leader_mode_commanded),
-            maximum_source_skew_s=self._maximum_source_skew_s,
-            q_mean_window_samples=self._q_mean_window_samples,
-            q_lowpass_cutoff_hz=self._q_lowpass_cutoff_hz,
-            dq_lowpass_cutoff_hz=self._dq_lowpass_cutoff_hz,
-            ddq_lowpass_cutoff_hz=self._ddq_lowpass_cutoff_hz,
-            maximum_input_gap_s=self._maximum_input_gap_s,
-        )
-        self._start_state_sampler()
-
-    def configure_state_capture(
-        self,
-        maximum_source_skew_s: float,
-        q_lowpass_cutoff_hz: float | None,
-        dq_lowpass_cutoff_hz: float | None,
-        ddq_lowpass_cutoff_hz: float | None,
-        maximum_input_gap_s: float = 0.03,
-    ) -> None:
-        self._require_robot()
-        self._maximum_source_skew_s = float(maximum_source_skew_s)
-        self._q_mean_window_samples = 1
-        self._q_lowpass_cutoff_hz = q_lowpass_cutoff_hz
-        self._dq_lowpass_cutoff_hz = dq_lowpass_cutoff_hz
-        self._ddq_lowpass_cutoff_hz = ddq_lowpass_cutoff_hz
-        self._maximum_input_gap_s = float(maximum_input_gap_s)
-        self._reset_state_alignment_cache()
-        log.info(
-            "configured event-driven CAN state assembler arm=%s max_source_skew=%.3fms "
-            "dq_source=V120_motor_velocity q_lpf_compat=%sHz dq_lpf=%sHz "
-            "ddq_source=d_dq_dt ddq_lpf=%sHz "
-            "max_can_gap=%.3fms poll=%.3fms",
-            self.name,
-            self._maximum_source_skew_s * 1e3,
-            self._q_lowpass_cutoff_hz,
-            self._dq_lowpass_cutoff_hz,
-            self._ddq_lowpass_cutoff_hz,
-            self._maximum_input_gap_s * 1e3,
-            _ASYNC_STATE_POLL_INTERVAL_S * 1e3,
-        )
-
-    def _start_state_sampler(self) -> None:
-        thread = self._state_sampler_thread
-        if thread is not None and thread.is_alive():
-            if not self._state_sampler_stop.is_set():
-                return
-            if thread is threading.current_thread():
-                raise RuntimeError("CAN state sampler cannot restart itself")
-            thread.join(timeout=1.0)
-            if thread.is_alive():
-                raise RuntimeError(
-                    f"previous CAN state sampler for arm {self.name} is still stopping"
-                )
-        self._state_sampler_thread = None
-        self._state_sampler_stop.clear()
-        self._state_sampler_thread = threading.Thread(
-            target=self._state_sampler_loop,
-            name=f"nero-state-{self.name}",
-            daemon=True,
-        )
-        self._state_sampler_thread.start()
-
-    def _stop_state_sampler(self) -> bool:
-        self._state_sampler_stop.set()
-        thread = self._state_sampler_thread
-        if thread is threading.current_thread():
-            return False
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=1.0)
-            if thread.is_alive():
-                return False
-        self._state_sampler_thread = None
-        return True
-
-    def _state_sampler_loop(self) -> None:
-        while not self._state_sampler_stop.is_set():
-            timeline = self._state_timeline
-            robot = self._robot
-            if timeline is not None and robot is not None:
-                try:
-                    _capture_async_state(
-                        robot,
-                        timeline,
-                        leader=self._leader_mode_commanded,
-                        firmware=self.config.firmware,
-                        last_timestamps_us=self._state_capture_timestamps_us,
-                    )
-                except StateTimingError as exc:
-                    self._state_sampler_fault = exc
-                    log.error("CAN state timing fault arm=%s: %s", self.name, exc)
-                    self._state_sampler_stop.set()
-                    return
-                except Exception as exc:  # pragma: no cover - hardware diagnostic guard
-                    log.debug("async state capture failed arm=%s: %s", self.name, exc)
-            self._state_sampler_stop.wait(_ASYNC_STATE_POLL_INTERVAL_S)
 
     def set_normal_mode(self) -> None:
         robot = self._require_robot()
@@ -331,7 +194,6 @@ class PyAgxArmAdapter:
         self._leader_mode_commanded = False
         self._leader_feedback_timestamp = None
         self._leader_gripper_feedback_baseline = None
-        self._reset_state_alignment_cache()
 
     def read_control_role(self, refresh: bool = False) -> str | None:
         if self._configured_role is not None and not refresh:
@@ -370,42 +232,20 @@ class PyAgxArmAdapter:
         return None
 
     def read_state(self) -> ArmState:
-        if self._state_sampler_fault is not None:
-            raise RuntimeError(
-                f"CAN state watchdog tripped for arm {self.name}: {self._state_sampler_fault}"
-            ) from self._state_sampler_fault
         robot = self._require_robot()
         acquired_timestamp_us = now_us()
-        timeline = self._state_timeline
-        if timeline is not None:
-            pending = self.read_pending_states()
-            if pending:
-                return pending[-1]
-            with self._aligned_state_lock:
-                if self._last_aligned_arm_state is not None:
-                    return _copy_arm_state(self._last_aligned_arm_state)
-            return _invalid_aligned_arm_state(self.dof, acquired_timestamp_us)
-        else:
-            reader = (
-                getattr(robot, "get_leader_joint_angles", None)
-                if self._leader_mode_commanded
-                else getattr(robot, "get_joint_angles", None)
-            )
-            q_message = reader() if callable(reader) else None
-            q = _as_float_array(q_message, self.dof)
-            q_timestamp_us = _message_timestamp_us(q_message)
-            q_component_timestamp_us = np.full(
-                self.dof, q_timestamp_us, dtype=np.int64
-            )
-            q_source_before_timestamp_us = q_component_timestamp_us.copy()
-            q_source_after_timestamp_us = q_component_timestamp_us.copy()
-            motor_states = _read_motor_states(
-                robot,
-                self.dof,
-                firmware=self.config.firmware,
-            )
-            dq = motor_states["velocity"]
-            ddq = np.full(self.dof, np.nan, dtype=np.float64)
+        reader = (
+            getattr(robot, "get_leader_joint_angles", None)
+            if self._leader_mode_commanded
+            else getattr(robot, "get_joint_angles", None)
+        )
+        q_message = reader() if callable(reader) else None
+        q = _as_float_array(q_message, self.dof)
+        q_timestamp_us = _message_timestamp_us(q_message)
+        q_component_timestamp_us = np.full(self.dof, q_timestamp_us, dtype=np.int64)
+        motor_states = _read_motor_states(robot, self.dof, firmware=self.config.firmware)
+        dq = motor_states["velocity"]
+        ddq = np.full(self.dof, np.nan, dtype=np.float64)
         ee_pose = _read_pose(robot)
         q_acquired_timestamp_us = acquired_timestamp_us
         timestamp_us = q_timestamp_us or acquired_timestamp_us
@@ -421,43 +261,12 @@ class PyAgxArmAdapter:
             q_timestamp_us=q_timestamp_us,
             q_acquired_timestamp_us=q_acquired_timestamp_us,
             q_component_timestamp_us=q_component_timestamp_us,
-            q_source_before_timestamp_us=q_source_before_timestamp_us,
-            q_source_after_timestamp_us=q_source_after_timestamp_us,
+            q_source_before_timestamp_us=q_component_timestamp_us.copy(),
+            q_source_after_timestamp_us=q_component_timestamp_us.copy(),
             motor_timestamp_us=motor_states["timestamp_us"],
             motor_acquired_timestamp_us=motor_states["acquired_timestamp_us"],
         )
         return state
-
-    def read_pending_states(self) -> tuple[ArmState, ...]:
-        """Return complete unpublished states on their real CAN timeline."""
-        if self._state_sampler_fault is not None:
-            raise RuntimeError(
-                f"CAN state watchdog tripped for arm {self.name}: {self._state_sampler_fault}"
-            ) from self._state_sampler_fault
-        robot = self._require_robot()
-        timeline = self._state_timeline
-        if timeline is None:
-            return (self.read_state(),)
-
-        with self._aligned_state_lock:
-            acquired_timestamp_us = now_us()
-            samples = timeline.drain_completed()
-            if not samples:
-                return ()
-            # Pose is not a model input. Read it once for an event batch so a
-            # briefly delayed consumer does not multiply SDK calls by backlog size.
-            ee_pose = _read_pose(robot)
-            states = tuple(
-                _arm_state_from_aligned_sample(
-                    sample,
-                    acquired_timestamp_us=acquired_timestamp_us,
-                    ee_pose=ee_pose,
-                )
-                for sample in samples
-            )
-            self._last_published_aligned_timestamp_us = states[-1].timestamp_us
-            self._last_aligned_arm_state = states[-1]
-            return tuple(_copy_arm_state(state) for state in states)
 
     def read_leader_joint_positions(self) -> np.ndarray:
         return self.read_state().q
@@ -781,183 +590,6 @@ def _as_float_array(value: Any, expected_size: int) -> np.ndarray:
     padded = np.full(expected_size, np.nan, dtype=np.float64)
     padded[: array.size] = array
     return padded
-
-
-def _q_group_layout(leader: bool) -> tuple[tuple[str, tuple[int, ...]], ...]:
-    prefix = "leader_" if leader else ""
-    return (
-        (f"{prefix}joint_12", (0, 1)),
-        (f"{prefix}joint_34", (2, 3)),
-        (f"{prefix}joint_56", (4, 5)),
-        (f"{prefix}joint_7", (6,)),
-    )
-
-
-def _capture_async_state(
-    robot: Any,
-    timeline: CanStateAssembler,
-    *,
-    leader: bool,
-    firmware: str,
-    last_timestamps_us: dict[str, int],
-) -> None:
-    parser = getattr(robot, "_parser", None)
-    if parser is None:
-        raise RuntimeError(
-            "pyAgxArm does not expose the CAN parser required for timestamped state alignment"
-        )
-    for group_name, indices in _q_group_layout(leader):
-        message = getattr(parser, group_name, None)
-        fields = tuple(f"joint_{index + 1}" for index in indices)
-        snapshot = _snapshot_message_fields(
-            message,
-            fields,
-            last_timestamps_us.get(group_name, 0),
-        )
-        if snapshot is not None:
-            timestamp_us, values = snapshot
-            timeline.append_q_group(group_name, timestamp_us, values)
-            last_timestamps_us[group_name] = timestamp_us
-
-    legacy_feedback = str(firmware).strip().upper() != "V120"
-    for joint_index in range(7):
-        message = getattr(parser, f"motor_state_{joint_index + 1}", None)
-        stream_name = f"motor_state_{joint_index + 1}"
-        snapshot = _snapshot_message_fields(
-            message,
-            ("velocity", "torque", "current"),
-            last_timestamps_us.get(stream_name, 0),
-        )
-        if snapshot is None:
-            continue
-        timestamp_us, values = snapshot
-        velocity, torque, current = values
-        if legacy_feedback:
-            velocity = 0.0
-            current = -current
-        else:
-            velocity = nero_v120_joint_velocity(velocity, joint_index)
-        timeline.append_motor(
-            joint_index,
-            timestamp_us,
-            velocity=float(velocity),
-            torque=float(torque),
-            current=float(current),
-        )
-        last_timestamps_us[stream_name] = timestamp_us
-
-
-def _snapshot_message_fields(
-    message: Any,
-    fields: tuple[str, ...],
-    last_timestamp_us: int,
-) -> tuple[int, np.ndarray] | None:
-    if message is None:
-        return None
-    if _message_timestamp_us(message) <= last_timestamp_us:
-        return None
-    snapshot = copy.deepcopy(message)
-    timestamp_us = _message_timestamp_us(snapshot)
-    payload = _unwrap_message(snapshot)
-    if timestamp_us <= last_timestamp_us or payload is None:
-        return None
-    values = np.asarray(
-        [_field_float(payload, (field,)) for field in fields],
-        dtype=np.float64,
-    )
-    if not np.isfinite(values).all():
-        return None
-    return timestamp_us, values
-
-
-def _empty_motor_states(dof: int) -> dict[str, np.ndarray]:
-    return {
-        "velocity": np.full(dof, np.nan, dtype=np.float64),
-        "torque": np.full(dof, np.nan, dtype=np.float64),
-        "current": np.full(dof, np.nan, dtype=np.float64),
-        "timestamp_us": np.zeros(dof, dtype=np.int64),
-        "acquired_timestamp_us": np.zeros(dof, dtype=np.int64),
-    }
-
-
-def _arm_state_from_aligned_sample(
-    sample: Any,
-    *,
-    acquired_timestamp_us: int,
-    ee_pose: np.ndarray,
-) -> ArmState:
-    q_source_timestamp_us = np.asarray(
-        sample.q_source_timestamp_us,
-        dtype=np.int64,
-    ).copy()
-    motor_source_timestamp_us = np.asarray(
-        sample.motor_source_timestamp_us,
-        dtype=np.int64,
-    ).copy()
-    dof = int(np.asarray(sample.q).size)
-    return ArmState(
-        q=np.asarray(sample.q, dtype=np.float64).copy(),
-        dq=np.asarray(sample.dq, dtype=np.float64).copy(),
-        ddq=np.asarray(sample.ddq, dtype=np.float64).copy(),
-        ee_pose=np.asarray(ee_pose, dtype=np.float64).copy(),
-        torque=np.asarray(sample.torque, dtype=np.float64).copy(),
-        current=np.asarray(sample.current, dtype=np.float64).copy(),
-        timestamp_us=int(sample.timestamp_us),
-        acquired_timestamp_us=int(acquired_timestamp_us),
-        q_timestamp_us=int(sample.timestamp_us),
-        q_acquired_timestamp_us=int(acquired_timestamp_us),
-        q_component_timestamp_us=q_source_timestamp_us,
-        q_source_before_timestamp_us=q_source_timestamp_us.copy(),
-        q_source_after_timestamp_us=q_source_timestamp_us.copy(),
-        motor_timestamp_us=motor_source_timestamp_us,
-        motor_acquired_timestamp_us=np.full(
-            dof,
-            int(acquired_timestamp_us),
-            dtype=np.int64,
-        ),
-    )
-
-
-def _invalid_aligned_arm_state(dof: int, acquired_timestamp_us: int) -> ArmState:
-    invalid = np.full(dof, np.nan, dtype=np.float64)
-    timestamps = np.zeros(dof, dtype=np.int64)
-    return ArmState(
-        q=invalid.copy(),
-        dq=invalid.copy(),
-        ddq=invalid.copy(),
-        ee_pose=np.eye(4, dtype=np.float64),
-        torque=invalid.copy(),
-        current=invalid.copy(),
-        timestamp_us=int(acquired_timestamp_us),
-        acquired_timestamp_us=int(acquired_timestamp_us),
-        q_timestamp_us=0,
-        q_acquired_timestamp_us=int(acquired_timestamp_us),
-        q_component_timestamp_us=timestamps.copy(),
-        q_source_before_timestamp_us=timestamps.copy(),
-        q_source_after_timestamp_us=timestamps.copy(),
-        motor_timestamp_us=timestamps.copy(),
-        motor_acquired_timestamp_us=timestamps.copy(),
-    )
-
-
-def _copy_arm_state(state: ArmState) -> ArmState:
-    return ArmState(
-        q=np.asarray(state.q).copy(),
-        dq=np.asarray(state.dq).copy(),
-        ddq=np.asarray(state.ddq).copy(),
-        ee_pose=np.asarray(state.ee_pose).copy(),
-        torque=np.asarray(state.torque).copy(),
-        current=np.asarray(state.current).copy(),
-        timestamp_us=int(state.timestamp_us),
-        acquired_timestamp_us=int(state.acquired_timestamp_us),
-        q_timestamp_us=int(state.q_timestamp_us),
-        q_acquired_timestamp_us=int(state.q_acquired_timestamp_us),
-        q_component_timestamp_us=np.asarray(state.q_component_timestamp_us).copy(),
-        q_source_before_timestamp_us=np.asarray(state.q_source_before_timestamp_us).copy(),
-        q_source_after_timestamp_us=np.asarray(state.q_source_after_timestamp_us).copy(),
-        motor_timestamp_us=np.asarray(state.motor_timestamp_us).copy(),
-        motor_acquired_timestamp_us=np.asarray(state.motor_acquired_timestamp_us).copy(),
-    )
 
 
 def _read_motor_states(

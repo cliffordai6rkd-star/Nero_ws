@@ -116,11 +116,15 @@ class BilateralJointController:
         if tau_ext_override is not None:
             tau_ext = _vector(tau_ext_override)
             tau_ext_feedback = tau_ext
+        elif not np.any(_vector(cfg.force_feedback_gain)):
+            tau_ext = np.zeros(DOF, dtype=np.float64)
+            tau_ext_feedback = tau_ext
         else:
+            ddq = _state_vector("follower", "ddq", follower.ddq)
             residual = self.dynamics.estimate(
                 follower.q,
                 follower.dq,
-                follower.ddq,
+                ddq,
                 follower.torque,
             )
             tau_ext = np.zeros(DOF, dtype=np.float64)
@@ -248,10 +252,15 @@ class BilateralJointController:
 
 
 def _validate_state(role: str, state: ArmState) -> None:
-    for name in ("q", "dq", "ddq", "torque"):
-        value = np.asarray(getattr(state, name), dtype=np.float64).reshape(-1)
-        if value.shape != (DOF,) or not np.isfinite(value).all():
-            raise RuntimeError(f"Bilateral {role} state has invalid {name}: {value}")
+    for name in ("q", "dq", "torque"):
+        _state_vector(role, name, getattr(state, name))
+
+
+def _state_vector(role: str, name: str, value: np.ndarray) -> np.ndarray:
+    result = np.asarray(value, dtype=np.float64).reshape(-1)
+    if result.shape != (DOF,) or not np.isfinite(result).all():
+        raise RuntimeError(f"Bilateral {role} state has invalid {name}: {result}")
+    return result
 
 
 def _vector(value) -> np.ndarray:

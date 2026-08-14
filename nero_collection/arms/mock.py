@@ -86,16 +86,6 @@ class MockArm:
             motor_acquired_timestamp_us=np.full(self.dof, timestamp_us, dtype=np.int64),
         )
 
-    def configure_state_capture(
-        self,
-        maximum_source_skew_s: float,
-        q_lowpass_cutoff_hz: float | None,
-        dq_lowpass_cutoff_hz: float | None,
-        ddq_lowpass_cutoff_hz: float | None,
-        maximum_input_gap_s: float = 0.03,
-    ) -> None:
-        self._ensure_connected()
-
     def read_leader_joint_positions(self) -> np.ndarray:
         self._ensure_connected()
         self._integrate()

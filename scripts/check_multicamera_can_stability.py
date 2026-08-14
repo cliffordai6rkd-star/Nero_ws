@@ -371,19 +371,7 @@ def main() -> int:
 
 
 def _configure_read_only_alignment(arm: ArmInterface, config: CollectionConfig) -> None:
-    q_state = config.robot_states["q"]
-    dq_state = config.robot_states["velocity"]
-    ddq_state = config.robot_states["acceleration"]
-    command = config.teleop.command
-    arm.configure_state_alignment(
-        command.state_alignment_delay_s,
-        command.sample_rate_hz,
-        q_state.mean_window,
-        q_state.lowpass_cutoff_hz if q_state.lowpass else None,
-        dq_state.lowpass_cutoff_hz if dq_state.lowpass else None,
-        ddq_state.lowpass_cutoff_hz if ddq_state.lowpass else None,
-        command.maximum_can_frame_gap_s,
-    )
+    del arm, config
 
 
 def _wait_for_valid_states(arms: dict[str, ArmInterface], timeout_s: float) -> None:
@@ -834,10 +822,7 @@ def _parse_args() -> argparse.Namespace:
         if not 0.0 < getattr(args, name) <= 1.0:
             parser.error(f"--{name.replace('_', '-')} must be within (0, 1]")
     config = load_config(args.config)
-    configured_gap_ms = config.teleop.command.maximum_can_frame_gap_s * 1_000.0
-    args.maximum_can_gap_ms = (
-        configured_gap_ms if args.maximum_can_gap_ms is None else args.maximum_can_gap_ms
-    )
+    args.maximum_can_gap_ms = 30.0 if args.maximum_can_gap_ms is None else args.maximum_can_gap_ms
     if args.maximum_can_gap_ms <= 0.0:
         parser.error("--maximum-can-gap-ms must be positive")
     return args

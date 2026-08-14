@@ -1,16 +1,9 @@
-from collections import deque
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
-import torch
 
 from inference.world_model import WorldModelWrenchAdapter
-from nero_collection.filters import OnePoleLowPass
-from nero_collection.state_alignment import (
-    _JointGroupDerivativeState,
-    _append_filtered_joint_state,
-)
 
 
 class _TauFPredictor:
@@ -100,58 +93,3 @@ def test_world_model_adapter_requires_tau_ext_inference_when_no_predictor() -> N
             inverse_dynamics=inverse_dynamics,
             wrench_mapper=mapper,
         )
-
-
-def test_v4_torch_state_reconstruction_matches_nero_uniform_recurrence() -> None:
-    try:
-        from model.pinn_model.causal_state import (
-            CausalStateEstimatorConfig,
-            causal_joint_state_from_position,
-        )
-    except ModuleNotFoundError:
-        pytest.skip("PINN package is not installed in the nero_ws test environment")
-
-    sampling_dt = 0.0125
-    mean_window = 8
-    q = np.stack(
-        [
-            np.linspace(0.0, 0.2, 7),
-            np.linspace(0.01, 0.22, 7),
-            np.linspace(0.03, 0.25, 7),
-            np.linspace(0.06, 0.29, 7),
-            np.linspace(0.10, 0.34, 7),
-            np.linspace(0.15, 0.40, 7),
-        ],
-        axis=0,
-    )
-    nero_state = _JointGroupDerivativeState(
-        q_window=deque(maxlen=mean_window),
-        q_filter=OnePoleLowPass(10.0),
-        dq_filter=OnePoleLowPass(6.0),
-        ddq_filter=OnePoleLowPass(3.0),
-    )
-    nero_dq = []
-    nero_ddq = []
-    for index, value in enumerate(q, start=1):
-        state = _append_filtered_joint_state(
-            nero_state,
-            int(round(index * sampling_dt * 1.0e6)),
-            value,
-        )
-        assert state is not None
-        nero_dq.append(state.dq)
-        nero_ddq.append(state.ddq)
-
-    _, torch_dq, torch_ddq = causal_joint_state_from_position(
-        torch.as_tensor(q, dtype=torch.float64)[None],
-        CausalStateEstimatorConfig(
-            sampling_dt=sampling_dt,
-            q_mean_window_samples=mean_window,
-            q_lowpass_cutoff_hz=10.0,
-            dq_lowpass_cutoff_hz=6.0,
-            ddq_lowpass_cutoff_hz=3.0,
-        ),
-    )
-
-    np.testing.assert_allclose(torch_dq[0].numpy(), nero_dq, atol=1.0e-12)
-    np.testing.assert_allclose(torch_ddq[0].numpy(), nero_ddq, atol=1.0e-12)

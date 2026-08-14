@@ -1,0 +1,147 @@
+{
+  "config_path": "/mnt/code/lcx/nero_ws/configs/joint_pose_coverage.yaml",
+  "config_sha256": "b3c4128b77fc526c52e364ce8f3897e27602399ecc0629d6c26ba9398ea513bd",
+  "format": "nero_free_space_preflight/v2",
+  "passed": true,
+  "sample_rate_hz": 100.0,
+  "trajectory": {
+    "contact_events": [],
+    "contact_samples_checked": 120000,
+    "duration_s": 1200.0,
+    "joint_candidate_count": 4096,
+    "joint_connection_step_rad": 0.6,
+    "joint_pose_count": 20,
+    "joint_range_dataset": "teleop/q_follower",
+    "joint_range_effective_max_rad": [
+      0.824598258397241,
+      0.7815409857505409,
+      0.7466232306034413,
+      1.68625,
+      0.5236050587836059,
+      0.46680576173840344,
+      1.118097225
+    ],
+    "joint_range_effective_min_rad": [
+      -1.0427644148965323,
+      -0.34607016727074286,
+      -0.8329409322217739,
+      1.1149861393440574,
+      -0.7129844527322036,
+      -0.4600000000000001,
+      0.0054105206811824215
+    ],
+    "joint_range_excluded_files": [],
+    "joint_range_quantile_max_rad": [
+      0.824598258397241,
+      0.7815409857505409,
+      0.7466232306034413,
+      2.0566038371656123,
+      0.5236050587836059,
+      0.46680576173840344,
+      1.5012798626879624
+    ],
+    "joint_range_quantile_min_rad": [
+      -1.0427644148965323,
+      -0.34607016727074286,
+      -0.8329409322217739,
+      1.1149861393440574,
+      -0.7129844527322036,
+      -0.5976880023454582,
+      0.0054105206811824215
+    ],
+    "joint_range_quantiles": [
+      0.01,
+      0.99
+    ],
+    "joint_range_raw_max_rad": [
+      1.1648676493660555,
+      0.883677653577249,
+      1.4454467799166637,
+      2.125671402588934,
+      1.4103656619515779,
+      0.8624893564580378,
+      1.5111409729617304
+    ],
+    "joint_range_raw_min_rad": [
+      -1.512781582458605,
+      -0.6846403056798157,
+      -1.5901171216144738,
+      0.41868703426091974,
+      -1.5308457402167464,
+      -0.6401867696315201,
+      -1.1586019173513957
+    ],
+    "joint_range_sample_count": 202433,
+    "joint_range_source_directory": "/mnt/code/lcx/nero_ws/runs/next_background_data",
+    "joint_range_source_files": [
+      "/mnt/code/lcx/nero_ws/runs/next_background_data/episode_0000_20260813_174333.h5",
+      "/mnt/code/lcx/nero_ws/runs/next_background_data/episode_0001_20260813_174519.h5",
+      "/mnt/code/lcx/nero_ws/runs/next_background_data/episode_0002_20260813_175042.h5",
+      "/mnt/code/lcx/nero_ws/runs/next_background_data/episode_0003_20260813_175413.h5",
+      "/mnt/code/lcx/nero_ws/runs/next_background_data/episode_0004_20260813_175449.h5",
+      "/mnt/code/lcx/nero_ws/runs/next_background_data/episode_0005_20260813_175727.h5",
+      "/mnt/code/lcx/nero_ws/runs/next_background_data/episode_0006_20260813_180058.h5",
+      "/mnt/code/lcx/nero_ws/runs/next_background_data/episode_0007_20260813_180406.h5",
+      "/mnt/code/lcx/nero_ws/runs/next_background_data/episode_0008_20260813_180608.h5",
+      "/mnt/code/lcx/nero_ws/runs/next_background_data/episode_0009_20260813_180913.h5",
+      "/mnt/code/lcx/nero_ws/runs/next_background_data/episode_0010_20260813_180941.h5",
+      "/mnt/code/lcx/nero_ws/runs/next_background_data/episode_0011_20260813_181755.h5",
+      "/mnt/code/lcx/nero_ws/runs/next_background_data/episode_0012_20260813_183607.h5",
+      "/mnt/code/lcx/nero_ws/runs/next_background_data/episode_0015_20260813_195531.h5",
+      "/mnt/code/lcx/nero_ws/runs/next_background_data/episode_0020_20260813_205637.h5"
+    ],
+    "joint_route_passes": 8,
+    "joint_transition_speed_scale": 0.5,
+    "name": "joint_pose_static_torque_anchors",
+    "passed": true,
+    "planner": "joint_pose_coverage",
+    "reference_h5_path": "/mnt/code/lcx/nero_ws/runs/next_background_data",
+    "reference_h5_sha256": "5690ad8cc574715b2c029f796b6fd91f800352fc117c29f6ba31ba12bc1c10bb",
+    "samples": 120000,
+    "scene_path": "/mnt/code/lcx/nero_ws/calibration/data/joint_pose_static_torque_anchors.scene.xml",
+    "segment_names": [
+      "joint_pose_transition",
+      "joint_pose_hold"
+    ],
+    "segment_sample_counts": [
+      107760,
+      12240
+    ],
+    "source_h5_paths": [
+      "/mnt/code/lcx/nero_ws/runs/next_background_data/episode_0000_20260813_174333.h5",
+      "/mnt/code/lcx/nero_ws/runs/next_background_data/episode_0001_20260813_174519.h5",
+      "/mnt/code/lcx/nero_ws/runs/next_background_data/episode_0002_20260813_175042.h5",
+      "/mnt/code/lcx/nero_ws/runs/next_background_data/episode_0003_20260813_175413.h5",
+      "/mnt/code/lcx/nero_ws/runs/next_background_data/episode_0004_20260813_175449.h5",
+      "/mnt/code/lcx/nero_ws/runs/next_background_data/episode_0005_20260813_175727.h5",
+      "/mnt/code/lcx/nero_ws/runs/next_background_data/episode_0006_20260813_180058.h5",
+      "/mnt/code/lcx/nero_ws/runs/next_background_data/episode_0007_20260813_180406.h5",
+      "/mnt/code/lcx/nero_ws/runs/next_background_data/episode_0008_20260813_180608.h5",
+      "/mnt/code/lcx/nero_ws/runs/next_background_data/episode_0009_20260813_180913.h5",
+      "/mnt/code/lcx/nero_ws/runs/next_background_data/episode_0010_20260813_180941.h5",
+      "/mnt/code/lcx/nero_ws/runs/next_background_data/episode_0011_20260813_181755.h5",
+      "/mnt/code/lcx/nero_ws/runs/next_background_data/episode_0012_20260813_183607.h5",
+      "/mnt/code/lcx/nero_ws/runs/next_background_data/episode_0015_20260813_195531.h5",
+      "/mnt/code/lcx/nero_ws/runs/next_background_data/episode_0020_20260813_205637.h5"
+    ],
+    "static_hold_s": 0.8,
+    "static_position_threshold_rad": 0.04,
+    "static_stability_duration_s": 0.25,
+    "static_stability_timeout_s": 3.0,
+    "static_velocity_threshold_rad_s": 0.03,
+    "trajectory_path": "/mnt/code/lcx/nero_ws/calibration/data/joint_pose_static_torque_anchors.npz",
+    "trajectory_sha256": "d130a26c254dc27c82fcecc6be9a4b6d2241c2374243b58eb023844365629ebc",
+    "workspace_convex_hull_volume_m3": 0.02292288376200834,
+    "workspace_max_m": [
+      0.02955344652027844,
+      0.09824696658680479,
+      0.6122896578628718
+    ],
+    "workspace_min_m": [
+      -0.44152212575821526,
+      -0.371469180785218,
+      0.1521467369152048
+    ],
+    "workspace_violation_count": 0
+  }
+}

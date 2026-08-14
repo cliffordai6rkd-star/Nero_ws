@@ -74,16 +74,6 @@ class ArmInterface(Protocol):
     def read_state(self) -> ArmState:
         ...
 
-    def configure_state_capture(
-        self,
-        maximum_source_skew_s: float,
-        q_lowpass_cutoff_hz: float | None,
-        dq_lowpass_cutoff_hz: float | None,
-        ddq_lowpass_cutoff_hz: float | None,
-        maximum_input_gap_s: float = 0.03,
-    ) -> None:
-        ...
-
     def read_leader_joint_positions(self) -> np.ndarray:
         ...
 
