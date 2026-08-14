@@ -59,3 +59,17 @@ python scripts/free_space.py \
 ```
 python scripts/replay_h5_hardware.py runs/next_background_dataruns/next_background_data/episode_0000_20260813_174333.h5
 ```
+## todo:
+- 轨迹规划器数据采集:
+  - 数据重播
+    ```
+    python scripts/free_space.py --config configs/joint_pose_coverage.yaml collect
+- 历史数据replay
+  ```
+  python scripts/replay_h5_hardware.py runs/next_background_dataruns/next_background_data/episode_0000_20260813_174333.h5
+  ```
+- 重新采集自由空间遥操数据
+  - 10min 训练集
+  - 5min 验证集
+- wipe_board双相机30hz遥操数据
+- insert_usb双相机30hz遥操数据
