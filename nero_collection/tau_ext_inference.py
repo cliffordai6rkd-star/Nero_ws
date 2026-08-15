@@ -697,10 +697,10 @@ class OnlineTauExtInference:
                     cutoff_hz=source_filter.cutoff_hz,
                 )
                 for key in (
-                    # "q",
+                    "q",
                     "dq",
                     "tau",
-                    # "q_cmd"
+                    "q_cmd"
                 )
             }
             if source_filter.enabled

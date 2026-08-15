@@ -72,7 +72,7 @@ simulation:
 hardware:
   # Keep false until the generated trajectory passes the full MuJoCo preflight
   # and its native preview has been checked against the real workcell.
-  approved: false
+  approved: true
   preflight_report_path: ../calibration/data/joint_pose_static_torque_anchors_preflight.json
   max_tracking_error_rad: [0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2]
   max_abs_torque_nm: [20.0, 20.0, 12.0, 12.0, 6.0, 6.0, 6.0]

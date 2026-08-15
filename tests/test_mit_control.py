@@ -195,6 +195,40 @@ def test_bilateral_controller_uses_preprocessed_learned_external_torque() -> Non
     np.testing.assert_allclose(result.tau_feedback_leader, tau_ext)
 
 
+def test_bilateral_feedback_lowpass_accepts_null_and_bypasses_filter() -> None:
+    config = _parse_command(
+        {"bilateral_mit": {"force_feedback_lowpass_hz": None}}
+    ).bilateral_mit
+    assert config.force_feedback_lowpass_hz is None
+
+    class Dynamics:
+        model = SimpleNamespace(
+            lowerPositionLimit=np.full(7, -3.0),
+            upperPositionLimit=np.full(7, 3.0),
+        )
+
+        @staticmethod
+        def gravity_torque(_q):
+            return np.zeros(7)
+
+        @staticmethod
+        def estimate(*_args):
+            return SimpleNamespace(tau_residual=np.ones(7))
+
+    controller = BilateralJointController(
+        config,
+        InverseDynamicsConfig(),
+        dynamics=Dynamics(),
+    )
+    assert controller.feedback_filter is None
+
+
+@pytest.mark.parametrize("cutoff", [0, -1, float("inf")])
+def test_bilateral_feedback_lowpass_rejects_invalid_numeric_cutoff(cutoff: float) -> None:
+    with pytest.raises(ValueError, match="positive or null"):
+        _parse_command({"bilateral_mit": {"force_feedback_lowpass_hz": cutoff}})
+
+
 @pytest.mark.parametrize(
     "bilateral",
     [

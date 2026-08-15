@@ -45,6 +45,7 @@ class ContactWrenchConfig:
     frame_name: str = "gripper_tcp"
     delay_s: float = 0.5
     damping: float = 0.02
+    joint_weights: tuple[float, ...] = (1.0,) * 7
     reference_frame: str = "local"
     locked_joint_names: tuple[str, ...] = (
         "gripper",
@@ -192,7 +193,7 @@ class BilateralMitConfig:
     leader_torque_limit_nm: tuple[float, ...] = (20.0, 20.0, 14.0, 14.0, 7.0, 7.0, 7.0)
     follower_torque_limit_nm: tuple[float, ...] = (20.0, 20.0, 14.0, 14.0, 7.0, 7.0, 7.0)
     feedback_torque_rate_limit_nm_s: tuple[float, ...] = (10.0,) * 7
-    force_feedback_lowpass_hz: float = 5.0
+    force_feedback_lowpass_hz: float | None = 5.0
     force_feedback_ramp_s: float = 2.0
     joint_limit_margin_rad: float = 0.10
 
@@ -471,11 +472,17 @@ def _parse_bilateral_mit(data: dict[str, Any]) -> BilateralMitConfig:
     for name in ("leader_torque_limit_nm", "follower_torque_limit_nm"):
         if any(value > limit for value, limit in zip(values[name], nero_limits)):
             raise ValueError(f"teleop.command.bilateral_mit.{name} exceeds Nero MIT limits")
-    cutoff = float(data.get("force_feedback_lowpass_hz", defaults.force_feedback_lowpass_hz))
+    raw_cutoff = data.get(
+        "force_feedback_lowpass_hz", defaults.force_feedback_lowpass_hz
+    )
+    cutoff = None if raw_cutoff is None else float(raw_cutoff)
     ramp = float(data.get("force_feedback_ramp_s", defaults.force_feedback_ramp_s))
     margin = float(data.get("joint_limit_margin_rad", defaults.joint_limit_margin_rad))
-    if not isfinite(cutoff) or cutoff <= 0:
-        raise ValueError("teleop.command.bilateral_mit.force_feedback_lowpass_hz must be positive")
+    if cutoff is not None and (not isfinite(cutoff) or cutoff <= 0):
+        raise ValueError(
+            "teleop.command.bilateral_mit.force_feedback_lowpass_hz must be "
+            "positive or null"
+        )
     if not isfinite(ramp) or ramp < 0:
         raise ValueError("teleop.command.bilateral_mit.force_feedback_ramp_s must be non-negative")
     if not isfinite(margin) or margin < 0:
@@ -765,6 +772,16 @@ def _parse_realtime_plot(
     damping = float(wrench_data.get("damping", 0.02))
     if not isfinite(damping) or damping <= 0:
         raise ValueError("realtime_plot.wrench_mapping.damping must be positive and finite")
+    joint_weights = tuple(
+        float(value) for value in wrench_data.get("joint_weights", (1.0,) * 7)
+    )
+    if len(joint_weights) != 7 or any(
+        not isfinite(value) or value <= 0.0 for value in joint_weights
+    ):
+        raise ValueError(
+            "realtime_plot.wrench_mapping.joint_weights must contain seven "
+            "positive finite values"
+        )
     reference_frame = str(wrench_data.get("reference_frame", "local")).lower()
     if reference_frame not in {"local", "local_world_aligned"}:
         raise ValueError(
@@ -787,6 +804,7 @@ def _parse_realtime_plot(
             frame_name=frame_name,
             delay_s=0.0,
             damping=damping,
+            joint_weights=joint_weights,
             reference_frame=reference_frame,
             locked_joint_names=locked_joint_names,
             gravity_m_s2=gravity,

@@ -44,6 +44,7 @@ def test_realtime_plot_config_defaults_to_ten_second_window() -> None:
     assert config.wrench_mapping.frame_name == "gripper_tcp"
     assert config.wrench_mapping.reference_frame == "local"
     assert config.wrench_mapping.damping == pytest.approx(0.02)
+    assert config.wrench_mapping.joint_weights == pytest.approx((1.0,) * 7)
 
 
 def test_realtime_plot_config_resolves_identified_manifest(tmp_path: Path) -> None:
@@ -65,6 +66,7 @@ def test_realtime_plot_config_parses_wrench_mapping(tmp_path: Path) -> None:
                 "frame_name": "tool_frame",
                 "reference_frame": "local_world_aligned",
                 "damping": 0.05,
+                "joint_weights": [1.0, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0],
             },
         },
         tmp_path,
@@ -74,6 +76,9 @@ def test_realtime_plot_config_parses_wrench_mapping(tmp_path: Path) -> None:
     assert config.wrench_mapping.frame_name == "tool_frame"
     assert config.wrench_mapping.reference_frame == "local_world_aligned"
     assert config.wrench_mapping.damping == pytest.approx(0.05)
+    assert config.wrench_mapping.joint_weights == pytest.approx(
+        (1.0, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0)
+    )
 
 
 @pytest.mark.parametrize(
@@ -88,6 +93,8 @@ def test_realtime_plot_config_parses_wrench_mapping(tmp_path: Path) -> None:
         {"wrench_mapping": {"frame_name": ""}},
         {"wrench_mapping": {"damping": 0.0}},
         {"wrench_mapping": {"reference_frame": "world"}},
+        {"wrench_mapping": {"joint_weights": [1.0] * 6}},
+        {"wrench_mapping": {"joint_weights": [1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0]}},
     ],
 )
 def test_realtime_plot_config_rejects_invalid_rates(data: dict[str, object]) -> None:
@@ -165,6 +172,27 @@ def test_damped_wrench_maps_joint_residual_and_reports_nullspace_error() -> None
     assert wrench == pytest.approx(tau_residual[:6], rel=1e-9)
     assert error == pytest.approx(7.0 / np.linalg.norm(tau_residual), rel=1e-9)
     assert condition == pytest.approx(1.0)
+
+
+def test_weighted_damped_wrench_reduces_influence_of_low_confidence_joint() -> None:
+    jacobian = np.zeros((6, 7), dtype=np.float64)
+    jacobian[0, 0] = 1.0
+    jacobian[0, 1] = 1.0
+    tau_residual = np.zeros(7, dtype=np.float64)
+    tau_residual[:2] = [1.0, 10.0]
+
+    unweighted, _, _ = solve_damped_wrench(
+        jacobian, tau_residual, damping=1e-6
+    )
+    weighted, _, _ = solve_damped_wrench(
+        jacobian,
+        tau_residual,
+        damping=1e-6,
+        joint_weights=(1.0, 0.01, 1.0, 1.0, 1.0, 1.0, 1.0),
+    )
+
+    assert unweighted[0] == pytest.approx(5.5, rel=1e-9)
+    assert weighted[0] == pytest.approx(1.0 + 0.09 / 1.01, rel=1e-9)
 
 
 @pytest.mark.skipif(find_spec("pinocchio") is None, reason="Pinocchio is not installed")

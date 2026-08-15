@@ -226,6 +226,7 @@ class PinocchioContactWrenchEstimator:
             jacobian,
             tau_external,
             self.config.damping,
+            joint_weights=self.config.joint_weights,
         )
         spatial_force = self.pin.Force(wrench_vector)
         wrench = np.concatenate(
@@ -246,6 +247,8 @@ def solve_damped_wrench(
     jacobian: np.ndarray,
     tau_residual: np.ndarray,
     damping: float,
+    *,
+    joint_weights: tuple[float, ...] | np.ndarray | None = None,
 ) -> tuple[np.ndarray, float, float]:
     jacobian = np.asarray(jacobian, dtype=np.float64)
     tau_residual = np.asarray(tau_residual, dtype=np.float64).reshape(-1)
@@ -260,9 +263,24 @@ def solve_damped_wrench(
         raise RuntimeError("Contact-wrench damping must be positive and finite")
 
     joint_to_wrench = jacobian.T
-    u, singular_values, vt = np.linalg.svd(joint_to_wrench, full_matrices=False)
+    weights = (
+        np.ones(tau_residual.size, dtype=np.float64)
+        if joint_weights is None
+        else np.asarray(joint_weights, dtype=np.float64).reshape(-1)
+    )
+    if weights.shape != tau_residual.shape or not np.isfinite(weights).all() or np.any(weights <= 0):
+        raise RuntimeError(
+            "Contact-wrench joint weights must be positive finite values matching "
+            "the joint torque dimension"
+        )
+    sqrt_weights = np.sqrt(weights)
+    weighted_joint_to_wrench = sqrt_weights[:, None] * joint_to_wrench
+    weighted_tau_residual = sqrt_weights * tau_residual
+    u, singular_values, vt = np.linalg.svd(
+        weighted_joint_to_wrench, full_matrices=False
+    )
     gains = singular_values / (singular_values * singular_values + damping * damping)
-    wrench = vt.T @ (gains * (u.T @ tau_residual))
+    wrench = vt.T @ (gains * (u.T @ weighted_tau_residual))
     reconstructed = joint_to_wrench @ wrench
     denominator = max(float(np.linalg.norm(tau_residual)), 1e-9)
     reconstruction_error = float(np.linalg.norm(reconstructed - tau_residual) / denominator)
@@ -289,6 +307,7 @@ def wrench_ext_dataset_attrs(config: ContactWrenchConfig) -> dict[str, object]:
         "reference_frame": config.reference_frame,
         "wrench_convention": "environment_on_tool",
         "damping": config.damping,
+        "joint_weights_json": json.dumps(config.joint_weights),
         "model_urdf": str(config.urdf_path),
     }
 

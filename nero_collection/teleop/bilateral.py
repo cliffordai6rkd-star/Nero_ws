@@ -60,7 +60,7 @@ class BilateralJointController:
     ) -> None:
         self.config = config
         self.dynamics = dynamics or PinocchioJointTorqueResidualEstimator(dynamics_config)
-        self.feedback_filter = OnePoleLowPass(config.force_feedback_lowpass_hz)
+        self.feedback_filter = self._new_feedback_filter()
         margin = float(config.joint_limit_margin_rad)
         self.position_lower = (
             np.asarray(self.dynamics.model.lowerPositionLimit, dtype=np.float64) + margin
@@ -88,7 +88,11 @@ class BilateralJointController:
         self._previous_feedback.fill(0.0)
         self._previous_compute_t = None
         self._activation_t = time.monotonic()
-        self.feedback_filter = OnePoleLowPass(self.config.force_feedback_lowpass_hz)
+        self.feedback_filter = self._new_feedback_filter()
+
+    def _new_feedback_filter(self) -> OnePoleLowPass | None:
+        cutoff_hz = self.config.force_feedback_lowpass_hz
+        return None if cutoff_hz is None else OnePoleLowPass(cutoff_hz)
 
     def compute(
         self,
@@ -133,7 +137,8 @@ class BilateralJointController:
                 self._force_bias = residual_torque.copy()
             else:
                 tau_ext = residual_torque - self._force_bias
-                tau_ext = self.feedback_filter.apply(tau_ext, int(timestamp_us))
+                if self.feedback_filter is not None:
+                    tau_ext = self.feedback_filter.apply(tau_ext, int(timestamp_us))
             deadband = _vector(cfg.force_feedback_deadband_nm)
             tau_ext_feedback = np.sign(tau_ext) * np.maximum(
                 np.abs(tau_ext) - deadband,
