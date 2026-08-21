@@ -26,6 +26,7 @@ from inference.pipeline import (
     _minimum_jerk_action_plan,
     _relative_action_pose_torch,
     _select_action_chunk,
+    _uses_link7_target_gripper_tcp_current_contract,
 )
 from nero_collection.control import DynamicsSnapshot, OSCQPConfig, OSCQPResult
 
@@ -55,6 +56,24 @@ class _DP(torch.nn.Module):
         return {
             "action_target": torch.tensor(
                 [[0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]]
+            )
+        }
+
+
+class _ImageOnlyDP(torch.nn.Module):
+    n_obs_steps = 1
+    image_key = "wrist"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.anchor = torch.nn.Parameter(torch.zeros(()))
+        self.observation_keys = None
+
+    def predict_action(self, obs):
+        self.observation_keys = tuple(obs)
+        return {
+            "action_target": torch.tensor(
+                [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]]
             )
         }
 
@@ -102,6 +121,16 @@ class _ActionDP(torch.nn.Module):
         }
 
 
+class _JointActionDP(_ActionDP):
+    def predict_action(self, obs):
+        del obs
+        self.calls += 1
+        chunk = torch.tensor(
+            [[[0.4, -0.2, 0.3, 0.1, -0.1, 0.2, -0.3]]]
+        )
+        return {"action": chunk, "action_target": chunk[:, 0]}
+
+
 class _TwoObservationActionDP(_ActionDP):
     n_obs_steps = 2
 
@@ -114,6 +143,16 @@ class _TwoObservationActionDP(_ActionDP):
             obs["wrist"][0, :, 0, 0, 0].detach().cpu().numpy().copy()
         )
         return super().predict_action(obs)
+
+
+class _TwoCameraDP(_DP):
+    image_keys = ("side", "wrist")
+    wrench_key = None
+
+    class _Encoder:
+        pass
+
+    obs_encoder = _Encoder()
 
 
 class _ActionPINN(torch.nn.Module):
@@ -338,6 +377,44 @@ def test_multirate_pipeline_tracks_clipped_action_force_and_torque(tmp_path: Pat
     pipeline.close()
 
 
+def test_dp_tau_ext_switch_allows_image_only_checkpoint(tmp_path: Path) -> None:
+    config = replace(
+        _config(tmp_path),
+        dp_sampling=DPSamplingConfig(use_tau_ext_observation=False),
+    )
+    dp = _ImageOnlyDP()
+    pipeline = NeroInferencePipeline(
+        config,
+        dp_model=dp,
+        pinn_model=_PINN(),
+        controller=_Controller(),
+    )
+
+    pipeline._predict_action(
+        np.zeros((1, 3, 8, 10), dtype=np.float32),
+        np.ones((1, 1, 6), dtype=np.float32),
+    )
+
+    assert dp.observation_keys == ("wrist",)
+    assert not pipeline._uses_wrench_observation
+    pipeline.close()
+
+
+def test_dp_tau_ext_switch_rejects_force_aware_checkpoint(tmp_path: Path) -> None:
+    config = replace(
+        _config(tmp_path),
+        dp_sampling=DPSamplingConfig(use_tau_ext_observation=False),
+    )
+
+    with pytest.raises(ValueError, match="requires an image-only DP checkpoint"):
+        NeroInferencePipeline(
+            config,
+            dp_model=_DP(),
+            pinn_model=_PINN(),
+            controller=_Controller(),
+        )
+
+
 def test_current_dp_reduces_eight_high_rate_chunks_and_drops_first() -> None:
     actions = np.zeros((64, 7), dtype=np.float64)
     actions[:, 6] = 1.0
@@ -548,6 +625,78 @@ def test_open_loop_builds_two_images_with_eight_distinct_can_samples_each(
     pipeline.close()
 
 
+def test_multicamera_timestamps_use_wrist_anchor_and_causal_previous_side(
+    tmp_path: Path,
+) -> None:
+    pipeline = NeroInferencePipeline(
+        _config(tmp_path),
+        dp_model=_TwoCameraDP(),
+        pinn_model=_PINN(),
+        controller=_Controller(),
+    )
+    zero_wrench = np.zeros(6, dtype=np.float32)
+
+    observations = (
+        (0.026, 0.040, 0.1, 0.3, 0.040),
+        (0.066, 0.080, 0.2, 0.4, 0.080),
+        # This side frame is newer than the latest wrist frame and must not be
+        # paired with it; the training contract is causal, not nearest-neighbor.
+        (0.106, 0.080, 0.9, 0.4, 0.081),
+    )
+    for side_time, wrist_time, side_marker, wrist_marker, state_time in observations:
+        pipeline._append_observation(
+            {
+                "side": np.full((8, 10, 3), side_marker, dtype=np.float32),
+                "wrist": np.full((8, 10, 3), wrist_marker, dtype=np.float32),
+            },
+            zero_wrench,
+            image_timestamp_s={"side": side_time, "wrist": wrist_time},
+            state_timestamp_s=state_time,
+        )
+
+    snapshot = pipeline._timed_observation_snapshot(0.080)
+
+    assert snapshot is not None
+    images, _ = snapshot
+    assert isinstance(images, dict)
+    np.testing.assert_allclose(images["wrist"][:, 0, 0, 0], [0.3, 0.4])
+    np.testing.assert_allclose(images["side"][:, 0, 0, 0], [0.1, 0.2])
+    assert pipeline._timed_images is pipeline._timed_images_by_key["wrist"]
+    pipeline.close()
+
+
+def test_multicamera_timestamp_mapping_must_match_checkpoint_keys(
+    tmp_path: Path,
+) -> None:
+    pipeline = NeroInferencePipeline(
+        _config(tmp_path),
+        dp_model=_TwoCameraDP(),
+        pinn_model=_PINN(),
+        controller=_Controller(),
+    )
+    images = {
+        "side": np.zeros((8, 10, 3), dtype=np.uint8),
+        "wrist": np.zeros((8, 10, 3), dtype=np.uint8),
+    }
+
+    with pytest.raises(ValueError, match="image timestamps do not match"):
+        pipeline._append_observation(
+            images,
+            np.zeros(6),
+            image_timestamp_s={"wrist": 0.1},
+            state_timestamp_s=0.1,
+        )
+    with pytest.raises(ValueError, match="finite"):
+        pipeline.step(
+            replace(
+                _sample(0.1),
+                image=images,
+                image_timestamp_s={"side": np.nan, "wrist": 0.1},
+            )
+        )
+    pipeline.close()
+
+
 def test_absolute_action_condition_is_restored_from_pinn_checkpoint(
     tmp_path: Path,
 ) -> None:
@@ -753,7 +902,7 @@ def test_config_selects_ddpm_sampling_and_inference_steps(tmp_path: Path) -> Non
         """
 dp_checkpoint: {path: dp.ckpt, device: cpu}
 pinn_checkpoint: {path: pinn.ckpt, device: cpu}
-dp_sampling: {method: ddpm, num_inference_steps: 25}
+dp_sampling: {method: ddpm, num_inference_steps: 25, use_tau_ext_observation: false}
 robot: {urdf_path: robot.urdf}
 runtime: {collection_config: collection.yaml}
 """,
@@ -763,7 +912,7 @@ runtime: {collection_config: collection.yaml}
     config = load_inference_config(config_file)
     overrides = _dp_model_overrides(config)
 
-    assert config.dp_sampling == DPSamplingConfig("ddpm", 25)
+    assert config.dp_sampling == DPSamplingConfig("ddpm", 25, False)
     assert overrides["noise_scheduler._target_"].endswith("DDPMScheduler")
     assert overrides["num_inference_steps"] == 25
 
@@ -1093,6 +1242,42 @@ def test_disabled_predictor_executes_selected_dp_action_through_ik(
     pipeline.close()
 
 
+def test_joint_dp_action_bypasses_ik_and_uses_joint_safety(tmp_path: Path) -> None:
+    config = replace(
+        _config(tmp_path),
+        action="joint",
+        pinn_checkpoint=None,
+        predictor=PredictorConfig(enabled=False, action_chunk_mode="first"),
+        safety=replace(
+            _config(tmp_path).safety,
+            maximum_joint_position_step_rad=0.1,
+        ),
+    )
+    controller = _Controller()
+    controller.model = _IKModel()
+    pipeline = NeroInferencePipeline(
+        config,
+        dp_model=_JointActionDP(),
+        controller=controller,
+    )
+
+    pipeline.step(_sample(0.0))
+    assert pipeline._dp_future is not None
+    pipeline._dp_future.result(timeout=2.0)
+    output = pipeline.step(_sample(0.01))
+
+    assert output.ik_result is None
+    np.testing.assert_allclose(
+        output.action_target,
+        [0.4, -0.2, 0.3, 0.1, -0.1, 0.2, -0.3],
+    )
+    np.testing.assert_allclose(
+        output.joint_position_command,
+        [0.1, -0.1, 0.1, 0.1, -0.1, 0.1, -0.1],
+    )
+    pipeline.close()
+
+
 def test_open_loop_all_executes_complete_chunk_before_reobserving_direct_ik(
     tmp_path: Path,
 ) -> None:
@@ -1386,6 +1571,57 @@ runtime: {collection_config: collection.yaml}
     assert config.predictor.action_step_s == pytest.approx(0.05)
     assert config.pinn_checkpoint is None
     assert config.robot.action_frame_name == "link7"
+
+
+def test_config_loads_joint_dp_action_semantics(tmp_path: Path) -> None:
+    config_file = tmp_path / "joint.yaml"
+    config_file.write_text(
+        """
+dp_checkpoint: {path: dp.ckpt, device: cpu}
+action: joint
+predictor: {enabled: false}
+robot: {urdf_path: robot.urdf}
+runtime: {collection_config: collection.yaml}
+""",
+        encoding="utf-8",
+    )
+
+    assert load_inference_config(config_file).action == "joint"
+
+
+def test_config_rejects_unknown_dp_action_semantics(tmp_path: Path) -> None:
+    config_file = tmp_path / "invalid_action.yaml"
+    config_file.write_text(
+        """
+dp_checkpoint: {path: dp.ckpt, device: cpu}
+action: delta_joint
+predictor: {enabled: false}
+robot: {urdf_path: robot.urdf}
+runtime: {collection_config: collection.yaml}
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="action must be 'eepose' or 'joint'"):
+        load_inference_config(config_file)
+
+
+def test_legacy_wm_frame_split_is_bound_to_exact_checkpoint(tmp_path: Path) -> None:
+    exact = Path(
+        "/mnt/code/lcx/PINN/outputs/contact_world_model_opd_sweep/20260819_113728/"
+        "teacher/checkpoints/step_00100000.pt"
+    )
+    config = replace(
+        _config(tmp_path),
+        pinn_checkpoint=CheckpointConfig(exact, device="cpu"),
+    )
+    other = replace(
+        config,
+        pinn_checkpoint=CheckpointConfig(exact.with_name("latest.pt"), device="cpu"),
+    )
+
+    assert _uses_link7_target_gripper_tcp_current_contract(config)
+    assert not _uses_link7_target_gripper_tcp_current_contract(other)
 
 
 def test_synchronous_direct_ik_consumes_one_dp_result_per_dataset_frame(

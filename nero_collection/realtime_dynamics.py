@@ -6,7 +6,7 @@ from typing import Protocol
 
 import numpy as np
 
-from nero_collection.contact_wrench import JointTorqueResidualEstimate
+from nero_collection.inverse_dynamics import JointTorqueResidualEstimate
 from nero_collection.dynamics_processing import three_point_centered_sample
 
 

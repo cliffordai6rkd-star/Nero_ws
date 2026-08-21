@@ -217,7 +217,7 @@ class _MatplotlibWrenchWindow:
         self.figure, axes_grid = plt.subplots(2, 2, figsize=(15, 9), sharex=True)
         try:
             self.figure.canvas.manager.set_window_title(
-                "Nero raw and processed external wrench"
+                "Nero wrench: before and after DP observation filtering"
             )
         except AttributeError:
             pass
@@ -232,10 +232,10 @@ class _MatplotlibWrenchWindow:
             self.processed_components_axis,
         )
         self.raw_force_line = self.raw_force_axis.plot(
-            [], [], color="tab:blue", linewidth=1.3, label="raw ||F||"
+            [], [], color="tab:blue", linewidth=1.3, label="before filter ||F||"
         )[0]
         self.processed_force_line = self.processed_force_axis.plot(
-            [], [], color="tab:blue", linewidth=1.3, label="processed ||F||"
+            [], [], color="tab:blue", linewidth=1.3, label="DP observation ||F||"
         )[0]
         if self.contact_threshold_n is not None:
             self.processed_force_axis.axhline(
@@ -247,21 +247,24 @@ class _MatplotlibWrenchWindow:
             )
         self.raw_component_lines = self._make_component_lines(
             self.raw_components_axis,
-            "raw",
+            "before filter",
         )
         self.processed_component_lines = self._make_component_lines(
             self.processed_components_axis,
-            "processed",
+            "DP observation",
         )
-        self._configure_force_axis(self.raw_force_axis, "Raw resultant force")
+        self._configure_force_axis(
+            self.raw_force_axis,
+            "Before tau_ext_filter (diagnostic only)",
+        )
         self._configure_force_axis(
             self.processed_force_axis,
-            "Processed DP observation resultant force",
+            "After tau_ext_filter and DP contact gate",
         )
         self.raw_force_axis.legend(loc="upper left", fontsize=9)
         self.processed_force_axis.legend(loc="upper left", fontsize=9)
         self.figure.suptitle(
-            "External wrench in DP observation frame: raw vs processed"
+            "External wrench in DP frame: raw diagnostic vs model observation"
         )
         self.figure.tight_layout()
         self.figure.show()
@@ -330,10 +333,13 @@ class _MatplotlibWrenchWindow:
         self.processed_force_line.set_data([], [])
         for line in (*self.raw_component_lines, *self.processed_component_lines):
             line.set_data([], [])
-        self._configure_force_axis(self.raw_force_axis, "Raw resultant force")
+        self._configure_force_axis(
+            self.raw_force_axis,
+            "Before tau_ext_filter (diagnostic only)",
+        )
         self._configure_force_axis(
             self.processed_force_axis,
-            "Processed DP observation resultant force",
+            "After tau_ext_filter and DP contact gate",
         )
         for axis in (self.raw_components_axis, self.processed_components_axis):
             axis.set_xlim(-self.config.window_s, 0.0)

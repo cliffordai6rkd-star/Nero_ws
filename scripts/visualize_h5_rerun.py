@@ -17,6 +17,13 @@ WRENCH_COLORS = (
     (170, 91, 170),
     (89, 161, 79),
 )
+WRENCH_DATASETS = (
+    "wrench_cal",
+    "wrench_pred",
+    "wrench_cal_raw",
+    "wrench_pred_raw",
+    "wrench_ext",
+)
 
 
 @dataclass(frozen=True)
@@ -28,7 +35,8 @@ class EpisodeData:
     camera_time_s: np.ndarray
     camera_frames: np.ndarray
     ee_pose: np.ndarray
-    wrench_ext: np.ndarray
+    wrench_name: str
+    wrench: np.ndarray
 
 
 def parse_args() -> argparse.Namespace:
@@ -47,6 +55,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--camera",
         help="Camera group name; defaults to wrist when present, otherwise the first camera",
+    )
+    parser.add_argument(
+        "--wrench-source",
+        choices=("auto", *WRENCH_DATASETS),
+        default="auto",
+        help=(
+            "Teleop wrench dataset to plot; auto prefers wrench_cal, then "
+            "wrench_pred, then legacy wrench_ext"
+        ),
     )
     parser.add_argument(
         "--save",
@@ -79,7 +96,12 @@ def resolve_episode(runs_dir: Path, episode_index: int) -> Path:
     return matches[0]
 
 
-def load_episode(path: Path, episode_index: int, camera_name: str | None) -> EpisodeData:
+def load_episode(
+    path: Path,
+    episode_index: int,
+    camera_name: str | None,
+    wrench_source: str = "auto",
+) -> EpisodeData:
     try:
         import h5py
     except (ImportError, ValueError) as exc:
@@ -91,7 +113,6 @@ def load_episode(path: Path, episode_index: int, camera_name: str | None) -> Epi
         required = (
             "teleop/timestamp_us",
             "teleop/ee_pose_follower",
-            "teleop/wrench_ext",
         )
         missing = [name for name in required if name not in h5]
         if missing:
@@ -105,11 +126,12 @@ def load_episode(path: Path, episode_index: int, camera_name: str | None) -> Epi
             if "frames" in group and "timestamp_us" in group
         )
         selected_camera = _select_camera(camera_name, available_cameras, path)
+        selected_wrench = _select_wrench(wrench_source, h5["teleop"], path)
         camera_group = h5[f"cameras/{selected_camera}"]
 
         teleop_timestamp_us = np.asarray(h5["teleop/timestamp_us"][:], dtype=np.int64)
         ee_pose = np.asarray(h5["teleop/ee_pose_follower"][:], dtype=np.float64)
-        wrench_ext = np.asarray(h5["teleop/wrench_ext"][:], dtype=np.float64)
+        wrench = np.asarray(h5[f"teleop/{selected_wrench}"][:], dtype=np.float64)
         camera_timestamp_us = np.asarray(camera_group["timestamp_us"][:], dtype=np.int64)
         camera_frames = np.asarray(camera_group["frames"][:], dtype=np.uint8)
 
@@ -119,7 +141,8 @@ def load_episode(path: Path, episode_index: int, camera_name: str | None) -> Epi
         ee_pose,
         camera_timestamp_us,
         camera_frames,
-        wrench_ext,
+        selected_wrench,
+        wrench,
     )
     origin_us = int(teleop_timestamp_us[0])
     return EpisodeData(
@@ -130,11 +153,12 @@ def load_episode(path: Path, episode_index: int, camera_name: str | None) -> Epi
         camera_time_s=(camera_timestamp_us - origin_us).astype(np.float64) * 1.0e-6,
         camera_frames=camera_frames,
         ee_pose=ee_pose,
-        wrench_ext=wrench_ext,
+        wrench_name=selected_wrench,
+        wrench=wrench,
     )
 
 
-def log_episode(data: EpisodeData, wrench_ext: np.ndarray, save_path: Path | None) -> None:
+def log_episode(data: EpisodeData, save_path: Path | None) -> None:
     rr, rrb = _import_rerun()
     blueprint = _make_blueprint(rrb, data.camera_name)
     rr.init(
@@ -166,7 +190,7 @@ def log_episode(data: EpisodeData, wrench_ext: np.ndarray, save_path: Path | Non
 
     for index, (label, color) in enumerate(zip(WRENCH_LABELS, WRENCH_COLORS)):
         group = "force" if index < 3 else "moment"
-        entity_path = f"wrench_ext/{group}/{label}"
+        entity_path = f"wrench/{group}/{label}"
         rr.log(
             entity_path,
             rr.SeriesLines(colors=[color], names=label, widths=[2.0]),
@@ -175,7 +199,7 @@ def log_episode(data: EpisodeData, wrench_ext: np.ndarray, save_path: Path | Non
         rr.send_columns(
             entity_path,
             indexes=[rr.TimeColumn(TIMELINE, duration=data.teleop_time_s)],
-            columns=rr.Scalars.columns(scalars=wrench_ext[:, index]),
+            columns=rr.Scalars.columns(scalars=data.wrench[:, index]),
         )
 
     image_path = f"camera/{data.camera_name}/image"
@@ -198,12 +222,12 @@ def _make_blueprint(rrb, camera_name: str):
             ),
             rrb.Vertical(
                 rrb.TimeSeriesView(
-                    origin="/wrench_ext/force",
+                    origin="/wrench/force",
                     name="External force [N]",
                     plot_legend=rrb.PlotLegend(visible=True),
                 ),
                 rrb.TimeSeriesView(
-                    origin="/wrench_ext/moment",
+                    origin="/wrench/moment",
                     name="External moment [N.m]",
                     plot_legend=rrb.PlotLegend(visible=True),
                 ),
@@ -244,24 +268,42 @@ def _select_camera(requested: str | None, available: list[str], path: Path) -> s
     return "wrist" if "wrist" in available else available[0]
 
 
+def _select_wrench(requested: str, teleop, path: Path) -> str:
+    available = [name for name in WRENCH_DATASETS if name in teleop]
+    if requested == "auto":
+        if available:
+            return available[0]
+        raise RuntimeError(
+            f"Episode {path.name} has no supported wrench dataset; "
+            f"expected one of {[f'teleop/{name}' for name in WRENCH_DATASETS]}"
+        )
+    if requested not in available:
+        raise RuntimeError(
+            f"Wrench source {requested!r} is not in {path.name}; "
+            f"available={available}"
+        )
+    return requested
+
+
 def _validate_episode_arrays(
     path: Path,
     timestamp_us: np.ndarray,
     ee_pose: np.ndarray,
     camera_timestamp_us: np.ndarray,
     camera_frames: np.ndarray,
-    wrench_ext: np.ndarray,
+    wrench_name: str,
+    wrench: np.ndarray,
 ) -> None:
     sample_count = timestamp_us.size
     expected = {
         "teleop/timestamp_us": (sample_count,),
         "teleop/ee_pose_follower": (sample_count, 4, 4),
-        "teleop/wrench_ext": (sample_count, 6),
+        f"teleop/{wrench_name}": (sample_count, 6),
     }
     actual = {
         "teleop/timestamp_us": timestamp_us.shape,
         "teleop/ee_pose_follower": ee_pose.shape,
-        "teleop/wrench_ext": wrench_ext.shape,
+        f"teleop/{wrench_name}": wrench.shape,
     }
     invalid = [
         f"{name}: expected {expected[name]}, got {shape}"
@@ -281,7 +323,7 @@ def _validate_episode_arrays(
         raise RuntimeError(f"Invalid episode {path.name}: " + "; ".join(invalid))
     for name, values in (
         ("teleop/ee_pose_follower", ee_pose),
-        ("teleop/wrench_ext", wrench_ext),
+        (f"teleop/{wrench_name}", wrench),
     ):
         if not np.isfinite(values).all():
             raise RuntimeError(f"Episode {path.name} contains non-finite {name} values")
@@ -294,13 +336,18 @@ def _validate_episode_arrays(
 def main() -> int:
     args = parse_args()
     episode_path = resolve_episode(args.runs_dir, args.episode)
-    data = load_episode(episode_path, args.episode, args.camera)
+    data = load_episode(
+        episode_path,
+        args.episode,
+        args.camera,
+        args.wrench_source,
+    )
     print(
         f"Loading {episode_path.name}: teleop={data.teleop_time_s.size}, "
         f"camera={data.camera_name}:{data.camera_time_s.size}"
     )
-    print("External wrench source: teleop/wrench_ext")
-    log_episode(data, data.wrench_ext, args.save)
+    print(f"External wrench source: teleop/{data.wrench_name}")
+    log_episode(data, args.save)
     if args.save is not None:
         print(f"Saved Rerun recording: {args.save.expanduser().resolve()}")
     return 0

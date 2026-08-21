@@ -2,9 +2,19 @@
 
 `predictor.enabled` 是执行链路开关：
 
-- `true`：保持原链路，DP -> predictor/F expert -> OSC-QP -> `tau_command`；
+- `true`：加载 predictor；旧模型走 OSC-QP，contact WM 按 `execution.mode` 选择 MIT、
+  OSC-QP、q 或 tau；
 - `false`：不加载 `pinn_checkpoint`，DP action -> IK -> `q`，runtime 通过
   `command_joint_positions()` 下发关节位置。
+
+顶层 `action` 声明 DP checkpoint 的 7 维输出语义：
+
+- `action: eepose`（默认）：`[x,y,z,qx,qy,qz,qw]`，纯 DP 分支通过 IK 执行；
+- `action: joint`：绝对七轴 `q`，纯 DP 分支直接执行，不调用 IK。启用 WM 时，整段
+  joint action 会先用 URDF 对 `robot.action_frame_name` 做 FK，再以相同的
+  `[x,y,z,qx,qy,qz,qw]` pose 契约输入 WM。一般情况下 WM 的 target/current pose
+  使用同一 action frame；`contact_world_model_opd_sweep/.../step_00100000.pt` 因训练
+  数据契约特殊，推理端临时固定复现 `target=link7, current=gripper_tcp`。
 
 关闭 predictor 时的数据流为：
 
@@ -85,6 +95,19 @@ beta schedule、prediction type、模型权重和 normalizer 保持不变。DDIM
 
 ## H5 离线推理与 MuJoCo 播放
 
+在线 runtime 的键盘控制：`s` 请求并执行一个完整的有效推理/控制周期，执行后自动
+回到等待状态；再次按 `s` 执行下一周期，`c` 恢复连续运行，`i` 重置 episode，`q`
+退出。也可以用 `--single-step` 启动后直接处于等待状态：
+
+```bash
+python -m inference.cli \
+  --config inference/configs/nero_contact_wm.yaml \
+  --run --single-step --backend pyagxarm --enable-command
+```
+
+单步请求会保留到下一张有效相机帧和 CAN 状态都可用，因此一次 `s` 不会因为传感器暂时
+没有新数据而消耗掉；它只对应一次 `pipeline.step()` 和一次硬件命令。
+
 `scripts/infer_h5_direct_ik.py` 从 `runs` episode 读取与在线推理相同的观测契约，按最近
 时间戳将相机帧对齐到 `teleop` 状态，然后逐相机帧同步执行 DP -> action chunk -> IK。
 同步入口保证每个 H5 帧只进入一次 observation history，结果不会随离线读取速度变化；
@@ -119,7 +142,7 @@ python scripts/infer_h5_direct_ik.py \
 `pinn_checkpoint`，并通过 `dp_checkpoint.dino_model_path` 使用
 `/mnt/code/lcx/model/dinov3-vitb16-pretrain-lvd1689m` 的本地 backbone，不访问网络。
 
-`predictor.mode` 提供三种可切换的状态/力预测后端：
+`predictor.mode` 提供多类可切换的状态/力预测后端：
 
 - `wrench_gru`：原 V1，GRU 直接预测 future wrench；
 - `world_model_v3`：V3 联合预测 future `q/v/a/tau`，再经过 Nero 接触力链得到
@@ -128,6 +151,84 @@ python scripts/infer_h5_direct_ik.py \
   因果状态估计契约重建 future `v/a`，最后经过同一接触力链得到 future wrench。
 - `world_model_v5`：V5 从历史末段 `[q,tau,0]` 出发，用条件 Flow ODE 联合生成
   future `q/tau/contact logit`，再因果重建 `v/a` 并经过同一 Nero 接触力链。
+
+contact WM 使用独立的 `ContactWMInferencePipeline`，不会进入上面的 wrench 适配链。它
+严格按 `contact_world_model.yaml`/`contact_world_model_opd.yaml` 的契约输入 50 个 100 Hz
+的 `q/tau` 历史和 8 个 25 Hz、每个 21 维的 composite action token（absolute/current/relative
+pose）；WM 不读取 `dq` 或 wrench。模型输出 future `q/tau/contact_state`，MIT 需要的
+`dq_target` 由同一 checkpoint 的因果 q 状态估计器在输出侧重建。使用
+`inference/configs/nero_contact_wm.yaml`，并通过 `execution.mode` 选择四种执行方式：
+
+- `mit`：输出 q/dq 参考和 WM tau feedforward；固件按 `mit_kp/mit_kd` 加位置/速度反馈。
+  `mit_velocity_limit` 限制重建速度；`mit_feedback_torque_limit` 和
+  `safety.maximum_command_torque_nm` 超限时按比例缩小本周期实际下发的 `kp/kd`，
+  因而限幅作用于真实 `move_mit` 命令而不改变 WM 的 q/dq 参考。该限制按主机采样时
+  的 q/dq 计算；CAN 延迟和采样间状态变化意味着它不是替代固件/驱动器总力矩保护的
+  硬件安全保证。
+- `osc_qp`：把重建的 `ddq_target` 和 `tau_target` 作为 QP 的软目标，动力学、关节、速度、
+  力矩和接触约束保持硬约束；权重由 `osc_qp.joint_acceleration_tracking_weight` 与
+  `osc_qp.torque_tracking_weight` 设置。
+- `q`：对预测 q 做关节限位/单周期步长保护后调用 `command_joint_positions()`。
+- `tau`：仅下发限幅/滤波后的 WM tau feedforward，通过纯力矩 MIT 传输。
+
+`execution.mode: mit` 不会把已经由固件应用的 PD 项再次加入 `t_ff`；
+`InferenceOutput.tau_command` 用于诊断完整 MIT 合成力矩，`torque_target` 才是发送给
+固件的 WM feedforward。
+
+例如先只检查 checkpoint 和契约：
+
+```bash
+python -m inference.cli --config inference/configs/nero_contact_wm.yaml --check
+```
+
+## H5 -> MuJoCo 独立仿真分支
+
+仿真分支不会初始化 CAN、相机或真机 runtime。它读取一条 H5 episode，在状态时钟上运行
+同一个 DP/contact-WM pipeline，并把输出交给带七个 torque motor 的 MuJoCo 模型动态积分。
+`q` 是软件 PD 位置伺服，`mit` 是 `tau_WM + Kp(q_ref-q)+Kd(dq_ref-dq)`，`tau` 和
+`osc_qp` 直接使用 `tau_command`；四种模式都不会直接写 `data.qpos`。
+
+默认每 10 ms 调一次策略、每 1 ms 做 MuJoCo 子步。contact WM 仍接收 50 个 100 Hz 的
+q/tau 历史和 DP 的 8 个 action token。默认 `recorded` 观测模式用 H5 的 q/dq/ddq/tau
+作为策略输入，同时记录仿真状态；要检查闭环漂移可使用 `hybrid_closed_loop`，此时图像和
+wrench 仍来自 H5，而 q/dq/tau 改用仿真上一周期状态。
+
+先用无窗口模式验证模型和 scene：
+
+```bash
+python scripts/infer_h5_mujoco.py \
+  runs/wipe_board/episode_0024_20260815_153252.h5 \
+  --config inference/configs/nero_contact_wm.yaml \
+  --simulation-config calibration/config.yaml \
+  --dp-checkpoint /path/to/dp.ckpt \
+  --pinn-checkpoint /path/to/contact_wm_student.pt \
+  --mode mit --max-steps 200 --output /tmp/nero_mujoco_mit.npz
+```
+
+`--dp-checkpoint` and `--pinn-checkpoint` are optional overrides.  The checked-in
+contact-WM YAML keeps portable relative placeholders; pass the actual OPD
+student (or edit those two YAML paths) before running.  The CLI validates both
+checkpoint files and the local DINO directory before allocating the models, so
+a stale path fails with a short actionable message.  For a pure DP -> IK replay,
+use `inference/configs/nero_direct_ik.yaml`; the runner automatically selects
+the `q` MuJoCo servo when `predictor.enabled: false`.
+
+其余模式只需替换 `--mode` 为 `q`、`tau` 或 `osc_qp`。需要图形窗口时加 `--viewer`；在
+无显示服务器的机器上保持默认的 headless 模式。输出 NPZ 包含 recorded/simulated q、dq、
+ddq、command/applied torque、q/dq/tau target、DP/PINN 更新标记和 MuJoCo 接触计数，生成的
+执行器 MJCF 可用 `--scene-output` 保存。
+
+H5 loader 要求 `teleop/timestamp_us`、`q_follower`、`dq_follower`、`tau_follower`、
+外力矩（优先 `wrench_ext`，旧录音兼容 `wrench_cal`/`wrench_pred`）以及所选 camera 的
+`frames/timestamp_us`。如果旧录音没有 `ddq_follower`，默认用 timestamp-aware 的因果
+`dq` 后向差分补出 ddq；严格复现实验可通过 `derive_ddq_if_missing=False` 禁止该回退。arm
+名称同时支持 `teleop` 属性和旧格式的 `metadata/arm_names_json`。相机对状态是因果对齐的
+（只使用当前 tick 之前的最新帧），direct-IK 的 wrench 窗口按每个历史图像重新构造为
+`[n_obs_steps, wrench_history_steps, 6]`。当前环境若出现 h5py/NumPy ABI 错误，需要先修复
+Python 环境，代码会明确报告该依赖错误。
+
+离线 runner 要求 `predictor.inference_mode: open_loop`，这样 DP 在新图像窗口到达时同步
+更新，结果不依赖主机线程调度；只有明确接受非确定性时才传 `--allow-asynchronous`。
 
 V3 运行时数据流为：
 
@@ -235,6 +336,10 @@ episode reset、startup recovery 和 shutdown 会先停止并清空连续流，�
 在线 runtime 读取 `runtime.collection_config` 的 `teleop.command.sample_rate_hz`，与数采
 `MasterSlaveTeleop` 使用同一固定频率最新缓存语义。外力矩 RNEA 不使用普通状态字段 `ddq_follower`，
 而是由与 PINN offline forward pass 一致的因果 Kalman 从同一 tick 的 `q/dq` 估计 `ddq_kf_causal`。
+每个底层状态帧先复制，并由共享的 `source_butterworth_filter` 对 `q/dq/tau/q_cmd` 做因果滤波；
+随后 `tau_f` 和 `tau_next` 分别按
+`teleop.command.sample_rate_hz / observation_sample_rate_hz` 的整数 stride 取第 0、N、2N…帧。
+两路不再按时间戳执行最近邻或 Unix epoch 固定相位重采样；无法得到整数 stride 的配置会在启动时报错。
 episode 复位会重启固定频率状态流，并清空两个固定窗口、Kalman 状态和两条 tau_ext 滤波状态，等待新的有限
 `q/dq/tau/q_cmd` 有效后才恢复推理。collection runtime 要求 `tau_ext_inference.enabled: true`
 并至少配置实际使用的 checkpoint。主从遥操作通过
@@ -249,8 +354,12 @@ Kalman、`dq_sign`、RNEA state source 和 torque filter 契约；滤波后的�
 
 DP 的 observation 也按 checkpoint 时间契约取样：只把新相机 timestamp 加入图像时间线，
 以训练配置的 `timestamp_step_sec=0.1` 选择 10 Hz image anchors；每个 anchor 从带时间戳的
-wrench ring buffer 中按 `0.1 / wrench_history_steps` 选择对应高频历史。控制循环重复使用
-同一相机帧时不会再重复写入 DP observation history。
+wrench ring buffer 中按 `0.1 / wrench_history_steps` 选择对应高频历史（每个 tick 取不晚于
+anchor 的最新状态）。控制循环重复使用
+同一相机帧时不会再重复写入 DP observation history。多相机 checkpoint 以
+`runtime.camera`（当前为 `wrist`）作为 master anchor；其余相机严格选择 timestamp
+不晚于该 anchor 的最新帧，复现 wipe-board H5 转换中的 `resample: previous`，不会把
+未来 side 帧错配给 wrist。
 
 启用 `wrench_visualization` 后，独立窗口显示四张在线曲线：第一行是 raw tau_ext 经 Jacobian
 反解后的 wrench 合力和六个分量，第二行是一次 tau_ext 滤波后映射、再经过 DP

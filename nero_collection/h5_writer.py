@@ -10,14 +10,11 @@ import numpy as np
 
 from nero_collection.config import CollectionConfig
 from nero_collection.coordinates import NERO_V120_MOTOR_VELOCITY_TO_JOINT_SIGN
-from nero_collection.contact_wrench import (
-    PinocchioContactWrenchEstimator,
-)
 from nero_collection.tau_ext_inference import OnlineTauExtInference
 from nero_collection.time_utils import now_us
 
 
-FORMAT_VERSION = "factr_multimodal_episode/v11"
+FORMAT_VERSION = "factr_multimodal_episode/v12"
 
 FOLLOWER_TELEOP_DATASETS = frozenset(
     {
@@ -42,10 +39,6 @@ FOLLOWER_TELEOP_DATASETS = frozenset(
         "tau_ext_pred_raw",
         "tau_ext_cal",
         "tau_ext_pred",
-        "wrench_cal_raw",
-        "wrench_pred_raw",
-        "wrench_cal",
-        "wrench_pred",
         "model_observation_updated",
         "model_observation_timestamp_us",
         "model_prediction_age_us",
@@ -99,9 +92,10 @@ class EpisodeBuffer:
         elif self.online_tau_ext is None:
             self.online_tau_ext = OnlineTauExtInference(
                 self.config.tau_ext_inference,
-                self.config.realtime_plot.inverse_dynamics,
+                self.config.tau_ext_inference.inverse_dynamics,
                 self.config.dynamics_processing,
                 self.config.robot_states,
+                source_sample_rate_hz=self.config.teleop.command.sample_rate_hz,
             )
 
     def append_teleop(
@@ -359,7 +353,6 @@ class EpisodeBuffer:
             raise RuntimeError("Teleop acquisition timestamps must be strictly increasing")
         self._apply_dynamics_metadata(data, state_names, attrs, timeline)
         self._append_online_tau_ext_attrs(attrs)
-        self._append_wrenches(data, state_names, attrs, timeline)
         return data, state_names, attrs
 
     def _append_online_tau_ext_attrs(self, attrs) -> None:
@@ -378,20 +371,26 @@ class EpisodeBuffer:
             if model_metadata is not None
             and model_metadata.sample_rate_hz is not None
         }
+        source_sample_rate_hz = getattr(
+            self.online_tau_ext,
+            "source_sample_rate_hz",
+            self.config.teleop.command.sample_rate_hz,
+        )
         common = {
             "timestamp_path": "teleop/timestamp_us",
             "causal": True,
-            "model_observation_policy": "per_model_fixed_rate_observation",
-            "fixed_observation_interval": True,
+            "model_observation_policy": "per_model_filtered_source_frame_stride",
+            "fixed_observation_interval": False,
             "active_model_sample_rates_hz_json": json.dumps(sample_rates),
-            "observation_grid_phase": "per_model",
+            "source_sample_rate_hz": source_sample_rate_hz,
+            "observation_grid_phase": "episode_source_frame_zero",
             "configured_force_feedback_source": feedback_source,
             "observation_gap_warning_s": (
                 self.config.tau_ext_inference.observation_gap_warning_s
             ),
             "source_butterworth_filter_enabled": source_filter.enabled,
             "source_butterworth_filter_features_json": json.dumps(
-                ["q", "dq", "tau"] if source_filter.enabled else []
+                ["q", "dq", "tau", "q_cmd"] if source_filter.enabled else []
             ),
             "source_butterworth_filter_cutoff_hz": source_filter.cutoff_hz,
             "source_butterworth_filter_order": source_filter.order,
@@ -417,10 +416,10 @@ class EpisodeBuffer:
                 "dq_source_dataset": "teleop/dq_follower",
                 "ddq_source": "internal_causal_kalman_not_persisted",
                 "model_urdf": str(
-                    self.config.realtime_plot.inverse_dynamics.urdf_path
+                    self.config.tau_ext_inference.inverse_dynamics.urdf_path
                 ),
                 "model_manifest": str(
-                    self.config.realtime_plot.inverse_dynamics.manifest_path or ""
+                    self.config.tau_ext_inference.inverse_dynamics.manifest_path or ""
                 ),
                 }
             )
@@ -494,6 +493,26 @@ class EpisodeBuffer:
                     }
                 )
                 continue
+            model_name = "tau_f" if dataset_name == "tau_f_pred" else "tau_next"
+            observation_sample_rate_hz = (
+                self.online_tau_ext.observation_sample_rate_hz(model_name)
+                if hasattr(self.online_tau_ext, "observation_sample_rate_hz")
+                else model_metadata.sample_rate_hz
+            )
+            if hasattr(self.online_tau_ext, "observation_stride_frames"):
+                observation_stride_frames = (
+                    self.online_tau_ext.observation_stride_frames(model_name)
+                )
+            elif source_sample_rate_hz and observation_sample_rate_hz:
+                ratio = float(source_sample_rate_hz) / float(observation_sample_rate_hz)
+                rounded_ratio = int(round(ratio))
+                observation_stride_frames = (
+                    rounded_ratio
+                    if rounded_ratio >= 1 and np.isclose(ratio, rounded_ratio)
+                    else None
+                )
+            else:
+                observation_stride_frames = None
             attrs[dataset_name].update(
                 {
                     **common,
@@ -521,26 +540,12 @@ class EpisodeBuffer:
                         if model_metadata.sample_rate_hz is not None
                         else float("nan")
                     ),
-                    "observation_sample_rate_hz": (
-                        self.online_tau_ext.observation_sample_rate_hz(
-                            "tau_f" if dataset_name == "tau_f_pred" else "tau_next"
-                        )
-                        if hasattr(
-                            self.online_tau_ext,
-                            "observation_sample_rate_hz",
-                        )
-                        else model_metadata.sample_rate_hz
-                    ),
+                    "observation_sample_rate_hz": observation_sample_rate_hz,
                     "observation_selection_policy": (
-                        "fixed_phase_latest_complete_at_or_before_tick"
-                        if dataset_name == "tau_next_pred"
-                        else "episode_phase_absolute_nearest_complete_observation"
+                        "first_filtered_source_frame_then_every_nth_frame"
                     ),
-                    "observation_phase_reference": (
-                        "unix_epoch"
-                        if dataset_name == "tau_next_pred"
-                        else "first_complete_observation"
-                    ),
+                    "observation_phase_reference": "first_complete_source_frame",
+                    "observation_stride_frames": observation_stride_frames,
                     "model_dataloader_filters_json": json.dumps(
                         model_metadata.dataloader_filters,
                         sort_keys=True,
@@ -707,69 +712,6 @@ class EpisodeBuffer:
                             "filter_initialization": "steady_first_real_sample",
                         }
                     )
-
-    def _append_wrenches(self, data, state_names, attrs, timeline) -> None:
-        if "q_follower" not in data:
-            return
-        q = np.asarray(data["q_follower"], dtype=np.float64)
-        expected_joint_shape = (timeline.size, 7)
-        if q.shape != expected_joint_shape:
-            raise RuntimeError(
-                f"Cannot compute external wrenches from q_follower shape {q.shape}; "
-                f"expected {expected_joint_shape}"
-            )
-        mapper = PinocchioContactWrenchEstimator(
-            self.config.realtime_plot.wrench_mapping
-        )
-        mapping = self.config.realtime_plot.wrench_mapping
-        for tau_name, wrench_name in (
-            ("tau_ext_cal_raw", "wrench_cal_raw"),
-            ("tau_ext_pred_raw", "wrench_pred_raw"),
-            ("tau_ext_cal", "wrench_cal"),
-            ("tau_ext_pred", "wrench_pred"),
-        ):
-            if tau_name not in data:
-                continue
-            tau_ext = np.asarray(data[tau_name], dtype=np.float64)
-            if tau_ext.shape != expected_joint_shape:
-                raise RuntimeError(
-                    f"Cannot compute {wrench_name} from {tau_name} shape "
-                    f"{tau_ext.shape}; expected {expected_joint_shape}"
-                )
-            wrench = np.empty((timeline.size, 6), dtype=np.float64)
-            for index, (q_value, tau_value) in enumerate(zip(q, tau_ext)):
-                wrench[index] = mapper.map_joint_torque(q_value, tau_value).wrench
-            data[wrench_name] = wrench
-            state_names[wrench_name] = "wrench"
-            attrs[wrench_name].update(
-                {
-                    "definition": (
-                        f"damped least-squares solution of {tau_name} = "
-                        f"J(q)^T {wrench_name}"
-                    ),
-                    "processing_method": (
-                        "pinocchio_frame_jacobian_damped_least_squares"
-                    ),
-                    "timestamp_path": "teleop/timestamp_us",
-                    "q_source_dataset": "teleop/q_follower",
-                    "tau_source_dataset": f"teleop/{tau_name}",
-                    "tau_ext_post_filter_applied": bool(
-                        attrs[tau_name].get("tau_ext_post_filter_applied", False)
-                    ),
-                    "components_json": json.dumps(
-                        ["Fx", "Fy", "Fz", "Mx", "My", "Mz"]
-                    ),
-                    "component_units_json": json.dumps(
-                        ["N", "N", "N", "N.m", "N.m", "N.m"]
-                    ),
-                    "frame_name": mapping.frame_name,
-                    "frame_type": "end_effector",
-                    "reference_frame": mapping.reference_frame,
-                    "wrench_convention": "environment_on_tool",
-                    "damping": mapping.damping,
-                    "model_urdf": str(mapping.urdf_path),
-                }
-            )
 
     def _apply_dynamics_metadata(self, data, state_names, attrs, timeline) -> None:
         for role in ("leader", "follower"):

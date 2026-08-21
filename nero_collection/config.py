@@ -40,22 +40,6 @@ class DynamicsProcessingConfig:
 
 
 @dataclass(frozen=True)
-class ContactWrenchConfig:
-    urdf_path: Path = Path("urdf/nero/nero_with_gripper.urdf")
-    frame_name: str = "gripper_tcp"
-    delay_s: float = 0.5
-    damping: float = 0.02
-    joint_weights: tuple[float, ...] = (1.0,) * 7
-    reference_frame: str = "local"
-    locked_joint_names: tuple[str, ...] = (
-        "gripper",
-        "gripper_joint1",
-        "gripper_joint2",
-    )
-    gravity_m_s2: tuple[float, float, float] = (0.0, 0.0, -9.81)
-
-
-@dataclass(frozen=True)
 class InverseDynamicsConfig:
     urdf_path: Path = Path("urdf/nero/nero_with_gripper.urdf")
     manifest_path: Path | None = None
@@ -73,8 +57,6 @@ class RealtimePlotConfig:
     enabled: bool = False
     window_s: float = 10.0
     update_rate_hz: float = 20.0
-    inverse_dynamics: InverseDynamicsConfig = field(default_factory=InverseDynamicsConfig)
-    wrench_mapping: ContactWrenchConfig = field(default_factory=ContactWrenchConfig)
 
 
 @dataclass(frozen=True)
@@ -111,7 +93,7 @@ class TauExtFilterConfig:
 
 @dataclass(frozen=True)
 class SourceButterworthFilterConfig:
-    """Variable-dt anti-alias filter applied before model resampling."""
+    """Variable-dt anti-alias filter applied before model stride selection."""
 
     enabled: bool = False
     cutoff_hz: float = 15.0
@@ -131,6 +113,7 @@ class TauExtInferenceConfig:
     )
     state_estimator: CausalKalmanConfig = field(default_factory=CausalKalmanConfig)
     tau_ext_filter: TauExtFilterConfig = field(default_factory=TauExtFilterConfig)
+    inverse_dynamics: InverseDynamicsConfig = field(default_factory=InverseDynamicsConfig)
 
 
 @dataclass(frozen=True)
@@ -296,7 +279,7 @@ def load_config(path: str | Path) -> CollectionConfig:
     output = _parse_output(data.get("output", {}), config_path.parent)
     cameras = tuple(_parse_camera(item) for item in data.get("cameras", []) if item.get("enabled", True))
     gripper = _parse_gripper(data.get("gripper", {}))
-    realtime_plot = _parse_realtime_plot(data.get("realtime_plot", {}), config_path.parent)
+    realtime_plot = _parse_realtime_plot(data.get("realtime_plot", {}))
     tau_ext_inference = _parse_tau_ext_inference(
         data.get("tau_ext_inference", {}),
         config_path.parent,
@@ -715,7 +698,6 @@ def _parse_gripper(data: dict[str, Any]) -> GripperConfig:
 
 def _parse_realtime_plot(
     data: dict[str, Any],
-    config_dir: Path | None = None,
 ) -> RealtimePlotConfig:
     if data is None:
         data = {}
@@ -727,88 +709,62 @@ def _parse_realtime_plot(
         raise ValueError("realtime_plot.window_s must be positive and finite")
     if not isfinite(update_rate_hz) or update_rate_hz <= 0:
         raise ValueError("realtime_plot.update_rate_hz must be positive and finite")
-    if "inverse_dynamics" in data and "contact_wrench" in data:
-        raise ValueError("realtime_plot must not define both inverse_dynamics and contact_wrench")
-    inverse_data = data.get("inverse_dynamics", data.get("contact_wrench", {}))
-    if inverse_data is None:
-        inverse_data = {}
-    if not isinstance(inverse_data, dict):
-        raise ValueError("realtime_plot.inverse_dynamics must be a mapping")
-    base_dir = Path.cwd() if config_dir is None else Path(config_dir)
-    urdf_path = Path(
-        inverse_data.get("urdf_path", "../urdf/nero/nero_with_gripper.urdf")
-    ).expanduser()
-    if not urdf_path.is_absolute():
-        urdf_path = (base_dir / urdf_path).resolve()
-    manifest_value = inverse_data.get("manifest_path")
-    manifest_path = None
-    if manifest_value is not None:
-        manifest_path = Path(manifest_value).expanduser()
-        if not manifest_path.is_absolute():
-            manifest_path = (base_dir / manifest_path).resolve()
-    delay_s = float(inverse_data.get("delay_s", 0.0))
-    if not isfinite(delay_s) or delay_s < 0:
-        raise ValueError("realtime_plot.inverse_dynamics.delay_s must be non-negative and finite")
-    locked_joint_names = tuple(
-        str(name) for name in inverse_data.get(
-            "locked_joint_names",
-            ("gripper", "gripper_joint1", "gripper_joint2"),
-        )
-    )
-    if not all(locked_joint_names):
-        raise ValueError("realtime_plot.inverse_dynamics.locked_joint_names must contain valid names")
-    gravity = tuple(float(value) for value in inverse_data.get("gravity_m_s2", (0.0, 0.0, -9.81)))
-    if len(gravity) != 3 or not all(isfinite(value) for value in gravity):
-        raise ValueError("realtime_plot.inverse_dynamics.gravity_m_s2 must contain three finite values")
-
-    wrench_data = data.get("wrench_mapping", data.get("contact_wrench", {}))
-    if wrench_data is None:
-        wrench_data = {}
-    if not isinstance(wrench_data, dict):
-        raise ValueError("realtime_plot.wrench_mapping must be a mapping")
-    frame_name = str(wrench_data.get("frame_name", "gripper_tcp"))
-    if not frame_name:
-        raise ValueError("realtime_plot.wrench_mapping.frame_name must not be empty")
-    damping = float(wrench_data.get("damping", 0.02))
-    if not isfinite(damping) or damping <= 0:
-        raise ValueError("realtime_plot.wrench_mapping.damping must be positive and finite")
-    joint_weights = tuple(
-        float(value) for value in wrench_data.get("joint_weights", (1.0,) * 7)
-    )
-    if len(joint_weights) != 7 or any(
-        not isfinite(value) or value <= 0.0 for value in joint_weights
-    ):
+    unknown = set(data) - {"enabled", "window_s", "update_rate_hz"}
+    if unknown:
         raise ValueError(
-            "realtime_plot.wrench_mapping.joint_weights must contain seven "
-            "positive finite values"
-        )
-    reference_frame = str(wrench_data.get("reference_frame", "local")).lower()
-    if reference_frame not in {"local", "local_world_aligned"}:
-        raise ValueError(
-            "realtime_plot.wrench_mapping.reference_frame must be local or "
-            "local_world_aligned"
+            f"realtime_plot contains removed options: {sorted(unknown)}; "
+            "configure inverse_dynamics under tau_ext_inference"
         )
     return RealtimePlotConfig(
         enabled=bool(data.get("enabled", False)),
         window_s=window_s,
         update_rate_hz=update_rate_hz,
-        inverse_dynamics=InverseDynamicsConfig(
-            urdf_path=urdf_path,
-            manifest_path=manifest_path,
-            delay_s=delay_s,
-            locked_joint_names=locked_joint_names,
-            gravity_m_s2=gravity,
-        ),
-        wrench_mapping=ContactWrenchConfig(
-            urdf_path=urdf_path,
-            frame_name=frame_name,
-            delay_s=0.0,
-            damping=damping,
-            joint_weights=joint_weights,
-            reference_frame=reference_frame,
-            locked_joint_names=locked_joint_names,
-            gravity_m_s2=gravity,
-        ),
+    )
+
+
+def _parse_inverse_dynamics(
+    data: dict[str, Any],
+    config_dir: Path | None = None,
+    prefix: str = "inverse_dynamics",
+) -> InverseDynamicsConfig:
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        raise ValueError(f"{prefix} must be a mapping")
+    allowed = {"urdf_path", "manifest_path", "delay_s", "locked_joint_names", "gravity_m_s2"}
+    unknown = set(data) - allowed
+    if unknown:
+        raise ValueError(f"{prefix} contains unknown options: {sorted(unknown)}")
+    base_dir = Path.cwd() if config_dir is None else Path(config_dir)
+    urdf_path = Path(data.get("urdf_path", "../urdf/nero/nero_with_gripper.urdf")).expanduser()
+    if not urdf_path.is_absolute():
+        urdf_path = (base_dir / urdf_path).resolve()
+    manifest_value = data.get("manifest_path")
+    manifest_path = None
+    if manifest_value is not None:
+        manifest_path = Path(manifest_value).expanduser()
+        if not manifest_path.is_absolute():
+            manifest_path = (base_dir / manifest_path).resolve()
+    delay_s = float(data.get("delay_s", 0.0))
+    if not isfinite(delay_s) or delay_s < 0:
+        raise ValueError(f"{prefix}.delay_s must be non-negative and finite")
+    locked_joint_names = tuple(
+        str(name)
+        for name in data.get(
+            "locked_joint_names", ("gripper", "gripper_joint1", "gripper_joint2")
+        )
+    )
+    if not all(locked_joint_names):
+        raise ValueError(f"{prefix}.locked_joint_names must contain valid names")
+    gravity = tuple(float(value) for value in data.get("gravity_m_s2", (0.0, 0.0, -9.81)))
+    if len(gravity) != 3 or not all(isfinite(value) for value in gravity):
+        raise ValueError(f"{prefix}.gravity_m_s2 must contain three finite values")
+    return InverseDynamicsConfig(
+        urdf_path=urdf_path,
+        manifest_path=manifest_path,
+        delay_s=delay_s,
+        locked_joint_names=locked_joint_names,
+        gravity_m_s2=gravity,
     )
 
 
@@ -841,6 +797,7 @@ def _parse_tau_ext_inference(
         "source_butterworth_filter",
         "state_estimator",
         "tau_ext_filter",
+        "inverse_dynamics",
     }
     if unknown:
         raise ValueError(
@@ -879,6 +836,11 @@ def _parse_tau_ext_inference(
         "tau_ext_inference.state_estimator",
     )
     tau_ext_filter = _parse_tau_ext_filter(data.get("tau_ext_filter", {}))
+    inverse_dynamics = _parse_inverse_dynamics(
+        data.get("inverse_dynamics", {}),
+        config_dir,
+        "tau_ext_inference.inverse_dynamics",
+    )
     return TauExtInferenceConfig(
         enabled=enabled,
         feedback_source=feedback_source,
@@ -889,6 +851,7 @@ def _parse_tau_ext_inference(
         source_butterworth_filter=source_butterworth_filter,
         state_estimator=state_estimator,
         tau_ext_filter=tau_ext_filter,
+        inverse_dynamics=inverse_dynamics,
     )
 
 
@@ -1058,7 +1021,7 @@ def _parse_sequence_checkpoint(
 
     input_value = data.get("input_keys")
     input_keys = None if input_value is None else tuple(str(key) for key in input_value)
-    allowed_inputs = {"q", "dq", "delta_q", "tau"}
+    allowed_inputs = {"q", "dq", "ddq", "delta_q", "tau", "tau_id"}
     if input_keys is not None:
         if not input_keys or len(set(input_keys)) != len(input_keys):
             raise ValueError(f"{name}.input_keys must be non-empty and unique")

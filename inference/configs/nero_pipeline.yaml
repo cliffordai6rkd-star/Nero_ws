@@ -2,11 +2,14 @@
 dp_checkpoint:
   # path: ../../../model/checkpoints/optimizer_step=00020000.ckpt
   # path: ../../../model/checkpoints0802/checkpoints/latest.ckpt
-  path: ../../../model/checkpoints0805/latest.ckpt
+  path: ../../../model/checkpoints/latest.ckpt
 
   dino_model_path: ../../../model/dinov3-vitb16-pretrain-lvd1689m
   device: cuda:0
   use_ema: true
+
+# eepose: [x,y,z,qx,qy,qz,qw]; joint: absolute q (FK-converted before WM).
+action: eepose
 
 pinn_checkpoint:
   # predictor.enabled=false 时不会加载，也可以删除整个 pinn_checkpoint 配置块。

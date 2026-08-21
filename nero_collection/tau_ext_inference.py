@@ -19,7 +19,7 @@ from nero_collection.config import (
     TauExtFilterConfig,
     TauExtInferenceConfig,
 )
-from nero_collection.contact_wrench import PinocchioJointTorqueResidualEstimator
+from nero_collection.inverse_dynamics import PinocchioJointTorqueResidualEstimator
 from nero_collection.filters import (
     CausalFilterPipeline,
     CausalHampelButterworth,
@@ -34,7 +34,8 @@ from nero_collection.filters import (
 log = logging.getLogger(__name__)
 
 _DEFAULT_CPU_TORCH_NUM_THREADS = 1
-_MODEL_INPUT_KEYS = frozenset({"q", "dq", "delta_q", "tau"})
+_MODEL_INPUT_KEYS = frozenset({"q", "dq", "ddq", "delta_q", "tau", "tau_id"})
+_DYNAMICS_INPUT_KEYS = frozenset({"ddq", "tau_id"})
 _LEGACY_TAU_F_TARGET_CONTRACT = "matched_causal_torque_filter_v1"
 _DERIVED_TAU_F_TARGET_CONTRACT = "causal_rnea_residual_v1"
 _TAU_F_TARGET_CONTRACTS = frozenset(
@@ -124,97 +125,23 @@ class _SourceObservation:
 
 
 @dataclass
-class _NearestObservationGrid:
-    sample_rate_hz: float
-    origin_timestamp_us: int | None = None
-    next_index: int = 0
-    previous_source: _SourceObservation | None = None
+class _StrideObservationSampler:
+    """Select the first filtered source frame and then every ``stride`` frames."""
 
-    def reset(self) -> None:
-        self.origin_timestamp_us = None
-        self.next_index = 0
-        self.previous_source = None
-
-    def advance(
-        self,
-        source: _SourceObservation,
-    ) -> list[tuple[int, _SourceObservation]]:
-        previous = self.previous_source
-        if previous is None:
-            self.origin_timestamp_us = source.timestamp_us
-            self.next_index = 1
-            self.previous_source = source
-            return [(source.timestamp_us, source)]
-
-        selected: list[tuple[int, _SourceObservation]] = []
-        target_timestamp_us = self.timestamp_us(self.next_index)
-        while source.timestamp_us >= target_timestamp_us:
-            left_gap_us = target_timestamp_us - previous.timestamp_us
-            right_gap_us = source.timestamp_us - target_timestamp_us
-            nearest = previous if left_gap_us <= right_gap_us else source
-            selected.append((target_timestamp_us, nearest))
-            self.next_index += 1
-            target_timestamp_us = self.timestamp_us(self.next_index)
-
-        self.previous_source = source
-        return selected
-
-    def timestamp_us(self, index: int) -> int:
-        assert self.origin_timestamp_us is not None
-        offset_us = round(int(index) * 1.0e6 / self.sample_rate_hz)
-        return self.origin_timestamp_us + int(offset_us)
-
-
-@dataclass
-class _FixedPhaseCausalObservationGrid:
-    """Sample latest complete observations on an absolute, history-only grid."""
-
-    sample_rate_hz: float
-    next_timestamp_us: int | None = None
-    previous_source: _SourceObservation | None = None
+    stride: int
+    source_index: int = 0
 
     def __post_init__(self) -> None:
-        period_us = 1.0e6 / float(self.sample_rate_hz)
-        rounded_period_us = round(period_us)
-        if (
-            not np.isfinite(period_us)
-            or rounded_period_us <= 0
-            or not np.isclose(period_us, rounded_period_us, rtol=0.0, atol=1.0e-9)
-        ):
-            raise ValueError(
-                "fixed-phase causal observation rate must divide 1 MHz exactly"
-            )
-        self._period_us = int(rounded_period_us)
+        if self.stride < 1:
+            raise ValueError("observation stride must be positive")
 
     def reset(self) -> None:
-        self.next_timestamp_us = None
-        self.previous_source = None
+        self.source_index = 0
 
-    def advance(
-        self,
-        source: _SourceObservation,
-    ) -> list[tuple[int, _SourceObservation]]:
-        previous = self.previous_source
-        if previous is None:
-            self.next_timestamp_us = self._ceil_to_grid(source.timestamp_us)
-
-        selected: list[tuple[int, _SourceObservation]] = []
-        assert self.next_timestamp_us is not None
-        while source.timestamp_us >= self.next_timestamp_us:
-            if source.timestamp_us == self.next_timestamp_us:
-                observation = source
-            elif previous is not None:
-                observation = previous
-            else:
-                break
-            selected.append((self.next_timestamp_us, observation))
-            self.next_timestamp_us += self._period_us
-
-        self.previous_source = source
+    def advance(self, source: _SourceObservation) -> _SourceObservation | None:
+        selected = source if self.source_index % self.stride == 0 else None
+        self.source_index += 1
         return selected
-
-    def _ceil_to_grid(self, timestamp_us: int) -> int:
-        return -(-int(timestamp_us) // self._period_us) * self._period_us
 
 
 class SequenceTorquePredictorProtocol(Protocol):
@@ -623,7 +550,7 @@ class SequenceTorquePredictor:
 
 
 class OnlineTauExtInference:
-    """Run torque models on their configured fixed-rate observation grids."""
+    """Run torque models on strided, filtered fixed-rate source observations."""
 
     def __init__(
         self,
@@ -636,6 +563,7 @@ class OnlineTauExtInference:
         tau_next_predictor: SequenceTorquePredictorProtocol | None = None,
         estimator: Any | None = None,
         state_estimator: CausalJointKalmanFilter | None = None,
+        source_sample_rate_hz: float = 100.0,
     ) -> None:
         if not config.enabled and tau_f_predictor is None and tau_next_predictor is None:
             raise ValueError("tau_ext inference is disabled")
@@ -667,6 +595,16 @@ class OnlineTauExtInference:
                 model_name="tau_next",
                 output_key="tau",
             )
+        tau_next_dynamics_inputs = (
+            set()
+            if self.tau_next_predictor is None
+            else set(self.tau_next_predictor.metadata.input_keys) & _DYNAMICS_INPUT_KEYS
+        )
+        if tau_next_dynamics_inputs and self.tau_f_predictor is None:
+            raise RuntimeError(
+                "tau_free checkpoint inputs ddq/tau_id require the tau_f branch "
+                "to provide the shared causal Kalman/RNEA state"
+            )
 
         self._tau_f_sample_rate_hz = _resolve_observation_sample_rate(
             config.tau_f,
@@ -680,15 +618,34 @@ class OnlineTauExtInference:
             else self.tau_next_predictor.metadata,
             model_name="tau_next",
         )
-        self._tau_f_grid = (
-            None
-            if self._tau_f_sample_rate_hz is None
-            else _NearestObservationGrid(self._tau_f_sample_rate_hz)
+        self._source_sample_rate_hz = _positive_sample_rate(
+            source_sample_rate_hz,
+            "teleop.command.sample_rate_hz",
         )
-        self._tau_next_grid = (
+        self._tau_f_stride = _resolve_observation_stride(
+            self._source_sample_rate_hz,
+            self._tau_f_sample_rate_hz,
+            model_name="tau_f",
+        )
+        self._tau_next_stride = _resolve_observation_stride(
+            self._source_sample_rate_hz,
+            self._tau_next_sample_rate_hz,
+            model_name="tau_next",
+        )
+        if tau_next_dynamics_inputs and self._tau_next_stride != self._tau_f_stride:
+            raise RuntimeError(
+                "tau_free ddq/tau_id inputs require tau_free and tau_f to use "
+                "the same observation sample rate/stride"
+            )
+        self._tau_f_sampler = (
             None
-            if self._tau_next_sample_rate_hz is None
-            else _FixedPhaseCausalObservationGrid(self._tau_next_sample_rate_hz)
+            if self._tau_f_stride is None
+            else _StrideObservationSampler(self._tau_f_stride)
+        )
+        self._tau_next_sampler = (
+            None
+            if self._tau_next_stride is None
+            else _StrideObservationSampler(self._tau_next_stride)
         )
         source_filter = config.source_butterworth_filter
         self.source_butterworth_filters = (
@@ -697,10 +654,10 @@ class OnlineTauExtInference:
                     cutoff_hz=source_filter.cutoff_hz,
                 )
                 for key in (
-                    "q",
+                    # "q",
                     "dq",
                     "tau",
-                    "q_cmd"
+                    # "q_cmd"
                 )
             }
             if source_filter.enabled
@@ -847,6 +804,17 @@ class OnlineTauExtInference:
             return self._tau_next_sample_rate_hz
         raise ValueError(f"unknown torque model {model_name!r}")
 
+    @property
+    def source_sample_rate_hz(self) -> float:
+        return self._source_sample_rate_hz
+
+    def observation_stride_frames(self, model_name: str) -> int | None:
+        if model_name == "tau_f":
+            return self._tau_f_stride
+        if model_name == "tau_next":
+            return self._tau_next_stride
+        raise ValueError(f"unknown torque model {model_name!r}")
+
     def warm_up(self) -> None:
         if self.tau_f_predictor is not None:
             self.tau_f_predictor.warm_up()
@@ -879,10 +847,10 @@ class OnlineTauExtInference:
             self.tau_ext_pred_filter.reset()
         self._last_input_timestamp_us = None
         self._last_source_timestamp_us = None
-        if self._tau_f_grid is not None:
-            self._tau_f_grid.reset()
-        if self._tau_next_grid is not None:
-            self._tau_next_grid.reset()
+        if self._tau_f_sampler is not None:
+            self._tau_f_sampler.reset()
+        if self._tau_next_sampler is not None:
+            self._tau_next_sampler.reset()
         self._tau_f_timestamp_us = None
         self._tau_next_timestamp_us = None
         self._tau_f_ready = False
@@ -937,6 +905,7 @@ class OnlineTauExtInference:
                 ("q", q_value),
                 ("dq", dq_value),
                 ("tau", raw_tau_value),
+                ("q_cmd", q_cmd_value),
             )
         }
         source = _SourceObservation(
@@ -944,7 +913,7 @@ class OnlineTauExtInference:
             q=filtered_source["q"],
             dq=filtered_source["dq"],
             tau=filtered_source["tau"],
-            q_cmd=q_cmd_value.copy(),
+            q_cmd=filtered_source["q_cmd"],
         )
         if self._last_source_timestamp_us is not None:
             source_gap_us = timestamp_us - self._last_source_timestamp_us
@@ -952,7 +921,7 @@ class OnlineTauExtInference:
             if source_gap_us > warning_us:
                 log.warning(
                     "tau_ext source observation gap exceeded warning threshold: "
-                    "gap=%.3fms threshold=%.3fms; retaining the previous 49 "
+                    "gap=%.3fms threshold=%.3fms; retaining existing "
                     "observations in each model history",
                     source_gap_us * 1.0e-3,
                     warning_us * 1.0e-3,
@@ -960,18 +929,18 @@ class OnlineTauExtInference:
         self._last_source_timestamp_us = timestamp_us
 
         tau_f_updated = False
-        if self._tau_f_grid is not None:
-            selected = self._tau_f_grid.advance(source)
-            tau_f_updated = bool(selected)
-            for model_timestamp_us, observation in selected:
-                self._estimate_tau_f(model_timestamp_us, observation)
+        if self._tau_f_sampler is not None:
+            observation = self._tau_f_sampler.advance(source)
+            tau_f_updated = observation is not None
+            if observation is not None:
+                self._estimate_tau_f(observation.timestamp_us, observation)
 
         tau_next_updated = False
-        if self._tau_next_grid is not None:
-            selected = self._tau_next_grid.advance(source)
-            tau_next_updated = bool(selected)
-            for model_timestamp_us, observation in selected:
-                self._estimate_tau_next(model_timestamp_us, observation)
+        if self._tau_next_sampler is not None:
+            observation = self._tau_next_sampler.advance(source)
+            tau_next_updated = observation is not None
+            if observation is not None:
+                self._estimate_tau_next(observation.timestamp_us, observation)
 
         updated = (
             tau_next_updated
@@ -1023,6 +992,8 @@ class OnlineTauExtInference:
             q=q_value,
             dq=dq_value,
             tau=tau_value,
+            ddq=kalman_state.ddq,
+            tau_id=tau_id,
         )
         _require_features(raw_features, self.tau_f_predictor.metadata.input_keys, "tau_f")
         features = _apply_feature_filter_bank(
@@ -1071,7 +1042,11 @@ class OnlineTauExtInference:
             if self.tau_next_target_filter is not None
             else tau_next_source
         )
-        raw_features = _observation_features(source)
+        raw_features = _observation_features(
+            source,
+            ddq=self._ddq,
+            tau_id=self._tau_id,
+        )
         _require_features(
             raw_features, self.tau_next_predictor.metadata.input_keys, "tau_next"
         )
@@ -1179,13 +1154,22 @@ def _observation_features(
     q: np.ndarray | None = None,
     dq: np.ndarray | None = None,
     tau: np.ndarray | None = None,
+    ddq: np.ndarray | None = None,
+    tau_id: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
-    return {
+    features = {
         "q": source.q if q is None else q,
         "dq": source.dq if dq is None else dq,
         "delta_q": source.q_cmd - source.q,
         "tau": source.tau if tau is None else tau,
     }
+    if ddq is not None:
+        features["ddq"] = _finite_vector("ddq", ddq, 7)
+    if tau_id is not None:
+        # tau_id is always the direct RNEA(q, dq, ddq) result. The separately
+        # tracked tau_id_filtered is reserved for the tau_f residual formula.
+        features["tau_id"] = _finite_vector("tau_id", tau_id, 7)
+    return features
 
 
 def _normalize_checkpoint_filters(value: Any) -> dict[str, dict[str, Any]]:
@@ -1529,6 +1513,33 @@ def _resolve_observation_sample_rate(
     # Injected and legacy predictors without timing metadata retain the former
     # 50 Hz online observation contract. New checkpoints should carry a rate.
     return 50.0
+
+
+def _positive_sample_rate(value: float, name: str) -> float:
+    rate = float(value)
+    if not np.isfinite(rate) or rate <= 0.0:
+        raise ValueError(f"{name} must be positive and finite")
+    return rate
+
+
+def _resolve_observation_stride(
+    source_sample_rate_hz: float,
+    observation_sample_rate_hz: float | None,
+    *,
+    model_name: str,
+) -> int | None:
+    if observation_sample_rate_hz is None:
+        return None
+    ratio = source_sample_rate_hz / observation_sample_rate_hz
+    stride = round(ratio)
+    if stride < 1 or not np.isclose(ratio, stride, rtol=0.0, atol=1.0e-9):
+        raise ValueError(
+            "teleop.command.sample_rate_hz must be an integer multiple of "
+            f"tau_ext_inference.{model_name}.observation_sample_rate_hz: "
+            f"{source_sample_rate_hz:g} / {observation_sample_rate_hz:g} "
+            f"= {ratio:g}"
+        )
+    return int(stride)
 
 
 def _build_tau_f_source_filter(

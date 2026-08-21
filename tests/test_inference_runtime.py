@@ -120,6 +120,22 @@ class _Cameras:
         ]
 
 
+class _TwoCameras(_Cameras):
+    def poll(self):
+        return [
+            CameraFrame(
+                camera_name="side",
+                timestamp_us=26_000,
+                frame=np.full((8, 8, 3), 1, dtype=np.uint8),
+            ),
+            CameraFrame(
+                camera_name="wrist",
+                timestamp_us=40_000,
+                frame=np.full((8, 8, 3), 2, dtype=np.uint8),
+            ),
+        ]
+
+
 class _TauExt:
     def __init__(self):
         self.reset_count = 0
@@ -439,6 +455,82 @@ def test_tau_ext_post_filter_bypasses_second_wrench_lowpass() -> None:
     runtime.stop()
 
 
+def test_tau_ext_post_filter_is_dp_input_while_plot_keeps_raw_signal() -> None:
+    config = _protected_config(
+        warmup_duration_s=0.0,
+        median_window=1,
+        cutoff_hz=5.0,
+    )
+    config = replace(
+        config,
+        wrench_visualization=replace(config.wrench_visualization, enabled=True),
+    )
+    plotted = []
+    plotter = SimpleNamespace(
+        append=lambda timestamp_us, raw, processed: plotted.append(
+            (timestamp_us, np.asarray(raw).copy(), np.asarray(processed).copy())
+        )
+    )
+    tau_ext = _TauExt()
+    tau_ext.config = SimpleNamespace(
+        tau_ext_filter=SimpleNamespace(
+            enabled=True,
+            mode="moving_average",
+            window=20,
+            cutoff_hz=15.0,
+        ),
+    )
+    runtime = NeroInferenceRuntime(
+        config,
+        backend="mock",
+        command_enabled=False,
+        pipeline=_Pipeline(),
+        arm=_Arm(),
+        cameras=_Cameras(),
+        online_tau_ext=tau_ext,
+        wrench_estimator=_Wrench(),
+        wrench_plotter=plotter,
+    )
+
+    dp_wrench, plotted_wrench = runtime._process_stream_wrench(
+        np.full(6, 20.0),
+        np.full(6, 10.0),
+        123_000,
+    )
+
+    np.testing.assert_allclose(dp_wrench, 10.0)
+    np.testing.assert_allclose(plotted_wrench, 10.0)
+    assert plotted[0][0] == 123_000
+    np.testing.assert_allclose(plotted[0][1], 20.0)
+    np.testing.assert_allclose(plotted[0][2], 10.0)
+
+
+def test_runtime_passes_independent_multicamera_timestamps() -> None:
+    pipeline = _Pipeline()
+    pipeline._image_keys = ("side", "wrist")
+    runtime = NeroInferenceRuntime(
+        _config(),
+        backend="mock",
+        command_enabled=False,
+        pipeline=pipeline,
+        arm=_Arm(),
+        cameras=_TwoCameras(),
+        online_tau_ext=_TauExt(),
+        wrench_estimator=_Wrench(),
+    )
+    _use_fast_reset(runtime)
+    runtime.start()
+
+    runtime.step()
+
+    runtime.stop()
+    assert pipeline.inputs[-1].image_timestamp_s == {
+        "side": pytest.approx(0.026),
+        "wrist": pytest.approx(0.040),
+    }
+    assert isinstance(pipeline.inputs[-1].image, dict)
+
+
 def test_episode_reset_restarts_warmup_and_clears_wrench_filter() -> None:
     pipeline = _Pipeline()
     runtime = NeroInferenceRuntime(
@@ -636,6 +728,56 @@ def test_runtime_sends_qp_torque_only_when_explicitly_enabled() -> None:
     np.testing.assert_allclose(arm.commands[-1]["t_ff"], np.zeros(7))
 
 
+def test_runtime_sends_contact_mit_effective_gains() -> None:
+    arm, pipeline = _Arm(), _Pipeline()
+    effective_kp = np.full(7, 0.25)
+    effective_kd = np.full(7, 0.125)
+
+    def contact_step(value):
+        pipeline.inputs.append(value)
+        return SimpleNamespace(
+            tau_command=np.full(7, 0.5),
+            control_mode="mit",
+            joint_position_target=np.full(7, 0.1),
+            joint_velocity_target=np.full(7, 0.2),
+            torque_target=np.full(7, 0.3),
+            mit_kp=effective_kp,
+            mit_kd=effective_kd,
+        )
+
+    pipeline.step = contact_step
+    base = _config()
+    config = replace(
+        base,
+        predictor=replace(base.predictor, mode="contact_world_model_opd"),
+        execution=replace(
+            base.execution,
+            mode="mit",
+            mit_kp=(20.0,) * 7,
+            mit_kd=(2.0,) * 7,
+        ),
+    )
+    runtime = NeroInferenceRuntime(
+        config,
+        backend="mock",
+        command_enabled=True,
+        pipeline=pipeline,
+        arm=arm,
+        cameras=_Cameras(),
+        online_tau_ext=_TauExt(),
+        wrench_estimator=_Wrench(),
+    )
+    _use_fast_reset(runtime)
+    runtime.start()
+    runtime.step()
+    runtime.stop()
+
+    assert len(arm.commands) >= 1
+    np.testing.assert_allclose(arm.commands[0]["kp"], effective_kp)
+    np.testing.assert_allclose(arm.commands[0]["kd"], effective_kd)
+    np.testing.assert_allclose(arm.commands[0]["t_ff"], 0.3)
+
+
 def test_startup_reset_waits_through_transient_nan_verification_state() -> None:
     arm = _Arm()
     original_wait_motion_done = arm.wait_motion_done
@@ -750,6 +892,53 @@ def test_runtime_i_resets_current_episode_before_q_exits() -> None:
 
     assert cycles == 0
     assert len(arm.reset_commands) == 3  # startup, i, q
+    assert arm.enabled
+    assert arm.disable_count == 0
+
+
+def test_runtime_s_executes_one_cycle_then_waits_for_next_request() -> None:
+    arm, pipeline = _Arm(), _Pipeline()
+    runtime = NeroInferenceRuntime(
+        _config(),
+        backend="mock",
+        command_enabled=True,
+        pipeline=pipeline,
+        arm=arm,
+        cameras=_Cameras(),
+        online_tau_ext=_TauExt(),
+        wrench_estimator=_Wrench(),
+    )
+    _use_fast_reset(runtime)
+    # The None entry represents time spent paused after the first single step.
+    keys = iter(("s", None, "s", "q"))
+
+    cycles = runtime.run(read_key=lambda _timeout: next(keys))
+
+    assert cycles == 2
+    assert len(pipeline.inputs) == 2
+    assert arm.enabled
+    assert arm.disable_count == 0
+
+
+def test_runtime_single_step_starts_paused() -> None:
+    arm, pipeline = _Arm(), _Pipeline()
+    runtime = NeroInferenceRuntime(
+        _config(),
+        backend="mock",
+        command_enabled=True,
+        pipeline=pipeline,
+        arm=arm,
+        cameras=_Cameras(),
+        online_tau_ext=_TauExt(),
+        wrench_estimator=_Wrench(),
+    )
+    _use_fast_reset(runtime)
+    keys = iter((None, "s", "q"))
+
+    cycles = runtime.run(read_key=lambda _timeout: next(keys), single_step=True)
+
+    assert cycles == 1
+    assert len(pipeline.inputs) == 1
     assert arm.enabled
     assert arm.disable_count == 0
 

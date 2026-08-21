@@ -182,6 +182,63 @@ def test_dual_inference_uses_one_aligned_feature_sample_and_exact_formulas() -> 
     np.testing.assert_allclose(result.tau_ext_pred, -6.0)
 
 
+def test_dual_inference_connects_ddq_and_raw_tau_id_to_both_branches() -> None:
+    tau_f = _Predictor("tau_f", np.full(7, 0.5))
+    tau_next = _Predictor("tau", np.full(7, 4.0))
+    input_keys = ("q", "dq", "ddq", "delta_q", "tau", "tau_id")
+    input_dims = {key: 7 for key in input_keys}
+    tau_f.metadata = replace(
+        tau_f.metadata, input_keys=input_keys, input_dims=input_dims
+    )
+    tau_next.metadata = replace(
+        tau_next.metadata, input_keys=input_keys, input_dims=input_dims
+    )
+    inverse_dynamics = _InverseDynamics(np.full(7, 2.0))
+    state_estimator = _StateEstimator(np.full(7, 3.0))
+    inference = _inference(tau_f, tau_next, inverse_dynamics, state_estimator)
+
+    inference.estimate_aligned(
+        1_000_000,
+        np.zeros(7),
+        np.ones(7),
+        np.full(7, 10.0),
+        np.full(7, 0.2),
+    )
+    inverse_dynamics.tau_id = np.full(7, 4.0)
+    result = inference.estimate_aligned(
+        1_020_000,
+        np.zeros(7),
+        np.ones(7),
+        np.full(7, 10.0),
+        np.full(7, 0.2),
+    )
+
+    for predictor in (tau_f, tau_next):
+        np.testing.assert_allclose(predictor.features[-1]["ddq"], 3.0)
+        np.testing.assert_allclose(predictor.features[-1]["tau_id"], 4.0)
+    assert np.all(result.tau_id_filtered < 4.0)
+
+
+def test_tau_free_dynamics_inputs_require_tau_f_provider() -> None:
+    tau_next = _Predictor("tau", np.zeros(7))
+    tau_next.metadata = replace(
+        tau_next.metadata,
+        input_keys=("q", "ddq", "tau_id"),
+        input_dims={"q": 7, "ddq": 7, "tau_id": 7},
+    )
+    with pytest.raises(RuntimeError, match="require the tau_f branch"):
+        OnlineTauExtInference(
+            TauExtInferenceConfig(
+                enabled=True,
+                tau_next=SequenceCheckpointConfig(observation_sample_rate_hz=50.0),
+            ),
+            InverseDynamicsConfig(),
+            DynamicsProcessingConfig(),
+            {},
+            tau_next_predictor=tau_next,
+        )
+
+
 def test_tau_next_only_skips_tau_f_and_produces_prediction() -> None:
     tau_next = _Predictor("tau", np.full(7, 4.0))
     inference = OnlineTauExtInference(
@@ -244,7 +301,7 @@ def test_each_active_checkpoint_uses_its_own_observation_rate() -> None:
     assert len(tau_next.features) == 6
 
 
-def test_source_butterworth_filters_q_dq_tau_once_before_both_model_grids() -> None:
+def test_source_butterworth_filters_all_features_once_before_both_samplers() -> None:
     tau_f = _Predictor("tau_f", np.zeros(7))
     tau_next = _Predictor("tau", np.zeros(7))
     inverse_dynamics = _InverseDynamics(np.zeros(7))
@@ -283,20 +340,26 @@ def test_source_butterworth_filters_q_dq_tau_once_before_both_model_grids() -> N
     q_reference = VariableStepButterworthLowPass(15.0)
     dq_reference = VariableStepButterworthLowPass(15.0)
     tau_reference = VariableStepButterworthLowPass(15.0)
+    q_cmd_reference = VariableStepButterworthLowPass(15.0)
     q_reference.apply(zeros, 1_000_000)
     dq_reference.apply(zeros, 1_000_000)
     tau_reference.apply(zeros, 1_000_000)
+    q_cmd_reference.apply(zeros, 1_000_000)
     expected_q = q_reference.apply(ones, 1_010_000)
     expected_dq = dq_reference.apply(2.0 * ones, 1_010_000)
     expected_tau = tau_reference.apply(3.0 * ones, 1_010_000)
+    expected_q_cmd = q_cmd_reference.apply(4.0 * ones, 1_010_000)
 
     np.testing.assert_allclose(tau_f.features[1]["q"], expected_q)
     np.testing.assert_allclose(tau_next.features[1]["q"], expected_q)
     np.testing.assert_allclose(tau_f.features[1]["dq"], expected_dq)
     np.testing.assert_allclose(tau_next.features[1]["dq"], expected_dq)
-    # q_cmd remains an event/ZOH signal, so delta_q subtracts filtered q only.
-    np.testing.assert_allclose(tau_f.features[1]["delta_q"], 4.0 - expected_q)
-    np.testing.assert_allclose(tau_next.features[1]["delta_q"], 4.0 - expected_q)
+    np.testing.assert_allclose(
+        tau_f.features[1]["delta_q"], expected_q_cmd - expected_q
+    )
+    np.testing.assert_allclose(
+        tau_next.features[1]["delta_q"], expected_q_cmd - expected_q
+    )
     source_tau_filter = OnePoleLowPass(10.0, 1)
     source_tau_filter.apply(zeros, 1_000_000)
     expected_tau_after_checkpoint_filter = source_tau_filter.apply(
@@ -312,6 +375,51 @@ def test_source_butterworth_filters_q_dq_tau_once_before_both_model_grids() -> N
     inference.estimate_aligned(2_000_000, 7.0 * ones, zeros, zeros, 8.0 * ones)
     np.testing.assert_allclose(tau_f.features[-1]["q"], 7.0)
     np.testing.assert_allclose(tau_next.features[-1]["q"], 7.0)
+
+
+def test_source_butterworth_updates_on_skipped_frames_before_stride_sampling() -> None:
+    tau_next = _Predictor("tau", np.zeros(7))
+    inference = OnlineTauExtInference(
+        TauExtInferenceConfig(
+            enabled=True,
+            tau_next=SequenceCheckpointConfig(observation_sample_rate_hz=50.0),
+            source_butterworth_filter=SourceButterworthFilterConfig(
+                enabled=True,
+                cutoff_hz=15.0,
+                order=2,
+            ),
+        ),
+        InverseDynamicsConfig(),
+        DynamicsProcessingConfig(),
+        {},
+        tau_next_predictor=tau_next,
+        source_sample_rate_hz=100.0,
+    )
+    zeros = np.zeros(7)
+    ones = np.ones(7)
+
+    inference.estimate_aligned(1_000_000, zeros, zeros, zeros, zeros)
+    inference.estimate_aligned(
+        1_010_000, ones, 2.0 * ones, 3.0 * ones, 4.0 * ones
+    )
+    inference.estimate_aligned(
+        1_020_000, ones, 2.0 * ones, 3.0 * ones, 4.0 * ones
+    )
+
+    q_reference = VariableStepButterworthLowPass(15.0)
+    q_cmd_reference = VariableStepButterworthLowPass(15.0)
+    q_reference.apply(zeros, 1_000_000)
+    q_cmd_reference.apply(zeros, 1_000_000)
+    q_reference.apply(ones, 1_010_000)
+    q_cmd_reference.apply(4.0 * ones, 1_010_000)
+    expected_q = q_reference.apply(ones, 1_020_000)
+    expected_q_cmd = q_cmd_reference.apply(4.0 * ones, 1_020_000)
+
+    assert len(tau_next.features) == 2
+    np.testing.assert_allclose(tau_next.features[-1]["q"], expected_q)
+    np.testing.assert_allclose(
+        tau_next.features[-1]["delta_q"], expected_q_cmd - expected_q
+    )
 
 
 def test_tau_id_uses_the_same_causal_filter_as_measured_torque() -> None:
@@ -441,6 +549,13 @@ def test_derived_tau_f_reuses_one_filtered_tau_for_model_and_residual() -> None:
     )
     zeros = np.zeros(7)
     inference.estimate_aligned(1_000_000, zeros, zeros, zeros, zeros)
+    inference.estimate_aligned(
+        1_010_000,
+        zeros,
+        zeros,
+        np.full(7, 10.0),
+        zeros,
+    )
     result = inference.estimate_aligned(
         1_020_000,
         zeros,
@@ -472,12 +587,10 @@ def test_same_timestamp_returns_cached_dual_result_without_advancing_models() ->
     assert not second.observation_updated
     assert second.observation_timestamp_us == first.observation_timestamp_us
     assert len(tau_f.features) == 1
-    # Tau-free waits for the next absolute fixed-rate tick instead of treating
-    # an arbitrary episode-start timestamp as a new phase origin.
-    assert len(tau_next.features) == 0
+    assert len(tau_next.features) == 1
 
 
-def test_tau_free_grid_selects_latest_historical_frame_at_fixed_50hz_phase() -> None:
+def test_both_models_select_first_then_every_second_source_frame() -> None:
     tau_f = _Predictor("tau_f", np.zeros(7))
     tau_next = _Predictor("tau", np.zeros(7))
     inference = OnlineTauExtInference(
@@ -509,24 +622,23 @@ def test_tau_free_grid_selects_latest_historical_frame_at_fixed_50hz_phase() -> 
     ]
 
     assert [result.observation_updated for result in results] == [
-        True, False, False, True, False, True
+        True, False, True, False, True, False
     ]
-    # tau_f retains its existing nearest-observation resampling contract.
-    assert [features["q"][0] for features in tau_f.features] == [0.0, 2.0, 5.0]
-    # tau-free uses absolute 20 ms ticks and never consumes the post-tick frame.
+    assert [features["q"][0] for features in tau_f.features] == [0.0, 2.0, 4.0]
     assert [features["q"][0] for features in tau_next.features] == [0.0, 2.0, 4.0]
     assert len(tau_next.features) == 3
     assert results[1].observation_timestamp_us == 100_000
-    assert results[3].observation_timestamp_us == 120_000
-    assert results[5].observation_timestamp_us == 140_000
+    assert results[2].observation_timestamp_us == 117_000
+    assert results[4].observation_timestamp_us == 134_000
 
     inference.reset_episode()
     restarted = inference.estimate_aligned(1_000_000, zeros, zeros, zeros, zeros)
     assert restarted.observation_updated
     assert len(tau_f.features) == 4
+    assert len(tau_next.features) == 4
 
 
-def test_tau_free_fixed_phase_does_not_restart_at_first_source_timestamp() -> None:
+def test_stride_selection_uses_source_frame_count_not_timestamp_phase() -> None:
     tau_next = _Predictor("tau", np.zeros(7))
     inference = OnlineTauExtInference(
         TauExtInferenceConfig(
@@ -549,11 +661,11 @@ def test_tau_free_fixed_phase_does_not_restart_at_first_source_timestamp() -> No
             zeros,
         )
 
-    assert [features["q"][0] for features in tau_next.features] == [1.0, 2.0]
-    assert inference._tau_next_timestamp_us == 140_000
+    assert [features["q"][0] for features in tau_next.features] == [0.0, 2.0]
+    assert inference._tau_next_timestamp_us == 125_000
 
 
-def test_observation_grid_nearest_tie_selects_earlier_frame() -> None:
+def test_stride_selects_current_frame_without_nearest_timestamp_lookup() -> None:
     tau_f = _Predictor("tau_f", np.zeros(7))
     inference = _inference(
         tau_f,
@@ -568,10 +680,10 @@ def test_observation_grid_nearest_tie_selects_earlier_frame() -> None:
     inference.estimate_aligned(110_000, np.ones(7), zeros, zeros, zeros)
     inference.estimate_aligned(130_000, np.full(7, 2.0), zeros, zeros, zeros)
 
-    assert [features["q"][0] for features in tau_f.features] == [0.0, 1.0]
+    assert [features["q"][0] for features in tau_f.features] == [0.0, 2.0]
 
 
-def test_observation_grid_converts_117_hz_events_to_50_hz() -> None:
+def test_stride_ignores_source_timestamp_jitter() -> None:
     tau_f = _Predictor("tau_f", np.zeros(7))
     inference = _inference(
         tau_f,
@@ -594,7 +706,24 @@ def test_observation_grid_converts_117_hz_events_to_50_hz() -> None:
             zeros,
         )
 
-    assert len(tau_f.features) == 51
+    assert len(tau_f.features) == 59
+
+
+def test_observation_rate_must_divide_source_rate_exactly() -> None:
+    with pytest.raises(ValueError, match="integer multiple"):
+        OnlineTauExtInference(
+            TauExtInferenceConfig(
+                enabled=True,
+                tau_next=SequenceCheckpointConfig(
+                    observation_sample_rate_hz=50.0
+                ),
+            ),
+            InverseDynamicsConfig(),
+            DynamicsProcessingConfig(),
+            {},
+            tau_next_predictor=_Predictor("tau", np.zeros(7)),
+            source_sample_rate_hz=117.0,
+        )
 
 
 def test_dual_inference_returns_zero_until_full_real_history_is_ready() -> None:
@@ -635,7 +764,7 @@ def test_dual_inference_returns_zero_until_full_real_history_is_ready() -> None:
     np.testing.assert_allclose(result.tau_ext_pred, -6.0)
 
 
-def test_large_observation_gap_warns_but_retains_49_frame_history(caplog) -> None:
+def test_large_source_gap_warns_without_filling_or_resetting_history(caplog) -> None:
     tau_f = _Predictor("tau_f", np.full(7, 0.5), ready_after=50)
     tau_next = _Predictor("tau", np.full(7, 4.0), ready_after=50)
     inference = OnlineTauExtInference(
@@ -668,10 +797,19 @@ def test_large_observation_gap_warns_but_retains_49_frame_history(caplog) -> Non
             zeros,
         )
 
-    assert result.history_ready
-    assert len(tau_f.features) == len(tau_next.features) == 76
+    assert not result.history_ready
+    assert len(tau_f.features) == len(tau_next.features) == 25
     assert (tau_f.reset_count, tau_next.reset_count) == reset_counts
-    assert "retaining the previous 49 observations" in caplog.text
+    assert "retaining existing observations" in caplog.text
+
+    inference.estimate_aligned(
+        2_510_000,
+        zeros,
+        zeros,
+        np.full(7, 10.0),
+        zeros,
+    )
+    assert len(tau_f.features) == len(tau_next.features) == 26
 
 
 def test_causal_kalman_matches_pinn_forward_filter() -> None:
@@ -797,7 +935,7 @@ def test_checkpoint_filter_pipeline_matches_pinn_unified_filter_exactly() -> Non
     np.testing.assert_allclose(pipeline.apply(np.asarray([7.0]), 2_000_000), 7.0)
 
 
-def test_checkpoint_sample_rate_must_match_online_observation_grid() -> None:
+def test_checkpoint_sample_rate_must_match_online_observation_rate() -> None:
     tau_f = _Predictor("tau_f", np.zeros(7))
     tau_next = _Predictor("tau", np.zeros(7))
     tau_f.metadata = replace(tau_f.metadata, sample_rate_hz=100.0)

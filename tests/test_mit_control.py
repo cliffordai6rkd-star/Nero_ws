@@ -114,8 +114,8 @@ def test_master_slave_config_has_valid_control_parameters() -> None:
     assert "acceleration" not in config.robot_states
     assert config.gripper.teleop_enabled is True
     assert config.gripper.attach_to == "both"
-    if config.realtime_plot.inverse_dynamics.manifest_path is not None:
-        assert config.realtime_plot.inverse_dynamics.manifest_path.is_file()
+    if config.tau_ext_inference.inverse_dynamics.manifest_path is not None:
+        assert config.tau_ext_inference.inverse_dynamics.manifest_path.is_file()
     assert config.dynamics_processing.enabled is False
     assert config.dynamics_processing.state_method == "finite_difference"
     assert config.robot_states["tau_id"].lowpass is False

@@ -113,11 +113,25 @@ def restore_checkpoint_model(
             model_cfg = OmegaConf.select(cfg, "model")
         missing = object()
         for key, value in (model_overrides or {}).items():
-            if OmegaConf.select(model_cfg, key, default=missing) is missing:
+            update_key = key
+            # Older checkpoints put the DINO path at policy level, while the
+            # pure visual Transformer policy keeps it on its image encoder.
+            if (
+                key == "dino_model_name_or_path"
+                and OmegaConf.select(model_cfg, key, default=missing) is missing
+                and OmegaConf.select(
+                    model_cfg,
+                    "obs_encoder.pretrained_model_name_or_path",
+                    default=missing,
+                )
+                is not missing
+            ):
+                update_key = "obs_encoder.pretrained_model_name_or_path"
+            if OmegaConf.select(model_cfg, update_key, default=missing) is missing:
                 raise CheckpointError(
                     f"{kind} checkpoint model has no override field {key!r}"
                 )
-            OmegaConf.update(model_cfg, key, value, merge=False)
+            OmegaConf.update(model_cfg, update_key, value, merge=False)
         scheduler_cfg = OmegaConf.select(model_cfg, "noise_scheduler")
         scheduler_target = OmegaConf.select(model_cfg, "noise_scheduler._target_")
         if scheduler_cfg is not None and isinstance(scheduler_target, str):
@@ -149,10 +163,20 @@ def restore_checkpoint_model(
                 from model.pinn_model.model_v5 import StateToStateFlowWorldModelV5
 
                 model_type = StateToStateFlowWorldModelV5
+            elif pinn_mode in {
+                "contact_world_model",
+                "contact_world_model_opd",
+                "contact_wm",
+                "contact_wm_opd",
+            }:
+                from model.pinn_model.torque_world_model import TorqueWorldModel
+
+                model_type = TorqueWorldModel
             else:
                 raise CheckpointError(
                     "pinn_mode must be 'wrench_gru', 'world_model_v3', "
-                    "'world_model_v4', or 'world_model_v5', "
+                    "'world_model_v4', 'world_model_v5', "
+                    "'contact_world_model', or 'contact_world_model_opd', "
                     f"got {pinn_mode!r}"
                 )
         except ImportError as exc:
@@ -166,14 +190,37 @@ def restore_checkpoint_model(
             f"{kind} checkpoint cfg must contain self-describing policy/model._target_"
         )
 
+    if kind.upper() == "PINN" and pinn_mode in {
+        "contact_world_model",
+        "contact_world_model_opd",
+        "contact_wm",
+        "contact_wm_opd",
+    }:
+        contact_contract = bool(getattr(model, "q_tau_contact_contract", False))
+        contact_contract = contact_contract or (
+            str(getattr(model, "state_contract", "")).lower() == "q_tau_contact"
+        )
+        if not contact_contract:
+            raise CheckpointError(
+                "contact world-model inference requires checkpoint model.state_contract="
+                "'q_tau_contact'"
+            )
+
     state_dicts = payload.get("state_dicts")
     if isinstance(state_dicts, Mapping):
-        candidates = ("ema_model", "model") if use_ema else ("model", "ema_model")
+        candidates = (
+            ("ema_model", "model_ema", "model")
+            if use_ema
+            else ("model", "model_ema", "ema_model")
+        )
         state = next((state_dicts[key] for key in candidates if key in state_dicts), None)
     else:
         state = payload.get(
             "model_state_dict",
-            payload.get("state_dict", payload.get("model")),
+            payload.get(
+                "state_dict",
+                payload.get("model_ema", payload.get("model")),
+            ),
         )
     if not isinstance(state, Mapping):
         raise CheckpointError(f"{kind} checkpoint contains no model state dictionary")

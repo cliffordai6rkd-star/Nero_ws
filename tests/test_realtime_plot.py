@@ -8,21 +8,23 @@ import pytest
 import yaml
 
 from nero_collection.config import (
-    ContactWrenchConfig,
     InverseDynamicsConfig,
     RealtimePlotConfig,
     StateParamConfig,
+    _parse_inverse_dynamics,
     _parse_realtime_plot,
 )
-from nero_collection.contact_wrench import (
+from inference.wrench_mapping import (
     PinocchioContactWrenchEstimator,
-    PinocchioJointTorqueResidualEstimator,
+    WrenchMappingConfig,
     solve_damped_wrench,
 )
-from nero_collection.contact_wrench import JointTorqueResidualEstimate
+from nero_collection.inverse_dynamics import PinocchioJointTorqueResidualEstimator
+from nero_collection.inverse_dynamics import JointTorqueResidualEstimate
 from nero_collection.realtime_dynamics import CenteredThreePointTorqueResidualStream
 from nero_collection.realtime_plot import (
     _MatplotlibPlotWindow,
+    _set_dynamic_ylim,
     RealtimeJointPlotter,
     SlidingJointBuffer,
 )
@@ -34,51 +36,24 @@ def test_realtime_plot_config_defaults_to_ten_second_window() -> None:
     assert config.enabled is False
     assert config.window_s == pytest.approx(10.0)
     assert config.update_rate_hz == pytest.approx(20.0)
-    assert config.inverse_dynamics.delay_s == pytest.approx(0.0)
-    assert config.inverse_dynamics.locked_joint_names == (
-        "gripper",
-        "gripper_joint1",
-        "gripper_joint2",
-    )
-    assert config.inverse_dynamics.manifest_path is None
-    assert config.wrench_mapping.frame_name == "gripper_tcp"
-    assert config.wrench_mapping.reference_frame == "local"
-    assert config.wrench_mapping.damping == pytest.approx(0.02)
-    assert config.wrench_mapping.joint_weights == pytest.approx((1.0,) * 7)
 
 
 def test_realtime_plot_config_resolves_identified_manifest(tmp_path: Path) -> None:
-    config = _parse_realtime_plot(
-        {"inverse_dynamics": {"manifest_path": "results/dynamics_manifest.yaml"}},
+    config = _parse_inverse_dynamics(
+        {"manifest_path": "results/dynamics_manifest.yaml"},
         tmp_path,
     )
 
-    assert config.inverse_dynamics.manifest_path == (
+    assert config.manifest_path == (
         tmp_path / "results" / "dynamics_manifest.yaml"
     ).resolve()
 
 
-def test_realtime_plot_config_parses_wrench_mapping(tmp_path: Path) -> None:
-    config = _parse_realtime_plot(
-        {
-            "inverse_dynamics": {"urdf_path": "robot.urdf"},
-            "wrench_mapping": {
-                "frame_name": "tool_frame",
-                "reference_frame": "local_world_aligned",
-                "damping": 0.05,
-                "joint_weights": [1.0, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0],
-            },
-        },
-        tmp_path,
-    )
-
-    assert config.wrench_mapping.urdf_path == (tmp_path / "robot.urdf").resolve()
-    assert config.wrench_mapping.frame_name == "tool_frame"
-    assert config.wrench_mapping.reference_frame == "local_world_aligned"
-    assert config.wrench_mapping.damping == pytest.approx(0.05)
-    assert config.wrench_mapping.joint_weights == pytest.approx(
-        (1.0, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0)
-    )
+def test_realtime_plot_config_rejects_removed_dynamics_and_wrench_options() -> None:
+    with pytest.raises(ValueError, match="removed options"):
+        _parse_realtime_plot({"inverse_dynamics": {}})
+    with pytest.raises(ValueError, match="removed options"):
+        _parse_realtime_plot({"wrench_mapping": {}})
 
 
 @pytest.mark.parametrize(
@@ -87,14 +62,6 @@ def test_realtime_plot_config_parses_wrench_mapping(tmp_path: Path) -> None:
         {"window_s": 0.0},
         {"window_s": float("nan")},
         {"update_rate_hz": 0.0},
-        {"inverse_dynamics": {"delay_s": -0.1}},
-        {"inverse_dynamics": {"locked_joint_names": ["joint7", ""]}},
-        {"inverse_dynamics": {"gravity_m_s2": [0.0, float("nan"), -9.81]}},
-        {"wrench_mapping": {"frame_name": ""}},
-        {"wrench_mapping": {"damping": 0.0}},
-        {"wrench_mapping": {"reference_frame": "world"}},
-        {"wrench_mapping": {"joint_weights": [1.0] * 6}},
-        {"wrench_mapping": {"joint_weights": [1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0]}},
     ],
 )
 def test_realtime_plot_config_rejects_invalid_rates(data: dict[str, object]) -> None:
@@ -106,60 +73,64 @@ def test_sliding_joint_buffer_keeps_only_latest_ten_seconds() -> None:
     buffer = SlidingJointBuffer(window_s=10.0)
     for timestamp_s, value in ((0, 1.0), (5, 2.0), (11, 3.0)):
         joints = np.full(7, value, dtype=np.float64)
-        wrench = np.full(6, value * 2, dtype=np.float64)
         buffer.append(
             timestamp_s * 1_000_000,
             joints,
             joints * 3,
-            wrench,
-            wrench * 4,
         )
 
-    time_s, tau_ext_cal, tau_ext_pred, wrench_cal, wrench_pred = buffer.arrays()
+    time_s, tau_ext_cal, tau_ext_pred = buffer.arrays()
 
     assert time_s == pytest.approx([-6.0, 0.0])
     assert tau_ext_cal.shape == (2, 7)
     assert np.allclose(tau_ext_cal[:, 0], [2.0, 3.0])
     assert np.allclose(tau_ext_pred[:, 0], [6.0, 9.0])
-    assert wrench_cal.shape == (2, 6)
-    assert np.allclose(wrench_cal[:, 0], [4.0, 6.0])
-    assert np.allclose(wrench_pred[:, 0], [16.0, 24.0])
 
 
 def test_sliding_joint_buffer_rejects_non_seven_dimensional_data() -> None:
     buffer = SlidingJointBuffer(window_s=10.0)
 
     with pytest.raises(RuntimeError, match="7D tau_ext_cal"):
-        buffer.append(1, np.zeros(6), np.zeros(7), np.zeros(6), np.zeros(6))
+        buffer.append(1, np.zeros(6), np.zeros(7))
 
     with pytest.raises(RuntimeError, match="7D tau_ext_pred"):
-        buffer.append(1, np.zeros(7), np.zeros(6), np.zeros(6), np.zeros(6))
-
-    with pytest.raises(RuntimeError, match="6D wrench_cal"):
-        buffer.append(1, np.zeros(7), np.zeros(7), np.zeros(7), np.zeros(6))
+        buffer.append(1, np.zeros(7), np.zeros(6))
 
 
 def test_sliding_joint_buffer_clear_removes_all_history() -> None:
     buffer = SlidingJointBuffer(window_s=10.0)
-    buffer.append(1, np.ones(7), np.ones(7), np.ones(6), np.ones(6))
+    buffer.append(1, np.ones(7), np.ones(7))
 
     buffer.clear()
 
-    time_s, tau_ext_cal, tau_ext_pred, wrench_cal, wrench_pred = buffer.arrays()
+    time_s, tau_ext_cal, tau_ext_pred = buffer.arrays()
     assert time_s.shape == (0,)
     assert tau_ext_cal.shape == (0, 7)
     assert tau_ext_pred.shape == (0, 7)
-    assert wrench_cal.shape == (0, 6)
-    assert wrench_pred.shape == (0, 6)
 
 
-def test_realtime_plot_places_tau_left_and_wrench_right() -> None:
+def test_realtime_plot_places_cal_above_pred_without_mixing() -> None:
     assert tuple(item[0] for item in _MatplotlibPlotWindow._PLOTS) == (
         "tau_ext_cal",
-        "wrench_cal",
+        "tau_ext_cal_l1",
         "tau_ext_pred",
-        "wrench_pred",
+        "tau_ext_pred_l1",
     )
+
+
+def test_realtime_plot_y_scale_is_at_least_plus_minus_three_nm() -> None:
+    class Axis:
+        limits = None
+
+        def set_ylim(self, lower, upper):
+            self.limits = (lower, upper)
+
+    axis = Axis()
+    _set_dynamic_ylim(axis, np.asarray([-0.2, 0.5]))
+    assert axis.limits == pytest.approx((-3.0, 3.0))
+
+    _set_dynamic_ylim(axis, np.asarray([-4.0, 2.0]))
+    assert axis.limits == pytest.approx((-4.32, 4.32))
 
 
 def test_damped_wrench_maps_joint_residual_and_reports_nullspace_error() -> None:
@@ -198,7 +169,7 @@ def test_weighted_damped_wrench_reduces_influence_of_low_confidence_joint() -> N
 @pytest.mark.skipif(find_spec("pinocchio") is None, reason="Pinocchio is not installed")
 def test_contact_estimator_maps_external_joint_torque_to_tool_wrench() -> None:
     estimator = PinocchioContactWrenchEstimator(
-        ContactWrenchConfig(
+        WrenchMappingConfig(
             urdf_path=(
                 Path(__file__).resolve().parents[1]
                 / "urdf"

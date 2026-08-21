@@ -16,11 +16,14 @@ from inference.state_stream import (
     ContinuousInferenceSample,
     ContinuousInferenceStateStream,
 )
+from inference.wrench_mapping import (
+    PinocchioContactWrenchEstimator,
+    WrenchMappingConfig,
+)
 from inference.wrench_visualization import InferenceWrenchPlotter
 from nero_collection.arms.factory import build_arm
 from nero_collection.cameras import CameraFrame, CameraManager, CameraVisualizer
 from nero_collection.config import CollectionConfig, load_config
-from nero_collection.contact_wrench import PinocchioContactWrenchEstimator
 from nero_collection.filters import OnePoleLowPass
 from nero_collection.tau_ext_inference import OnlineTauExtInference
 from nero_collection.time_utils import now_us
@@ -70,33 +73,49 @@ class NeroInferenceRuntime:
             collection.cameras,
             visualizer=CameraVisualizer.from_config(collection.cameras),
         )
-        self.pipeline = pipeline or NeroInferencePipeline(config)
+        if pipeline is not None:
+            self.pipeline = pipeline
+        elif config.predictor.enabled and config.predictor.mode in {
+            "contact_world_model",
+            "contact_world_model_opd",
+            "contact_wm",
+            "contact_wm_opd",
+        }:
+            from inference.contact_pipeline import ContactWMInferencePipeline
+
+            self.pipeline = ContactWMInferencePipeline(config)
+        else:
+            self.pipeline = NeroInferencePipeline(config)
         self.online_tau_ext = online_tau_ext or OnlineTauExtInference(
             collection.tau_ext_inference,
-            collection.realtime_plot.inverse_dynamics,
+            collection.tau_ext_inference.inverse_dynamics,
             collection.dynamics_processing,
             collection.robot_states,
+            source_sample_rate_hz=collection.teleop.command.sample_rate_hz,
+        )
+        self._wrench_mapping = WrenchMappingConfig(
+            urdf_path=config.robot.urdf_path,
+            frame_name=config.robot.frame_name,
+            delay_s=0.0,
+            locked_joint_names=config.robot.locked_joint_names,
+            gravity_m_s2=collection.tau_ext_inference.inverse_dynamics.gravity_m_s2,
         )
         self.wrench_estimator = wrench_estimator or PinocchioContactWrenchEstimator(
-            collection.realtime_plot.wrench_mapping
+            self._wrench_mapping
         )
         self._dp_contact_threshold_n = _dp_contact_threshold_n(self.pipeline)
-        self._dp_contact_force_dims, self._dp_contact_history_reducer = (
-            _dp_contact_gate_settings(self.pipeline)
-        )
-        self._dp_contact_history_steps = max(
-            int(getattr(self.pipeline, "wrench_history_steps", 1)),
-            1,
-        )
-        self._dp_contact_history: deque[float] = deque(
-            maxlen=self._dp_contact_history_steps
-        )
+        self._dp_contact_force_dims, _ = _dp_contact_gate_settings(self.pipeline)
         self.wrench_plotter = wrench_plotter or InferenceWrenchPlotter(
             config.wrench_visualization,
             contact_threshold_n=self._dp_contact_threshold_n,
         )
         self.command_enabled = bool(command_enabled)
         self._latest_frame: CameraFrame | None = None
+        configured_image_keys = tuple(getattr(self.pipeline, "_image_keys", ()))
+        self._pipeline_image_keys = configured_image_keys or (
+            str(config.runtime.camera),
+        )
+        self._latest_frames: dict[str, CameraFrame] = {}
         self._last_arm_timestamp_us = 0
         self._last_valid_arm_state_s: float | None = None
         self._last_invalid_state_warning_s = 0.0
@@ -110,6 +129,14 @@ class NeroInferenceRuntime:
         self._tau_ext_post_filter_enabled = bool(
             getattr(tau_ext_filter, "enabled", False)
         )
+        if self._tau_ext_post_filter_enabled:
+            log.info(
+                "DP wrench observation uses collection tau_ext_filter "
+                "mode=%s window=%s cutoff_hz=%s; no second inference low-pass",
+                getattr(tau_ext_filter, "mode", "unknown"),
+                getattr(tau_ext_filter, "window", "unknown"),
+                getattr(tau_ext_filter, "cutoff_hz", "unknown"),
+            )
         self._wrench_filter = OnePoleLowPass(
             protection.wrench_lowpass_cutoff_hz,
             protection.wrench_median_window,
@@ -243,6 +270,7 @@ class NeroInferenceRuntime:
         duration_s: float | None = None,
         *,
         read_key: Callable[[float], str | None] | None = None,
+        single_step: bool = False,
     ) -> int:
         if not self._started:
             self.start()
@@ -250,6 +278,11 @@ class NeroInferenceRuntime:
         total_cycles = 0
         episode_steps = 0
         self._episode_index = 1
+        # In single-step mode the key request remains armed until a complete
+        # state/image sample is available. This makes one ``s`` correspond to
+        # exactly one pipeline control cycle even when cameras or CAN lag.
+        manual_step = bool(single_step)
+        step_requested = False
         final_reset_succeeded = False
         failed = False
         log.info(
@@ -274,12 +307,30 @@ class NeroInferenceRuntime:
                     episode_steps = 0
                     log.info("inference episode %d started", self._episode_index)
                     continue
+                if key in {"s", "S"}:
+                    manual_step = True
+                    step_requested = True
+                    log.info(
+                        "single-step requested; press s for the next control cycle "
+                        "or c to resume continuous inference"
+                    )
+                elif key in {"c", "C"}:
+                    manual_step = False
+                    step_requested = False
+                    log.info("continuous inference resumed")
+                if manual_step and not step_requested:
+                    # TerminalKeys is non-blocking; avoid spinning while the
+                    # operator is inspecting the last command/visualization.
+                    time.sleep(0.005)
+                    continue
                 output = self.step()
                 if output is None:
-                    time.sleep(0.0005)
+                    time.sleep(0.0005 if not manual_step else 0.005)
                     continue
                 total_cycles += 1
                 episode_steps += 1
+                if manual_step:
+                    step_requested = False
                 maximum_steps = self.config.runtime.maximum_inference_steps
                 if maximum_steps is not None and episode_steps >= maximum_steps:
                     log.info(
@@ -353,11 +404,11 @@ class NeroInferenceRuntime:
         self._reset_online_tau_ext_episode()
         self.wrench_plotter.clear_history()
         self._latest_frame = None
+        self._latest_frames.clear()
         self._reset_observation_protection()
 
     def _reset_observation_protection(self) -> None:
         self._wrench_filter.reset()
-        self._dp_contact_history.clear()
         self._observation_warmup_started_us = None
         self._inference_control_mode_ready = not (
             self.command_enabled
@@ -397,6 +448,17 @@ class NeroInferenceRuntime:
 
     def _prepare_inference_control_mode(self) -> None:
         if not self.command_enabled or not self.config.predictor.enabled:
+            return
+        if (
+            self.config.predictor.mode
+            in {
+                "contact_world_model",
+                "contact_world_model_opd",
+                "contact_wm",
+                "contact_wm_opd",
+            }
+            and self.config.execution.mode == "q"
+        ):
             return
         self.arm.validate_joint_impedance_support()
         self.arm.configure_joint_impedance_mode()
@@ -700,15 +762,25 @@ class NeroInferenceRuntime:
             getattr(self.pipeline, "open_loop_execution_active", False)
         )
         for frame in self.cameras.poll():
-            if frame.camera_name == self.config.runtime.camera:
-                self._latest_frame = frame
-        if self._latest_frame is None:
+            if frame.camera_name in self._pipeline_image_keys:
+                self._latest_frames[frame.camera_name] = frame
+        primary_frame = self._latest_frames.get(self.config.runtime.camera)
+        if primary_frame is None:
+            return None
+        self._latest_frame = primary_frame
+        missing_frames = [
+            key for key in self._pipeline_image_keys if key not in self._latest_frames
+        ]
+        if missing_frames:
             return None
 
         current_us = now_us()
         camera_age_s = max(
-            0.0,
-            (current_us - int(self._latest_frame.timestamp_us)) * 1.0e-6,
+            max(
+                0.0,
+                (current_us - int(self._latest_frames[key].timestamp_us)) * 1.0e-6,
+            )
+            for key in self._pipeline_image_keys
         )
         camera_is_stale = camera_age_s > self.config.runtime.maximum_state_age_s
         if camera_is_stale:
@@ -739,36 +811,99 @@ class NeroInferenceRuntime:
             return None
 
         rotation = None
-        if self.collection.realtime_plot.wrench_mapping.reference_frame == "local":
+        if self._wrench_mapping.reference_frame == "local":
             model = getattr(self.pipeline, "model", self.pipeline.controller.model)
             pose = model.snapshot(
                 sample.q, sample.dq
             ).pose
             rotation = pose[:3, :3].copy()
 
+        image = (
+            self._latest_frame.frame
+            if len(self._pipeline_image_keys) == 1
+            else {
+                key: self._latest_frames[key].frame
+                for key in self._pipeline_image_keys
+            }
+        )
+        image_timestamp_s = (
+            self._latest_frame.timestamp_us * 1.0e-6
+            if len(self._pipeline_image_keys) == 1
+            else {
+                key: self._latest_frames[key].timestamp_us * 1.0e-6
+                for key in self._pipeline_image_keys
+            }
+        )
         output = self.pipeline.step(
             InferenceInput(
                 q=sample.q,
                 dq=sample.dq,
                 ddq=sample.ddq,
                 tau=sample.tau,
-                image=self._latest_frame.frame,
+                image=image,
                 wrench_ext=sample.wrench,
                 timestamp_s=sample.timestamp_us * 1.0e-6,
                 wrench_to_control_rotation=rotation,
-                image_timestamp_s=self._latest_frame.timestamp_us * 1.0e-6,
+                image_timestamp_s=image_timestamp_s,
             )
         )
         if self.command_enabled:
             if self.config.predictor.enabled:
-                q_cmd = np.asarray(sample.q, dtype=np.float64)
-                self.arm.command_joint_impedance(
-                    q=q_cmd,
-                    v_des=np.zeros(7, dtype=np.float64),
-                    kp=np.zeros(7, dtype=np.float64),
-                    kd=np.asarray(self.config.runtime.command_kd, dtype=np.float64),
-                    t_ff=output.tau_command,
-                )
+                control_mode = getattr(output, "control_mode", None)
+                if control_mode == "q":
+                    if output.joint_position_command is None:
+                        raise RuntimeError(
+                            "contact WM q mode did not produce a joint-position command"
+                        )
+                    q_cmd = np.asarray(
+                        output.joint_position_command, dtype=np.float64
+                    )
+                    self.arm.command_joint_positions(q_cmd)
+                elif control_mode == "mit":
+                    q_target = getattr(output, "joint_position_target", None)
+                    dq_target = getattr(output, "joint_velocity_target", None)
+                    tau_target = getattr(output, "torque_target", None)
+                    if q_target is None or dq_target is None or tau_target is None:
+                        raise RuntimeError(
+                            "contact WM MIT mode requires q/dq/tau targets"
+                        )
+                    q_cmd = np.asarray(q_target, dtype=np.float64)
+                    kp = np.asarray(
+                        getattr(output, "mit_kp", None)
+                        if getattr(output, "mit_kp", None) is not None
+                        else self.config.execution.mit_kp,
+                        dtype=np.float64,
+                    )
+                    kd = np.asarray(
+                        getattr(output, "mit_kd", None)
+                        if getattr(output, "mit_kd", None) is not None
+                        else self.config.execution.mit_kd,
+                        dtype=np.float64,
+                    )
+                    if kp.ndim == 0:
+                        kp = np.repeat(kp, 7)
+                    if kd.ndim == 0:
+                        kd = np.repeat(kd, 7)
+                    self.arm.command_joint_impedance(
+                        q=q_cmd,
+                        v_des=np.asarray(dq_target, dtype=np.float64),
+                        kp=kp,
+                        kd=kd,
+                        # The arm firmware adds the PD terms.  Send only the WM
+                        # feedforward torque here to avoid counting feedback twice.
+                        t_ff=np.asarray(tau_target, dtype=np.float64),
+                    )
+                else:
+                    # Legacy OSC-QP, contact OSC-QP, and direct-tau execution
+                    # all send a pure torque command through the MIT transport.
+                    q_cmd = np.asarray(sample.q, dtype=np.float64)
+                    self.arm.command_joint_impedance(
+                        q=q_cmd,
+                        v_des=np.zeros(7, dtype=np.float64),
+                        kp=np.zeros(7, dtype=np.float64),
+                        kd=np.asarray(self.config.runtime.command_kd, dtype=np.float64),
+                        t_ff=output.tau_command,
+                    )
             else:
                 if output.joint_position_command is None:
                     raise RuntimeError(
@@ -806,26 +941,13 @@ class NeroInferenceRuntime:
         self,
         wrench: np.ndarray,
     ) -> np.ndarray:
-        """Mirror the DP contact mask for the processed-observation plot.
-
-        The actual DP model still applies its gate after normalizing the raw
-        physical wrench. This display copy shows the corresponding physical
-        wrench with the same history reducer and threshold.
-        """
+        """Mirror the DP's samplewise physical-wrench gate for visualization."""
         value = np.asarray(wrench, dtype=np.float64).reshape(-1)
         if self._dp_contact_threshold_n is None:
             return value.copy()
         force = value[list(self._dp_contact_force_dims)]
         magnitude = float(np.linalg.norm(force))
-        self._dp_contact_history.append(magnitude)
-        history = np.asarray(self._dp_contact_history, dtype=np.float64)
-        if self._dp_contact_history_reducer == "last":
-            reduced = float(history[-1])
-        elif self._dp_contact_history_reducer == "max":
-            reduced = float(np.max(history))
-        else:
-            reduced = float(np.mean(history))
-        if reduced <= self._dp_contact_threshold_n:
+        if magnitude <= self._dp_contact_threshold_n:
             return np.zeros(6, dtype=np.float64)
         return value.copy()
 
@@ -838,6 +960,16 @@ class NeroInferenceRuntime:
                 not preserve_arm_enabled
                 and self.command_enabled
                 and self.config.predictor.enabled
+                and not (
+                    self.config.predictor.mode
+                    in {
+                        "contact_world_model",
+                        "contact_world_model_opd",
+                        "contact_wm",
+                        "contact_wm_opd",
+                    }
+                    and self.config.execution.mode == "q"
+                )
             ):
                 try:
                     state = self.arm.read_state()

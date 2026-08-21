@@ -45,6 +45,18 @@ class OSCTargetTrajectory:
     wrenches: np.ndarray
     twists: np.ndarray | None = None
     accelerations: np.ndarray | None = None
+    # Optional joint-space references used by the contact world model.  They
+    # remain optional so existing pose/wrench callers retain their contract.
+    joint_positions: np.ndarray | None = None
+    joint_velocities: np.ndarray | None = None
+    joint_accelerations: np.ndarray | None = None
+    joint_torques: np.ndarray | None = None
+    # Short aliases accepted for callers that describe the references as
+    # q/dq/ddq/tau targets.
+    q_targets: np.ndarray | None = None
+    dq_targets: np.ndarray | None = None
+    ddq_targets: np.ndarray | None = None
+    tau_targets: np.ndarray | None = None
 
     @classmethod
     def constant(
@@ -89,6 +101,12 @@ class OSCQPConfig:
     osqp_eps_rel: float = 1.0e-4
     osqp_polish: bool = False
     maximum_constraint_violation: float = 1.0e-3
+    # Soft q/tau WM tracking weights.  ``q_tracking_weight`` and
+    # ``tau_tracking_weight`` are aliases with precedence when supplied.
+    joint_acceleration_tracking_weight: float | tuple[float, ...] = 0.0
+    torque_tracking_weight: float | tuple[float, ...] = 0.0
+    q_tracking_weight: float | tuple[float, ...] | None = None
+    tau_tracking_weight: float | tuple[float, ...] | None = None
 
     @property
     def control_frequency_hz(self) -> float:
@@ -248,7 +266,16 @@ class OSCQPController:
         started_ns = perf_counter_ns()
         q0 = _finite_vector("q", q, self.dof)
         dq0 = _finite_vector("dq", dq, self.dof)
-        poses, wrenches, twists, accelerations = self._validate_target(target)
+        (
+            poses,
+            wrenches,
+            twists,
+            accelerations,
+            joint_positions,
+            joint_velocities,
+            joint_accelerations,
+            joint_torques,
+        ) = self._validate_target(target)
         snapshot = self.model.snapshot(q0, dq0)
         self._validate_snapshot(snapshot)
         measured = (
@@ -272,6 +299,10 @@ class OSCQPController:
             accelerations,
             measured,
             previous,
+            joint_positions,
+            joint_velocities,
+            joint_accelerations,
+            joint_torques,
         )
         (
             hessian,
@@ -358,6 +389,10 @@ class OSCQPController:
         accelerations: np.ndarray,
         measured_wrench: np.ndarray | None,
         previous_tau: np.ndarray,
+        joint_positions: np.ndarray | None = None,
+        joint_velocities: np.ndarray | None = None,
+        joint_accelerations: np.ndarray | None = None,
+        joint_torques: np.ndarray | None = None,
     ) -> tuple[np.ndarray, ...]:
         cfg = self.config
         horizon = cfg.horizon_steps
@@ -454,6 +489,44 @@ class OSCQPController:
             tau_offset,
             np.full(horizon * dof, cfg.torque_weight),
         )
+        # Contact-WM references are soft objectives layered on top of the
+        # existing acceleration/torque regularizers.  The dynamics equation is
+        # represented by tau_map, so torque and acceleration cannot be matched
+        # independently when they conflict.
+        if joint_accelerations is not None:
+            acceleration_reference = np.zeros_like(acceleration_map)
+            acceleration_reference[:, :acceleration_size] = np.eye(acceleration_size)
+            _add_squared_cost(
+                hessian,
+                gradient,
+                acceleration_reference,
+                -joint_accelerations.reshape(-1),
+                np.tile(
+                    _tracking_weights(
+                        cfg.q_tracking_weight
+                        if cfg.q_tracking_weight is not None
+                        else cfg.joint_acceleration_tracking_weight,
+                        dof,
+                    ),
+                    horizon,
+                ),
+            )
+        if joint_torques is not None:
+            _add_squared_cost(
+                hessian,
+                gradient,
+                tau_map,
+                tau_offset - joint_torques.reshape(-1),
+                np.tile(
+                    _tracking_weights(
+                        cfg.tau_tracking_weight
+                        if cfg.tau_tracking_weight is not None
+                        else cfg.torque_tracking_weight,
+                        dof,
+                    ),
+                    horizon,
+                ),
+            )
         self._add_rate_costs(
             hessian,
             gradient,
@@ -616,6 +689,15 @@ class OSCQPController:
             value = float(getattr(cfg, name))
             if not np.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and non-negative")
+        for name in (
+            "joint_acceleration_tracking_weight",
+            "torque_tracking_weight",
+            "q_tracking_weight",
+            "tau_tracking_weight",
+        ):
+            value = getattr(cfg, name)
+            if value is not None:
+                _tracking_weights(value, self.dof, name=name)
         _positive_limit("acceleration_limit", cfg.acceleration_limit, self.dof)
         if cfg.torque_limit is not None:
             _positive_limit("torque_limit", cfg.torque_limit, self.dof)
@@ -656,7 +738,16 @@ class OSCQPController:
 
     def _validate_target(
         self, target: OSCTargetTrajectory
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray | None,
+        np.ndarray | None,
+        np.ndarray | None,
+        np.ndarray | None,
+    ]:
         horizon = self.config.horizon_steps
         poses = np.asarray(target.poses, dtype=np.float64)
         wrenches = np.asarray(target.wrenches, dtype=np.float64)
@@ -666,7 +757,42 @@ class OSCQPController:
             raise ValueError(f"target wrenches must have shape ({horizon}, 6) and be finite")
         twists = _optional_trajectory("twists", target.twists, horizon)
         accelerations = _optional_trajectory("accelerations", target.accelerations, horizon)
-        return poses, wrenches, twists, accelerations
+        joint_positions = _optional_joint_trajectory(
+            "joint_positions",
+            target.joint_positions if target.joint_positions is not None else target.q_targets,
+            horizon,
+            self.dof,
+        )
+        joint_velocities = _optional_joint_trajectory(
+            "joint_velocities",
+            target.joint_velocities if target.joint_velocities is not None else target.dq_targets,
+            horizon,
+            self.dof,
+        )
+        joint_accelerations = _optional_joint_trajectory(
+            "joint_accelerations",
+            target.joint_accelerations
+            if target.joint_accelerations is not None
+            else target.ddq_targets,
+            horizon,
+            self.dof,
+        )
+        joint_torques = _optional_joint_trajectory(
+            "joint_torques",
+            target.joint_torques if target.joint_torques is not None else target.tau_targets,
+            horizon,
+            self.dof,
+        )
+        return (
+            poses,
+            wrenches,
+            twists,
+            accelerations,
+            joint_positions,
+            joint_velocities,
+            joint_accelerations,
+            joint_torques,
+        )
 
     def _validate_snapshot(self, snapshot: DynamicsSnapshot) -> None:
         expected = {
@@ -745,3 +871,39 @@ def _optional_trajectory(name: str, value: np.ndarray | None, horizon: int) -> n
     if trajectory.shape != (horizon, 6) or not np.isfinite(trajectory).all():
         raise ValueError(f"target {name} must have shape ({horizon}, 6) and be finite")
     return trajectory
+
+
+def _optional_joint_trajectory(
+    name: str,
+    value: np.ndarray | None,
+    horizon: int,
+    dof: int,
+) -> np.ndarray | None:
+    if value is None:
+        return None
+    trajectory = np.asarray(value, dtype=np.float64)
+    if trajectory.shape != (horizon, dof) or not np.isfinite(trajectory).all():
+        raise ValueError(
+            f"target {name} must have shape ({horizon}, {dof}) and be finite"
+        )
+    return trajectory
+
+
+def _tracking_weights(
+    value: float | tuple[float, ...],
+    dof: int,
+    *,
+    name: str = "tracking weight",
+) -> np.ndarray:
+    weights = np.asarray(value, dtype=np.float64)
+    if weights.ndim == 0:
+        weights = np.full(dof, float(weights), dtype=np.float64)
+    else:
+        weights = weights.reshape(-1)
+    if (
+        weights.shape != (dof,)
+        or not np.isfinite(weights).all()
+        or np.any(weights < 0.0)
+    ):
+        raise ValueError(f"{name} must be finite, non-negative, and scalar or {dof}D")
+    return weights

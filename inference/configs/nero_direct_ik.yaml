@@ -1,9 +1,15 @@
 # Offline/online DP -> IK configuration. No F expert checkpoint is loaded.
 dp_checkpoint:
-  path: ../../../model/optimizer_step=00010000.ckpt
+  # Shared wrist+wrench DP checkpoint. This branch does not load a PINN
+  # predictor and executes the predicted pose through IK.
+  path: ../../../model/dp_baseline/wipeborad/checkpoints/latest.ckpt
   dino_model_path: ../../../model/dinov3-vitb16-pretrain-lvd1689m
   device: cuda:0
   use_ema: true
+
+# joint: DP outputs absolute 7-axis q and bypasses IK.
+# eepose: DP outputs [x,y,z,qx,qy,qz,qw] and executes through IK.
+action: joint
 
 predictor:
   enabled: false
@@ -11,19 +17,19 @@ predictor:
   # Disabled in this branch, but retained as valid predictor metadata.
   mode: world_model_v3
   # first: first pose; mean: averaged pose; all: execute the complete chunk.
-  action_chunk_mode: all
+  action_chunk_mode: first
   action_step_s: null
   # Set minimum_jerk_target with first/mean/last to execute one selected target
   # with zero velocity and acceleration at both trajectory boundaries.
-  action_execution_mode: chunk
+  action_execution_mode: minimum_jerk_target
   action_interpolation_duration_s: null
   # Number of trajectory segments; the generated plan includes both endpoints.
-  action_interpolation_steps: 10
+  action_interpolation_steps: 100
 
 dp_sampling:
   # ddim 适合少步快速推理；ddpm 通常需要更多步数。
-  method: ddim
-  num_inference_steps: 8
+  method: ddpm
+  num_inference_steps: 100
 
 robot:
   urdf_path: ../../urdf/nero/nero_with_gripper.urdf

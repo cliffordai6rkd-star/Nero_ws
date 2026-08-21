@@ -4,6 +4,7 @@ import logging
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from pathlib import Path
 from time import perf_counter
 from typing import Any, Mapping
 
@@ -24,8 +25,22 @@ from nero_collection.control import (
 log = logging.getLogger(__name__)
 
 
+_LINK7_TARGET_GRIPPER_TCP_CURRENT_CHECKPOINT = Path(
+    "/mnt/code/lcx/PINN/outputs/contact_world_model_opd_sweep/20260819_113728/"
+    "teacher/checkpoints/step_00100000.pt"
+).resolve()
+
+
 _Q_TAU_WORLD_MODEL_MODES = frozenset(
     ("world_model_v4", "world_model_v5")
+)
+_CONTACT_WORLD_MODEL_MODES = frozenset(
+    (
+        "contact_world_model",
+        "contact_world_model_opd",
+        "contact_wm",
+        "contact_wm_opd",
+    )
 )
 _WORLD_MODEL_MODES = frozenset(
     ("world_model_v3", *_Q_TAU_WORLD_MODEL_MODES)
@@ -38,11 +53,11 @@ class InferenceInput:
     dq: np.ndarray
     ddq: np.ndarray
     tau: np.ndarray
-    image: np.ndarray
+    image: np.ndarray | Mapping[str, np.ndarray]
     wrench_ext: np.ndarray
     timestamp_s: float
     wrench_to_control_rotation: np.ndarray | None = None
-    image_timestamp_s: float | None = None
+    image_timestamp_s: float | Mapping[str, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -59,6 +74,45 @@ class InferenceOutput:
     ik_result: IKResult | None
     dp_updated: bool
     pinn_updated: bool
+    # Optional joint-space references produced by a dedicated contact WM.
+    joint_position_target: np.ndarray | None = None
+    joint_velocity_target: np.ndarray | None = None
+    torque_target: np.ndarray | None = None
+    # Effective gains sent to the firmware for a contact-WM MIT cycle.  They
+    # may be lower than the configured nominal gains when the feedback or
+    # total-torque limit is active.
+    mit_kp: np.ndarray | None = None
+    mit_kd: np.ndarray | None = None
+    contact_state: np.ndarray | None = None
+    control_mode: str | None = None
+    joint_position_trajectory: np.ndarray | None = None
+    joint_velocity_trajectory: np.ndarray | None = None
+    joint_acceleration_trajectory: np.ndarray | None = None
+    torque_trajectory: np.ndarray | None = None
+    # Wall-clock duration of the most recent DP/WM model forward used for this
+    # control output. ``None`` means that model did not update this cycle.
+    dp_inference_time_s: float | None = None
+    wm_inference_time_s: float | None = None
+
+    @property
+    def q_target(self) -> np.ndarray | None:
+        return self.joint_position_target
+
+    @property
+    def dq_target(self) -> np.ndarray | None:
+        return self.joint_velocity_target
+
+    @property
+    def tau_target(self) -> np.ndarray | None:
+        return self.torque_target
+
+    @property
+    def q_targets(self) -> np.ndarray | None:
+        return self.joint_position_trajectory
+
+    @property
+    def tau_targets(self) -> np.ndarray | None:
+        return self.torque_trajectory
 
 
 @dataclass(frozen=True)
@@ -89,8 +143,10 @@ class NeroInferencePipeline:
         pinn_model: Any | None = None,
         controller: OSCQPController | None = None,
         world_model_wrench_adapter: Any | None = None,
+        _allow_contact_world_model: bool = False,
     ) -> None:
         self.config = config
+        self._dp_action_type = config.action
         self._predictor_enabled = bool(config.predictor.enabled)
         self.dp = dp_model or restore_checkpoint_model(
             config.dp_checkpoint.path,
@@ -130,7 +186,13 @@ class NeroInferencePipeline:
                         config.runtime.collection_config
                     )
                 )
-        elif self._predictor_enabled and self._predictor_mode != "wrench_gru":
+        elif self._predictor_enabled and (
+            self._predictor_mode != "wrench_gru"
+            and not (
+                _allow_contact_world_model
+                and self._predictor_mode in _CONTACT_WORLD_MODEL_MODES
+            )
+        ):
             raise ValueError(f"unsupported predictor mode: {self._predictor_mode!r}")
         if controller is None:
             dynamics = PinocchioDynamicsModel(
@@ -143,9 +205,34 @@ class NeroInferencePipeline:
         self.model = controller.model
 
         self._n_obs_steps = int(getattr(self.dp, "n_obs_steps", 1))
+        self._dp_tau_ext_observation_enabled = bool(
+            config.dp_sampling.use_tau_ext_observation
+        )
+        configured_wrench_key = getattr(self.dp, "wrench_key", None)
+        if configured_wrench_key is None and hasattr(
+            getattr(self.dp, "obs_encoder", None), "wrench_history_steps"
+        ):
+            # Older force-aware checkpoints did not expose wrench_key on the
+            # policy, but their encoder contract is unambiguously wrench_ext.
+            configured_wrench_key = "wrench_ext"
+        checkpoint_wrench_key = (
+            None if configured_wrench_key is None else str(configured_wrench_key)
+        )
+        if checkpoint_wrench_key is not None and not self._dp_tau_ext_observation_enabled:
+            raise ValueError(
+                "dp_sampling.use_tau_ext_observation=false requires an image-only "
+                "DP checkpoint; the loaded checkpoint requires "
+                f"{checkpoint_wrench_key!r}"
+            )
+        self._wrench_key = (
+            checkpoint_wrench_key
+            if self._dp_tau_ext_observation_enabled
+            else None
+        )
+        self._uses_wrench_observation = self._wrench_key is not None
         self._wrench_history_steps = int(
             getattr(getattr(self.dp, "obs_encoder", None), "wrench_history_steps", 1)
-        )
+        ) if self._uses_wrench_observation else 1
         if self._n_obs_steps < 1 or self._wrench_history_steps < 1:
             raise ValueError(
                 "DP checkpoint observation contract requires positive n_obs_steps "
@@ -153,19 +240,45 @@ class NeroInferencePipeline:
             )
         log.info(
             "DP observation contract images=%d CAN-derived samples/image=%d "
-            "total_CAN_samples/batch=%d",
+            "total_CAN_samples/batch=%d tau_ext_enabled=%s checkpoint_key=%s",
             self._n_obs_steps,
             self._wrench_history_steps,
             self._n_obs_steps * self._wrench_history_steps,
+            self._dp_tau_ext_observation_enabled,
+            checkpoint_wrench_key or "none",
         )
-        self._image_key = str(getattr(self.dp, "image_key", "wrist"))
-        self._wrench_key = str(getattr(self.dp, "wrench_key", "wrench_ext"))
-        self._images: deque[np.ndarray] = deque(maxlen=self._n_obs_steps)
+        configured_image_keys = tuple(
+            str(key) for key in getattr(self.dp, "image_keys", ())
+        )
+        if not configured_image_keys:
+            configured_image_keys = tuple(
+                str(key)
+                for key in getattr(getattr(self.dp, "obs_encoder", None), "rgb_keys", ())
+            )
+        if not configured_image_keys:
+            configured_image_keys = (str(getattr(self.dp, "image_key", "wrist")),)
+        self._image_keys = tuple(sorted(dict.fromkeys(configured_image_keys)))
+        self._anchor_image_key = str(config.runtime.camera)
+        if self._anchor_image_key not in self._image_keys:
+            raise ValueError(
+                f"runtime.camera={self._anchor_image_key!r} must be one of the DP "
+                f"image keys {list(self._image_keys)}"
+            )
+        self._image_key = self._image_keys[0] if len(self._image_keys) == 1 else None
+        self._images_by_key = {
+            key: deque(maxlen=self._n_obs_steps) for key in self._image_keys
+        }
+        self._images = self._images_by_key[self._anchor_image_key]
         self._wrenches: deque[np.ndarray] = deque(
             maxlen=self._n_obs_steps * self._wrench_history_steps
         )
-        self._timed_images: deque[tuple[float, np.ndarray]] = deque(maxlen=256)
+        self._timed_images_by_key = {
+            key: deque(maxlen=256) for key in self._image_keys
+        }
+        self._timed_images = self._timed_images_by_key[self._anchor_image_key]
         self._timed_wrenches: deque[tuple[float, np.ndarray]] = deque(maxlen=2048)
+        self._camera_alignment_logged = False
+        self._dp_snapshot_pending_reason: str | None = None
         self._latest_policy_anchor_s: float | None = None
         self._last_submitted_policy_anchor_s: float | None = None
         self._open_loop_observation_start_s: float | None = None
@@ -280,6 +393,15 @@ class NeroInferencePipeline:
             action_frame_name = config.robot.action_frame_name or config.robot.frame_name
         self._action_frame_name = str(action_frame_name)
         self._control_frame_name = config.robot.frame_name
+        self._wm_current_frame_name = self._action_frame_name
+        if _uses_link7_target_gripper_tcp_current_contract(config):
+            self._action_frame_name = "link7"
+            self._wm_current_frame_name = "gripper_tcp"
+            log.info(
+                "applying checkpoint-specific WM frame contract: "
+                "target_action=link7 current_ee_pose=gripper_tcp checkpoint=%s",
+                config.pinn_checkpoint.path,
+            )
         self._action_to_control_transform: np.ndarray | None = None
         self._target_wrenches = np.zeros(
             (self.controller.config.horizon_steps, 6), dtype=np.float64
@@ -296,6 +418,11 @@ class NeroInferencePipeline:
         self._timing_qp_s = 0.0
         self._timing_ik_s = 0.0
         self._timing_dp_s: list[float] = []
+        self._timing_wm_s: list[float] = []
+        self._timing_dp_call_count = 0
+        self._timing_wm_call_count = 0
+        self._last_dp_inference_time_s: float | None = None
+        self._last_wm_inference_time_s: float | None = None
 
     def reset(self) -> None:
         # Do not reset checkpoint-owned recurrent/model state while an old DP
@@ -307,10 +434,13 @@ class NeroInferencePipeline:
                 future.result()
             except Exception as exc:
                 log.warning("discarding failed DP result during episode reset: %s", exc)
-        self._images.clear()
+        for images in self._images_by_key.values():
+            images.clear()
         self._wrenches.clear()
-        self._timed_images.clear()
+        for images in self._timed_images_by_key.values():
+            images.clear()
         self._timed_wrenches.clear()
+        self._dp_snapshot_pending_reason = None
         self._latest_policy_anchor_s = None
         self._last_submitted_policy_anchor_s = None
         self._open_loop_observation_start_s = None
@@ -382,6 +512,8 @@ class NeroInferencePipeline:
     def step(self, sample: InferenceInput) -> InferenceOutput:
         """Run one state-driven control cycle using the configured DP execution mode."""
         cycle_started_s = perf_counter()
+        self._last_dp_inference_time_s = None
+        self._last_wm_inference_time_s = None
         self._validate_input(sample)
         open_loop = self.config.predictor.inference_mode == "open_loop"
         plan_completed = self._advance_execution_plan(sample.timestamp_s)
@@ -408,9 +540,10 @@ class NeroInferencePipeline:
         dp_updated = self._update_dp_execution(
             sample.timestamp_s,
             current_action_pose,
+            sample.q,
         )
         if self._action is None:
-            self._set_idle_action(current_action_pose)
+            self._set_idle_action(current_action_pose, sample.q)
 
         if not self._predictor_enabled:
             return self._step_direct_ik(
@@ -423,16 +556,21 @@ class NeroInferencePipeline:
 
         # Every completed PINN inference immediately becomes the wrench reference.
         pinn_started_s = perf_counter()
+        current_wm_pose = self._current_wm_pose(
+            sample.q,
+            current_action_pose,
+            current_control_pose,
+        )
         self._target_wrenches = self._predict_wrenches(
             sample,
-            current_action_pose,
+            current_wm_pose,
         )
         self._timing_pinn_s += perf_counter() - pinn_started_s
         self._update_qp_timestep(sample.timestamp_s)
 
         assert self._action_chunk is not None
         action_poses = np.stack(
-            [_action_to_pose(action) for action in self._action_chunk],
+            [_action_to_pose(action) for action in self._actions_for_wm(self._action_chunk)],
             axis=0,
         )
         control_poses = self._action_poses_to_control(
@@ -489,6 +627,8 @@ class NeroInferencePipeline:
             ik_result=None,
             dp_updated=dp_updated,
             pinn_updated=True,
+            dp_inference_time_s=self._last_dp_inference_time_s,
+            wm_inference_time_s=self._last_wm_inference_time_s,
         )
         self._timing_cycles += 1
         self._report_timing(perf_counter() - cycle_started_s)
@@ -498,6 +638,7 @@ class NeroInferencePipeline:
         self,
         timestamp_s: float,
         current_action_pose: np.ndarray,
+        current_q: np.ndarray,
     ) -> bool:
         """Update the high-level action plan for both IK and predictor branches."""
         inference_mode = self.config.predictor.inference_mode
@@ -515,6 +656,7 @@ class NeroInferencePipeline:
             self._install_dp_prediction(
                 prediction,
                 current_action_pose,
+                current_q,
                 timestamp_s,
                 scheduled=True,
             )
@@ -531,6 +673,7 @@ class NeroInferencePipeline:
             self._install_dp_prediction(
                 pending,
                 current_action_pose,
+                current_q,
                 timestamp_s,
                 scheduled=True,
             )
@@ -548,6 +691,7 @@ class NeroInferencePipeline:
                 self._install_dp_prediction(
                     prediction,
                     current_action_pose,
+                    current_q,
                     timestamp_s,
                     scheduled=plan_locked,
                 )
@@ -568,30 +712,50 @@ class NeroInferencePipeline:
         self,
         prediction: _DPPrediction,
         current_action_pose: np.ndarray,
+        current_q: np.ndarray,
         timestamp_s: float,
         *,
         scheduled: bool,
     ) -> None:
-        safe_chunk = self._safe_action_chunk(
-            prediction.action_chunk,
-            current_action_pose,
+        # Publish the completed prediction's duration on the control thread;
+        # asynchronous DP may already be evaluating the next batch in its
+        # worker when this output is assembled.
+        self._last_dp_inference_time_s = float(prediction.elapsed_s)
+        safe_chunk = (
+            self._safe_action_chunk(prediction.action_chunk, current_action_pose)
+            if self._dp_action_type == "eepose"
+            else np.asarray(prediction.action_chunk, dtype=np.float64).copy()
         )
         self._dp_action_chunk = np.asarray(
             prediction.raw_action_chunk, dtype=np.float64
         ).copy()
         self._dp_chunk_sequence += 1
-        current_action = _pose_to_action(current_action_pose)
+        current_action = (
+            _pose_to_action(current_action_pose)
+            if self._dp_action_type == "eepose"
+            else _numpy_vector(current_q, 7, "current q")
+        )
         for action_index, action_pred in enumerate(self._dp_action_chunk):
-            log.info(
-                "DP action chunk #%d[%02d] delta_xyz_rotvec=%s",
-                self._dp_chunk_sequence,
-                action_index,
-                _format_action_delta(current_action, action_pred),
-            )
+            if self._dp_action_type == "eepose":
+                log.info(
+                    "DP action chunk #%d[%02d] delta_xyz_rotvec=%s",
+                    self._dp_chunk_sequence,
+                    action_index,
+                    _format_action_delta(current_action, action_pred),
+                )
+            else:
+                log.info(
+                    "DP action chunk #%d[%02d] delta_q=%s",
+                    self._dp_chunk_sequence,
+                    action_index,
+                    _format_action_vector(action_pred - current_action),
+                )
         chunk_mode = self.config.predictor.action_chunk_mode
         execution_mode = self.config.predictor.action_execution_mode
         if execution_mode in {"linear_target", "minimum_jerk_target"}:
-            target_action = _select_action_chunk(safe_chunk, chunk_mode)
+            target_action = _select_action_chunk(
+                safe_chunk, chunk_mode, action_type=self._dp_action_type
+            )
             interpolation_steps = self.config.predictor.action_interpolation_steps
             duration_s = self.config.predictor.action_interpolation_duration_s
             if duration_s is None:
@@ -601,27 +765,42 @@ class NeroInferencePipeline:
                 raise ValueError(
                     "minimum-jerk action duration must be positive and finite"
                 )
-            plan = _minimum_jerk_action_plan(
-                current_action,
-                target_action,
-                interpolation_steps,
+            plan = (
+                _minimum_jerk_action_plan(
+                    current_action,
+                    target_action,
+                    interpolation_steps,
+                )
+                if self._dp_action_type == "eepose"
+                else _minimum_jerk_joint_plan(
+                    current_action,
+                    target_action,
+                    interpolation_steps,
+                )
             )
             plan_step_s = duration_s / interpolation_steps
             held_action = target_action
             log.info(
-                "DP minimum-jerk target chunk_mode=%s steps=%d "
+                "DP minimum-jerk target action=%s chunk_mode=%s steps=%d "
                 "duration=%.4fs target_delta=%s",
+                self._dp_action_type,
                 chunk_mode,
                 interpolation_steps,
                 duration_s,
-                _format_action_delta(current_action, target_action),
+                (
+                    _format_action_delta(current_action, target_action)
+                    if self._dp_action_type == "eepose"
+                    else _format_action_vector(target_action - current_action)
+                ),
             )
         elif chunk_mode == "all":
             plan = safe_chunk
             plan_step_s = self._action_execution_step_s()
             held_action = plan[0]
         else:
-            plan = _select_action_chunk(safe_chunk, chunk_mode)[None]
+            plan = _select_action_chunk(
+                safe_chunk, chunk_mode, action_type=self._dp_action_type
+            )[None]
             plan_step_s = self._action_execution_step_s()
             held_action = plan[0]
         self._execution_plan = np.asarray(plan, dtype=np.float64).copy()
@@ -665,10 +844,13 @@ class NeroInferencePipeline:
         return False
 
     def _clear_dp_observations(self, *, start_s: float | None = None) -> None:
-        self._images.clear()
+        for images in self._images_by_key.values():
+            images.clear()
         self._wrenches.clear()
-        self._timed_images.clear()
+        for images in self._timed_images_by_key.values():
+            images.clear()
         self._timed_wrenches.clear()
+        self._dp_snapshot_pending_reason = None
         self._latest_policy_anchor_s = None
         self._last_submitted_policy_anchor_s = None
         self._open_loop_observation_start_s = (
@@ -688,8 +870,14 @@ class NeroInferencePipeline:
             return float(configured)
         return self.observation_step_s or 0.1
 
-    def _set_idle_action(self, current_action_pose: np.ndarray) -> None:
-        self._action = _pose_to_action(current_action_pose)
+    def _set_idle_action(
+        self, current_action_pose: np.ndarray, current_q: np.ndarray
+    ) -> None:
+        self._action = (
+            _pose_to_action(current_action_pose)
+            if self._dp_action_type == "eepose"
+            else _numpy_vector(current_q, 7, "current q").copy()
+        )
         self._pinn_held_action = self._action.copy()
         self._action_chunk = np.repeat(
             self._action[None],
@@ -722,7 +910,7 @@ class NeroInferencePipeline:
     def step_direct_ik_observation_history(
         self,
         sample: InferenceInput,
-        image_history: np.ndarray,
+        image_history: np.ndarray | Mapping[str, np.ndarray],
         wrench_history: np.ndarray,
     ) -> InferenceOutput:
         """Run direct IK from an already aligned model-contract observation."""
@@ -732,23 +920,51 @@ class NeroInferencePipeline:
             )
         cycle_started_s = perf_counter()
         self._validate_input(sample)
-        images = np.asarray(image_history)
-        expected_image_prefix = (self._n_obs_steps,)
-        if (
-            images.ndim != 4
-            or images.shape[:1] != expected_image_prefix
-            or images.shape[-1] != 3
-        ):
-            raise ValueError(
-                "image_history must have shape "
-                f"[{self._n_obs_steps},H,W,3], got {images.shape}"
-            )
-        processed_images = []
-        for image in images:
-            value = np.asarray(image, dtype=np.float32)
-            if value.max(initial=0.0) > 1.0:
-                value /= 255.0
-            processed_images.append(np.moveaxis(value, -1, 0))
+        if isinstance(image_history, Mapping):
+            image_keys = tuple(sorted(str(key) for key in image_history))
+            if image_keys != self._image_keys:
+                raise ValueError(
+                    "image_history cameras do not match the DP checkpoint: "
+                    f"expected={list(self._image_keys)}, got={list(image_keys)}"
+                )
+            processed_images: dict[str, np.ndarray] = {}
+            for key in self._image_keys:
+                images = np.asarray(image_history[key])
+                if (
+                    images.ndim != 4
+                    or images.shape[0] != self._n_obs_steps
+                    or images.shape[-1] != 3
+                ):
+                    raise ValueError(
+                        f"image_history[{key!r}] must have shape "
+                        f"[{self._n_obs_steps},H,W,3], got {images.shape}"
+                    )
+                processed = []
+                for image in images:
+                    value = np.asarray(image, dtype=np.float32)
+                    if value.max(initial=0.0) > 1.0:
+                        value /= 255.0
+                    processed.append(np.moveaxis(value, -1, 0))
+                processed_images[key] = np.stack(processed)
+        else:
+            images = np.asarray(image_history)
+            expected_image_prefix = (self._n_obs_steps,)
+            if (
+                images.ndim != 4
+                or images.shape[:1] != expected_image_prefix
+                or images.shape[-1] != 3
+            ):
+                raise ValueError(
+                    "image_history must have shape "
+                    f"[{self._n_obs_steps},H,W,3], got {images.shape}"
+                )
+            processed_images = []
+            for image in images:
+                value = np.asarray(image, dtype=np.float32)
+                if value.max(initial=0.0) > 1.0:
+                    value /= 255.0
+                processed_images.append(np.moveaxis(value, -1, 0))
+            processed_images = np.stack(processed_images)
         wrenches = np.asarray(wrench_history, dtype=np.float32)
         expected_wrench_shape = (
             self._n_obs_steps,
@@ -762,7 +978,7 @@ class NeroInferencePipeline:
             )
         return self._step_direct_ik_from_snapshot(
             sample,
-            np.stack(processed_images),
+            processed_images,
             wrenches,
             cycle_started_s=cycle_started_s,
         )
@@ -770,11 +986,13 @@ class NeroInferencePipeline:
     def _step_direct_ik_from_snapshot(
         self,
         sample: InferenceInput,
-        images: np.ndarray,
+        images: np.ndarray | Mapping[str, np.ndarray],
         wrenches: np.ndarray,
         *,
         cycle_started_s: float,
     ) -> InferenceOutput:
+        self._last_dp_inference_time_s = None
+        self._last_wm_inference_time_s = None
         current_control_pose = self.model.snapshot(sample.q, sample.dq).pose
         current_action_pose = self._current_action_pose(
             sample.q,
@@ -799,6 +1017,7 @@ class NeroInferencePipeline:
         self._install_dp_prediction(
             prediction,
             current_action_pose,
+            sample.q,
             sample.timestamp_s,
             scheduled=scheduled,
         )
@@ -819,26 +1038,30 @@ class NeroInferencePipeline:
         dp_updated: bool,
         cycle_started_s: float,
     ) -> InferenceOutput:
-        """Execute the selected DP pose through IK without the force expert/QP."""
+        """Execute the selected DP end-effector pose or joint target."""
         assert self._action is not None
-        action_pose = _action_to_pose(self._action)
-        control_pose = self._action_poses_to_control(
-            action_pose[None],
-            sample.q,
-            current_action_pose,
-            current_control_pose,
-        )[0]
-        ik_started_s = perf_counter()
-        ik_result = self._solve_ik(sample.q, control_pose)
-        self._timing_ik_s += perf_counter() - ik_started_s
-        if not ik_result.converged:
-            raise RuntimeError(
-                "IK did not converge for the selected DP action: "
-                f"position_error={ik_result.position_error_m:.6g} m, "
-                f"rotation_error={ik_result.rotation_error_rad:.6g} rad, "
-                f"iterations={ik_result.iterations}"
-            )
-        q_command = self._safe_joint_position_command(sample.q, ik_result.q)
+        if self._dp_action_type == "joint":
+            ik_result = None
+            q_command = self._safe_joint_position_command(sample.q, self._action)
+        else:
+            action_pose = _action_to_pose(self._action)
+            control_pose = self._action_poses_to_control(
+                action_pose[None],
+                sample.q,
+                current_action_pose,
+                current_control_pose,
+            )[0]
+            ik_started_s = perf_counter()
+            ik_result = self._solve_ik(sample.q, control_pose)
+            self._timing_ik_s += perf_counter() - ik_started_s
+            if not ik_result.converged:
+                raise RuntimeError(
+                    "IK did not converge for the selected DP action: "
+                    f"position_error={ik_result.position_error_m:.6g} m, "
+                    f"rotation_error={ik_result.rotation_error_rad:.6g} rad, "
+                    f"iterations={ik_result.iterations}"
+                )
+            q_command = self._safe_joint_position_command(sample.q, ik_result.q)
         zeros7 = np.zeros(7, dtype=np.float64)
         output = InferenceOutput(
             tau_command=zeros7.copy(),
@@ -855,6 +1078,8 @@ class NeroInferencePipeline:
             ik_result=ik_result,
             dp_updated=dp_updated,
             pinn_updated=False,
+            dp_inference_time_s=self._last_dp_inference_time_s,
+            wm_inference_time_s=self._last_wm_inference_time_s,
         )
         self._timing_cycles += 1
         self._report_timing(perf_counter() - cycle_started_s)
@@ -966,25 +1191,62 @@ class NeroInferencePipeline:
 
     def _append_observation(
         self,
-        image: np.ndarray,
+        image: np.ndarray | Mapping[str, np.ndarray],
         wrench: np.ndarray,
         *,
-        image_timestamp_s: float | None = None,
+        image_timestamp_s: float | Mapping[str, float] | None = None,
         state_timestamp_s: float | None = None,
         allow_backfill: bool = True,
     ) -> None:
-        image_value = np.asarray(image)
-        if image_value.ndim != 3 or image_value.shape[-1] != 3:
-            raise ValueError("image must have shape [H,W,3]")
-        image_value = image_value.astype(np.float32)
-        if image_value.max(initial=0.0) > 1.0:
-            image_value /= 255.0
-        chw_image = np.moveaxis(image_value, -1, 0)
+        if isinstance(image, Mapping):
+            image_keys = tuple(sorted(str(key) for key in image))
+            if image_keys != self._image_keys:
+                raise ValueError(
+                    "image observations do not match the DP checkpoint: "
+                    f"expected={list(self._image_keys)}, got={list(image_keys)}"
+                )
+            chw_images = {}
+            for key in self._image_keys:
+                image_value = np.asarray(image[key])
+                if image_value.ndim != 3 or image_value.shape[-1] != 3:
+                    raise ValueError(f"image[{key!r}] must have shape [H,W,3]")
+                image_value = image_value.astype(np.float32)
+                if image_value.max(initial=0.0) > 1.0:
+                    image_value /= 255.0
+                chw_images[key] = np.moveaxis(image_value, -1, 0)
+        else:
+            if len(self._image_keys) > 1:
+                raise ValueError(
+                    "multi-camera DP requires image observations keyed by camera name"
+                )
+            image_value = np.asarray(image)
+            if image_value.ndim != 3 or image_value.shape[-1] != 3:
+                raise ValueError("image must have shape [H,W,3]")
+            image_value = image_value.astype(np.float32)
+            if image_value.max(initial=0.0) > 1.0:
+                image_value /= 255.0
+            chw_images = {self._image_keys[0]: np.moveaxis(image_value, -1, 0)}
         wrench_value = np.asarray(wrench, dtype=np.float32).copy()
         if image_timestamp_s is not None and state_timestamp_s is not None:
-            image_time = float(image_timestamp_s)
+            if isinstance(image_timestamp_s, Mapping):
+                timestamp_keys = tuple(sorted(str(key) for key in image_timestamp_s))
+                if timestamp_keys != self._image_keys:
+                    raise ValueError(
+                        "image timestamps do not match the DP checkpoint: "
+                        f"expected={list(self._image_keys)}, got={list(timestamp_keys)}"
+                    )
+                image_times = {
+                    key: float(image_timestamp_s[key]) for key in self._image_keys
+                }
+            else:
+                image_time = float(image_timestamp_s)
+                image_times = {key: image_time for key in self._image_keys}
+            anchor_time = image_times[self._anchor_image_key]
             state_time = float(state_timestamp_s)
-            if not np.isfinite(image_time) or not np.isfinite(state_time):
+            if (
+                not all(np.isfinite(value) for value in image_times.values())
+                or not np.isfinite(state_time)
+            ):
                 raise ValueError("observation timestamps must be finite")
             if (
                 not self._timed_wrenches
@@ -993,37 +1255,55 @@ class NeroInferencePipeline:
                 self._timed_wrenches.append((state_time, wrench_value))
             image_is_in_current_batch = (
                 self._open_loop_observation_start_s is None
-                or image_time + 1.0e-9 >= self._open_loop_observation_start_s
+                or anchor_time + 1.0e-9 >= self._open_loop_observation_start_s
             )
-            if (
-                image_is_in_current_batch
-                and (not self._timed_images or image_time > self._timed_images[-1][0])
-            ):
-                self._timed_images.append((image_time, chw_image))
+            if image_is_in_current_batch:
+                anchor_appended = False
+                for key, timed_images in self._timed_images_by_key.items():
+                    image_time = image_times[key]
+                    if not timed_images or image_time > timed_images[-1][0]:
+                        timed_images.append((image_time, chw_images[key]))
+                        anchor_appended = anchor_appended or key == self._anchor_image_key
                 step_s = self.observation_step_s
                 if (
-                    self._latest_policy_anchor_s is None
-                    or step_s is None
-                    or image_time - self._latest_policy_anchor_s >= step_s * 0.999
+                    anchor_appended
+                    and (
+                        self._latest_policy_anchor_s is None
+                        or step_s is None
+                        or anchor_time - self._latest_policy_anchor_s
+                        >= step_s * 0.999
+                    )
                 ):
-                    self._latest_policy_anchor_s = image_time
+                    self._latest_policy_anchor_s = anchor_time
             return
 
-        self._images.append(chw_image)
+        for key, images in self._images_by_key.items():
+            images.append(chw_images[key])
         self._wrenches.append(wrench_value)
         if not allow_backfill:
             # A pure open-loop batch must contain the checkpoint's actual
             # number of observations; never synthesize its prefix by repeating
             # the first frame.
             return
-        while len(self._images) < self._n_obs_steps:
-            self._images.appendleft(self._images[0].copy())
+        for images in self._images_by_key.values():
+            while len(images) < self._n_obs_steps:
+                images.appendleft(images[0].copy())
         while len(self._wrenches) < self._wrenches.maxlen:
             self._wrenches.appendleft(self._wrenches[0].copy())
 
-    def _observation_snapshot(self) -> tuple[np.ndarray, np.ndarray]:
+    def _observation_snapshot(
+        self,
+    ) -> tuple[np.ndarray | Mapping[str, np.ndarray], np.ndarray]:
+        images: np.ndarray | Mapping[str, np.ndarray]
+        if len(self._image_keys) == 1:
+            images = np.stack(tuple(self._images), axis=0)
+        else:
+            images = {
+                key: np.stack(tuple(self._images_by_key[key]), axis=0)
+                for key in self._image_keys
+            }
         return (
-            np.stack(tuple(self._images), axis=0),
+            images,
             np.stack(tuple(self._wrenches), axis=0).reshape(
                 self._n_obs_steps, self._wrench_history_steps, 6
             ),
@@ -1031,16 +1311,25 @@ class NeroInferencePipeline:
 
     def _observation_snapshot_for_dp(
         self,
-    ) -> tuple[np.ndarray, np.ndarray] | None:
+    ) -> tuple[np.ndarray | Mapping[str, np.ndarray], np.ndarray] | None:
         if self._timed_images:
             anchor_s = self._latest_policy_anchor_s
             if anchor_s is None or (
                 self._last_submitted_policy_anchor_s is not None
                 and anchor_s <= self._last_submitted_policy_anchor_s
             ):
+                self._note_dp_snapshot_pending("no new wrist image anchor")
                 return None
             if self.config.predictor.inference_mode == "open_loop":
-                if len(self._timed_images) < self._n_obs_steps:
+                if any(
+                    len(images) < self._n_obs_steps
+                    for images in self._timed_images_by_key.values()
+                ):
+                    self._note_dp_snapshot_pending(
+                        "camera history incomplete "
+                        f"required={self._n_obs_steps} "
+                        f"available={[len(images) for images in self._timed_images_by_key.values()]}"
+                    )
                     return None
                 step_s = self.observation_step_s or 0.1
                 if (
@@ -1048,37 +1337,54 @@ class NeroInferencePipeline:
                     and anchor_s - self._timed_images[0][0]
                     < (self._n_obs_steps - 1) * step_s * 0.999
                 ):
+                    self._note_dp_snapshot_pending(
+                        "wrist image history span is shorter than the DP grid"
+                    )
                     return None
-                wrench_step_s = step_s / max(self._wrench_history_steps, 1)
-                required_wrench_span_s = (
-                    (self._n_obs_steps - 1) * step_s
-                    + (self._wrench_history_steps - 1) * wrench_step_s
-                )
-                if (
-                    not self._timed_wrenches
-                    or anchor_s - self._timed_wrenches[0][0]
-                    < required_wrench_span_s * 0.999
-                ):
-                    return None
+                if self._uses_wrench_observation:
+                    wrench_step_s = step_s / max(self._wrench_history_steps, 1)
+                    required_wrench_span_s = (
+                        (self._n_obs_steps - 1) * step_s
+                        + (self._wrench_history_steps - 1) * wrench_step_s
+                    )
+                    if (
+                        not self._timed_wrenches
+                        or anchor_s - self._timed_wrenches[0][0]
+                        < required_wrench_span_s * 0.999
+                    ):
+                        self._note_dp_snapshot_pending(
+                            "wrench history span is shorter than the DP grid"
+                        )
+                        return None
             if self.config.predictor.inference_mode == "open_loop":
                 snapshot = self._timed_observation_snapshot_if_aligned(anchor_s)
                 if snapshot is None:
                     return None
             else:
                 snapshot = self._timed_observation_snapshot(anchor_s)
+                if snapshot is None:
+                    return None
+            self._dp_snapshot_pending_reason = None
             self._last_submitted_policy_anchor_s = anchor_s
             return snapshot
         if self.config.predictor.inference_mode == "open_loop" and (
-            len(self._images) < self._n_obs_steps
-            or len(self._wrenches) < self._wrenches.maxlen
+            any(
+                len(images) < self._n_obs_steps
+                for images in self._images_by_key.values()
+            )
+            or (
+                self._uses_wrench_observation
+                and len(self._wrenches) < self._wrenches.maxlen
+            )
         ):
+            self._note_dp_snapshot_pending("untimed observation history incomplete")
             return None
         return self._observation_snapshot()
 
     def _timed_observation_snapshot(
         self,
         anchor_s: float,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray | Mapping[str, np.ndarray], np.ndarray] | None:
         image_times = np.asarray(
             [timestamp for timestamp, _ in self._timed_images],
             dtype=np.float64,
@@ -1087,8 +1393,11 @@ class NeroInferencePipeline:
             [timestamp for timestamp, _ in self._timed_wrenches],
             dtype=np.float64,
         )
-        if image_times.size == 0 or wrench_times.size == 0:
-            raise RuntimeError("timed DP observation requires image and wrench samples")
+        if image_times.size == 0:
+            raise RuntimeError("timed DP observation requires image samples")
+        if self._uses_wrench_observation and wrench_times.size == 0:
+            self._note_dp_snapshot_pending("no wrench samples")
+            raise RuntimeError("timed force-aware DP observation requires wrench samples")
         image_step_s = self.observation_step_s
         if image_step_s is None:
             image_step_s = 0.1
@@ -1098,26 +1407,68 @@ class NeroInferencePipeline:
             dtype=np.float64,
         ) * image_step_s
         image_indices = _nearest_timestamp_indices(image_times, image_targets)
-        images = np.stack(
-            [self._timed_images[int(index)][1] for index in image_indices],
-            axis=0,
-        )
+        selected_image_times = image_times[image_indices]
+        image_indices_by_key = {self._anchor_image_key: image_indices}
+        for key in self._image_keys:
+            if key == self._anchor_image_key:
+                continue
+            key_times = np.asarray(
+                [timestamp for timestamp, _ in self._timed_images_by_key[key]],
+                dtype=np.float64,
+            )
+            if key_times.size == 0:
+                self._note_dp_snapshot_pending(f"no frames received for camera={key}")
+                return None
+            key_indices = _previous_timestamp_indices(key_times, selected_image_times)
+            if np.any(key_indices < 0):
+                self._note_dp_snapshot_pending(
+                    f"camera={key} has no frame at or before the wrist anchor"
+                )
+                return None
+            image_indices_by_key[key] = key_indices
+        if len(self._image_keys) == 1:
+            images: np.ndarray | Mapping[str, np.ndarray] = np.stack(
+                [self._timed_images[int(index)][1] for index in image_indices],
+                axis=0,
+            )
+        else:
+            images = {
+                key: np.stack(
+                    [
+                        self._timed_images_by_key[key][int(index)][1]
+                        for index in image_indices_by_key[key]
+                    ],
+                    axis=0,
+                )
+                for key in self._image_keys
+            }
+            self._log_camera_alignment_once(selected_image_times, image_indices_by_key)
 
-        wrench_step_s = image_step_s / max(self._wrench_history_steps, 1)
-        history_offsets = np.arange(
-            -(self._wrench_history_steps - 1),
-            1,
-            dtype=np.float64,
-        ) * wrench_step_s
-        wrench_targets = image_targets[:, None] + history_offsets[None, :]
-        wrench_indices = _nearest_timestamp_indices(
-            wrench_times,
-            wrench_targets.reshape(-1),
-        ).reshape(self._n_obs_steps, self._wrench_history_steps)
-        wrenches = np.stack(
-            [self._timed_wrenches[int(index)][1] for index in wrench_indices.reshape(-1)],
-            axis=0,
-        ).reshape(self._n_obs_steps, self._wrench_history_steps, 6)
+        if self._uses_wrench_observation:
+            wrench_step_s = image_step_s / max(self._wrench_history_steps, 1)
+            history_offsets = np.arange(
+                -(self._wrench_history_steps - 1),
+                1,
+                dtype=np.float64,
+            ) * wrench_step_s
+            wrench_targets = selected_image_times[:, None] + history_offsets[None, :]
+            wrench_indices = _previous_timestamp_indices(
+                wrench_times,
+                wrench_targets.reshape(-1),
+            ).reshape(self._n_obs_steps, self._wrench_history_steps)
+            if np.any(wrench_indices < 0):
+                return None
+            wrenches = np.stack(
+                [
+                    self._timed_wrenches[int(index)][1]
+                    for index in wrench_indices.reshape(-1)
+                ],
+                axis=0,
+            ).reshape(self._n_obs_steps, self._wrench_history_steps, 6)
+        else:
+            # Keep the private snapshot tuple shape stable for the direct-IK
+            # and asynchronous callers; pure visual policies ignore this value.
+            wrenches = np.zeros((self._n_obs_steps, 1, 6), dtype=np.float32)
         return images, wrenches
 
     def append_open_loop_can_observation(
@@ -1172,7 +1523,7 @@ class NeroInferencePipeline:
     def _timed_observation_snapshot_if_aligned(
         self,
         anchor_s: float,
-    ) -> tuple[np.ndarray, np.ndarray] | None:
+    ) -> tuple[np.ndarray | Mapping[str, np.ndarray], np.ndarray] | None:
         """Return a complete checkpoint batch only after image/CAN alignment."""
         image_times = np.asarray(
             [timestamp for timestamp, _ in self._timed_images], dtype=np.float64
@@ -1180,7 +1531,13 @@ class NeroInferencePipeline:
         can_times = np.asarray(
             [timestamp for timestamp, _ in self._timed_wrenches], dtype=np.float64
         )
-        if image_times.size < self._n_obs_steps or can_times.size == 0:
+        if image_times.size < self._n_obs_steps or (
+            self._uses_wrench_observation and can_times.size == 0
+        ):
+            self._note_dp_snapshot_pending(
+                "history unavailable "
+                f"wrist={image_times.size}/{self._n_obs_steps} can={can_times.size}"
+            )
             return None
         image_step_s = self.observation_step_s or 0.1
         nominal_image_times = anchor_s + np.arange(
@@ -1188,48 +1545,156 @@ class NeroInferencePipeline:
         ) * image_step_s
         image_indices = _nearest_timestamp_indices(image_times, nominal_image_times)
         if np.unique(image_indices).size != self._n_obs_steps:
+            self._note_dp_snapshot_pending("wrist image timestamps collapse to duplicate DP rows")
             return None
         selected_image_times = image_times[image_indices]
         if np.any(np.diff(selected_image_times) <= 0.0):
+            self._note_dp_snapshot_pending("wrist image timestamps are not increasing")
             return None
+        image_indices_by_key = {self._anchor_image_key: image_indices}
+        for key in self._image_keys:
+            if key == self._anchor_image_key:
+                continue
+            key_times = np.asarray(
+                [timestamp for timestamp, _ in self._timed_images_by_key[key]],
+                dtype=np.float64,
+            )
+            if key_times.size < self._n_obs_steps:
+                self._note_dp_snapshot_pending(
+                    f"camera={key} history={key_times.size}/{self._n_obs_steps}"
+                )
+                return None
+            key_indices = _previous_timestamp_indices(
+                key_times,
+                selected_image_times,
+            )
+            if np.any(key_indices < 0):
+                self._note_dp_snapshot_pending(
+                    f"camera={key} has no causal frame for a wrist row"
+                )
+                return None
+            if np.unique(key_indices).size != self._n_obs_steps:
+                self._note_dp_snapshot_pending(
+                    f"camera={key} causal rows contain duplicates"
+                )
+                return None
+            if np.any(np.diff(key_times[key_indices]) <= 0.0):
+                self._note_dp_snapshot_pending(
+                    f"camera={key} causal timestamps are not increasing"
+                )
+                return None
+            image_indices_by_key[key] = key_indices
+
+        if len(self._image_keys) > 1:
+            self._log_camera_alignment_once(selected_image_times, image_indices_by_key)
+
+        if not self._uses_wrench_observation:
+            if len(self._image_keys) == 1:
+                images: np.ndarray | Mapping[str, np.ndarray] = np.stack(
+                    [self._timed_images[int(index)][1] for index in image_indices],
+                    axis=0,
+                )
+            else:
+                images = {
+                    key: np.stack(
+                        [
+                            self._timed_images_by_key[key][int(index)][1]
+                            for index in image_indices_by_key[key]
+                        ],
+                        axis=0,
+                    )
+                    for key in self._image_keys
+                }
+            return images, np.zeros((self._n_obs_steps, 1, 6), dtype=np.float32)
 
         can_step_s = image_step_s / self._wrench_history_steps
         can_offsets = np.arange(
             -(self._wrench_history_steps - 1), 1, dtype=np.float64
         ) * can_step_s
         can_targets = selected_image_times[:, None] + can_offsets[None, :]
-        if (
-            can_times[0] > float(np.min(can_targets))
-            or can_times[-1] < float(np.max(can_targets))
-        ):
+        if can_times[0] > float(np.min(can_targets)):
+            self._note_dp_snapshot_pending(
+                "wrench history starts after the oldest DP target "
+                f"start={can_times[0]:.6f} target={float(np.min(can_targets)):.6f}"
+            )
             return None
-        can_indices = _nearest_timestamp_indices(
+        can_indices = _previous_timestamp_indices(
             can_times, can_targets.reshape(-1)
         ).reshape(self._n_obs_steps, self._wrench_history_steps)
-        if any(
-            np.unique(indices).size != self._wrench_history_steps
-            for indices in can_indices
-        ):
-            return None
-        if np.unique(can_indices).size != can_indices.size:
+        if np.any(can_indices < 0):
+            self._note_dp_snapshot_pending("wrench history has no causal row for a DP target")
             return None
         matched_can_times = can_times[can_indices]
-        if np.any(np.diff(matched_can_times, axis=1) <= 0.0):
+        # The state stream is nominally faster than the image grid, but a
+        # slower tau_ext tick may leave two targets sharing the latest state.
+        # That is still a valid latest-state snapshot; only a future sample is
+        # forbidden by _previous_timestamp_indices.
+        if np.any(np.diff(matched_can_times, axis=1) < 0.0):
+            self._note_dp_snapshot_pending("wrench causal timestamps move backwards")
             return None
-        gaps = np.abs(matched_can_times - can_targets)
-        if np.any(
-            gaps > self.config.runtime.maximum_observation_alignment_gap_s
-        ):
+        # Training uses the latest CAN row at or before each wrist-camera
+        # anchor.  A positive age is expected; only reject a state that is too
+        # old to be a valid snapshot under the runtime contract.
+        gaps = can_targets - matched_can_times
+        if np.any(gaps > self.config.runtime.maximum_observation_alignment_gap_s):
+            self._note_dp_snapshot_pending(
+                "wrench state is too old "
+                f"max_age={float(np.max(gaps) * 1.0e3):.2f}ms "
+                f"limit={self.config.runtime.maximum_observation_alignment_gap_s * 1.0e3:.2f}ms"
+            )
             return None
 
-        images = np.stack(
-            [self._timed_images[int(index)][1] for index in image_indices], axis=0
-        )
+        if len(self._image_keys) == 1:
+            images: np.ndarray | Mapping[str, np.ndarray] = np.stack(
+                [self._timed_images[int(index)][1] for index in image_indices],
+                axis=0,
+            )
+        else:
+            images = {
+                key: np.stack(
+                    [
+                        self._timed_images_by_key[key][int(index)][1]
+                        for index in image_indices_by_key[key]
+                    ],
+                    axis=0,
+                )
+                for key in self._image_keys
+            }
         can_values = np.stack(
             [self._timed_wrenches[int(index)][1] for index in can_indices.reshape(-1)],
             axis=0,
         ).reshape(self._n_obs_steps, self._wrench_history_steps, 6)
         return images, can_values
+
+    def _log_camera_alignment_once(
+        self,
+        anchor_times: np.ndarray,
+        image_indices_by_key: Mapping[str, np.ndarray],
+    ) -> None:
+        if self._camera_alignment_logged:
+            return
+        age_descriptions = []
+        for key in self._image_keys:
+            if key == self._anchor_image_key:
+                continue
+            key_times = np.asarray(
+                [timestamp for timestamp, _ in self._timed_images_by_key[key]],
+                dtype=np.float64,
+            )
+            selected_times = key_times[image_indices_by_key[key]]
+            median_age_ms = float(np.median(anchor_times - selected_times) * 1.0e3)
+            age_descriptions.append(f"{key}={median_age_ms:.3f}ms")
+        log.info(
+            "DP camera alignment anchor=%s resample=causal_previous median_age=%s",
+            self._anchor_image_key,
+            ",".join(age_descriptions),
+        )
+        self._camera_alignment_logged = True
+
+    def _note_dp_snapshot_pending(self, reason: str) -> None:
+        if reason != self._dp_snapshot_pending_reason:
+            log.info("DP observation pending: %s", reason)
+        self._dp_snapshot_pending_reason = reason
 
     def _append_world_model_observation(self, sample: InferenceInput) -> None:
         self._append_world_model_observation_values(
@@ -1318,18 +1783,34 @@ class NeroInferencePipeline:
                 history.appendleft(history[0].copy())
 
     def _predict_action(
-        self, images: np.ndarray, wrench: np.ndarray
+        self, images: np.ndarray | Mapping[str, np.ndarray], wrench: np.ndarray
     ) -> _DPPrediction:
         import torch
 
-        started_s = perf_counter()
         device = _model_device(self.dp)
-        obs = {
-            self._image_key: torch.from_numpy(images[None]).to(device),
-            self._wrench_key: torch.from_numpy(wrench[None]).to(device),
-        }
+        if isinstance(images, Mapping):
+            obs = {
+                str(key): torch.from_numpy(np.asarray(value)[None]).to(device)
+                for key, value in images.items()
+            }
+        else:
+            if self._image_key is None:
+                raise ValueError(
+                    "multi-camera DP requires image observations keyed by camera name"
+                )
+            obs = {
+                self._image_key: torch.from_numpy(images[None]).to(device),
+            }
+        if self._uses_wrench_observation:
+            assert self._wrench_key is not None
+            obs[self._wrench_key] = torch.from_numpy(wrench[None]).to(device)
+        _synchronize_model(self.dp)
+        started_s = perf_counter()
         with torch.inference_mode():
             output = self.dp.predict_action(obs)
+        _synchronize_model(self.dp)
+        elapsed_s = perf_counter() - started_s
+        self._record_dp_inference_timing(elapsed_s)
         if not isinstance(output, Mapping) or "action_target" not in output:
             raise RuntimeError("DP predict_action must return action_target")
         action_target = _numpy_vector(
@@ -1339,17 +1820,42 @@ class NeroInferencePipeline:
         )
         raw_action_chunk = _numpy_action_chunk(
             output.get("action", output["action_target"]),
+            require_quaternion=self._dp_action_type == "eepose",
         )
         action_chunk = _dp_execution_action_chunk(
             raw_action_chunk,
             model_horizon=getattr(self.dp, "horizon", None),
+            action_type=self._dp_action_type,
         )
         return _DPPrediction(
             action_target=action_target,
             raw_action_chunk=raw_action_chunk,
             action_chunk=action_chunk,
-            elapsed_s=perf_counter() - started_s,
+            elapsed_s=elapsed_s,
         )
+
+    def _record_dp_inference_timing(self, elapsed_s: float) -> None:
+        elapsed_s = float(elapsed_s)
+        self._last_dp_inference_time_s = elapsed_s
+        self._timing_dp_call_count += 1
+        if self.config.timing.enabled:
+            log.info(
+                "[model timing] DP loop=%d elapsed=%.3f ms",
+                self._timing_dp_call_count,
+                elapsed_s * 1.0e3,
+            )
+
+    def _record_wm_inference_timing(self, elapsed_s: float) -> None:
+        elapsed_s = float(elapsed_s)
+        self._last_wm_inference_time_s = elapsed_s
+        self._timing_wm_s.append(elapsed_s)
+        self._timing_wm_call_count += 1
+        if self.config.timing.enabled:
+            log.info(
+                "[model timing] WM loop=%d elapsed=%.3f ms",
+                self._timing_wm_call_count,
+                elapsed_s * 1.0e3,
+            )
 
     def _report_timing(self, latest_cycle_s: float) -> None:
         timing = self.config.timing
@@ -1366,12 +1872,21 @@ class NeroInferencePipeline:
         ik_ms = 1.0e3 * self._timing_ik_s / cycles
         if self._timing_dp_s:
             dp_text = f"{1.0e3 * np.mean(self._timing_dp_s):.2f} ms"
+        elif self._dp_future is not None:
+            dp_text = "running"
+        elif self._dp_snapshot_pending_reason is not None:
+            dp_text = f"pending[{self._dp_snapshot_pending_reason}]"
         else:
             dp_text = "pending"
+        if self._timing_wm_s:
+            wm_text = f"{1.0e3 * np.mean(self._timing_wm_s):.2f} ms"
+        else:
+            wm_text = "pending"
         backend_text = (
             f"IK_avg={ik_ms:.2f} ms"
             if not self._predictor_enabled
-            else f"PINN_avg={pinn_ms:.2f} ms OSC-QP_avg={qp_ms:.2f} ms"
+            else f"WM_avg={wm_text} PINN_stage_avg={pinn_ms:.2f} ms "
+            f"OSC-QP_avg={qp_ms:.2f} ms"
         )
         print(
             "[inference timing] "
@@ -1390,6 +1905,9 @@ class NeroInferencePipeline:
         self._timing_qp_s = 0.0
         self._timing_ik_s = 0.0
         self._timing_dp_s = []
+        self._timing_wm_s = []
+        self._timing_dp_call_count = 0
+        self._timing_wm_call_count = 0
 
     def _predict_wrenches(
         self,
@@ -1418,6 +1936,7 @@ class NeroInferencePipeline:
         import torch
 
         device = _model_device(self.pinn)
+        wm_action = self._actions_for_wm(self._action[None])[0]
         values = {
             "q": sample.q,
             "v": sample.dq,
@@ -1425,10 +1944,10 @@ class NeroInferencePipeline:
             "a": sample.ddq,
             "ddq": sample.ddq,
             "tau": sample.tau,
-            "action": self._action,
-            "action_target": self._action,
-            "u": self._action,
-            "ee_pose": self._action,
+            "action": wm_action,
+            "action_target": wm_action,
+            "u": wm_action,
+            "ee_pose": wm_action,
             "wrench_ext": sample.wrench_ext,
         }
         active_inputs = tuple(getattr(self.pinn, "active_inputs", values.keys()))
@@ -1442,8 +1961,12 @@ class NeroInferencePipeline:
             )[None]
             inputs[key] = self._normalize_pinn_input(key, value)
         self._add_action_condition(inputs, device, current_action_pose)
+        _synchronize_model(self.pinn)
+        wm_started_s = perf_counter()
         with torch.inference_mode():
             output, state = call_pinn(self.pinn, inputs, self._pinn_state)
+        _synchronize_model(self.pinn)
+        self._record_wm_inference_timing(perf_counter() - wm_started_s)
         self._pinn_state = (
             self.pinn.detach_recurrent_state(state)
             if hasattr(self.pinn, "detach_recurrent_state")
@@ -1472,8 +1995,12 @@ class NeroInferencePipeline:
             for key, value in history.items()
         }
         self._add_action_condition(inputs, device, current_action_pose)
+        _synchronize_model(self.pinn)
+        wm_started_s = perf_counter()
         with torch.inference_mode():
             output = self.pinn.predict(inputs)
+        _synchronize_model(self.pinn)
+        self._record_wm_inference_timing(perf_counter() - wm_started_s)
         if not isinstance(output, Mapping) or not isinstance(
             output.get("state_pred"), Mapping
         ):
@@ -1603,7 +2130,9 @@ class NeroInferencePipeline:
             future_action = _fit_action_horizon(
                 self._action_chunk,
                 self._pinn_future_horizon,
+                require_quaternion=self._dp_action_type == "eepose",
             )
+        future_action = self._actions_for_wm(future_action)
         future_tensor = torch.as_tensor(
             future_action,
             dtype=torch.float32,
@@ -1710,6 +2239,50 @@ class NeroInferencePipeline:
             dtype=np.float64,
         )
 
+    def _actions_for_wm(self, actions: np.ndarray) -> np.ndarray:
+        """Return DP actions as absolute ee poses for predictor conditioning."""
+        values = _numpy_action_chunk(
+            actions, require_quaternion=self._dp_action_type == "eepose"
+        )
+        if self._dp_action_type == "eepose":
+            return values.copy()
+        frame_pose = getattr(self.controller.model, "frame_pose", None)
+        poses = []
+        for q in values:
+            if callable(frame_pose):
+                pose = frame_pose(q, self._action_frame_name)
+            elif self._action_frame_name == self._control_frame_name:
+                pose = self.controller.model.snapshot(q, np.zeros(7)).pose
+            else:
+                raise RuntimeError(
+                    "joint DP action requires dynamics model.frame_pose() when the "
+                    "WM action frame differs from the control frame"
+                )
+            poses.append(_pose_to_action(np.asarray(pose, dtype=np.float64)))
+        return np.stack(poses, axis=0)
+
+    def _current_wm_pose(
+        self,
+        q: np.ndarray,
+        current_action_pose: np.ndarray,
+        current_control_pose: np.ndarray,
+    ) -> np.ndarray:
+        """Return current_ee_pose in the exact frame used during WM training."""
+        if self._wm_current_frame_name == self._action_frame_name:
+            return current_action_pose.copy()
+        if self._wm_current_frame_name == self._control_frame_name:
+            return current_control_pose.copy()
+        frame_pose = getattr(self.controller.model, "frame_pose", None)
+        if not callable(frame_pose):
+            raise RuntimeError(
+                "WM current EE frame differs from action/control frames, but the "
+                "dynamics model does not expose frame_pose()"
+            )
+        return np.asarray(
+            frame_pose(q, self._wm_current_frame_name),
+            dtype=np.float64,
+        )
+
     def _action_poses_to_control(
         self,
         action_poses: np.ndarray,
@@ -1781,11 +2354,26 @@ class NeroInferencePipeline:
             _numpy_vector(getattr(sample, name), size, name)
         if not np.isfinite(sample.timestamp_s):
             raise ValueError("timestamp_s must be finite")
-        if (
-            sample.image_timestamp_s is not None
-            and not np.isfinite(sample.image_timestamp_s)
-        ):
-            raise ValueError("image_timestamp_s must be finite when provided")
+        image_timestamp_s = sample.image_timestamp_s
+        if isinstance(image_timestamp_s, Mapping):
+            try:
+                timestamps_are_valid = all(
+                    isinstance(key, str) and np.isfinite(float(value))
+                    for key, value in image_timestamp_s.items()
+                )
+            except (TypeError, ValueError):
+                timestamps_are_valid = False
+            if not timestamps_are_valid:
+                raise ValueError(
+                    "image_timestamp_s values must be finite and keyed by camera name"
+                )
+        elif image_timestamp_s is not None:
+            try:
+                timestamp_is_finite = np.isfinite(float(image_timestamp_s))
+            except (TypeError, ValueError):
+                timestamp_is_finite = False
+            if not timestamp_is_finite:
+                raise ValueError("image_timestamp_s must be finite when provided")
         if sample.wrench_to_control_rotation is not None:
             rotation = np.asarray(sample.wrench_to_control_rotation, dtype=np.float64)
             if rotation.shape != (3, 3) or not np.all(np.isfinite(rotation)):
@@ -1812,6 +2400,17 @@ def _dp_model_overrides(config: InferenceConfig) -> dict[str, Any]:
     return overrides
 
 
+def _uses_link7_target_gripper_tcp_current_contract(
+    config: InferenceConfig,
+) -> bool:
+    checkpoint = config.pinn_checkpoint
+    return (
+        checkpoint is not None
+        and checkpoint.path.resolve()
+        == _LINK7_TARGET_GRIPPER_TCP_CURRENT_CHECKPOINT
+    )
+
+
 def _model_device(model: Any) -> Any:
     import torch
 
@@ -1819,6 +2418,15 @@ def _model_device(model: Any) -> Any:
         return next(model.parameters()).device
     except (AttributeError, StopIteration):
         return torch.device("cpu")
+
+
+def _synchronize_model(model: Any) -> None:
+    """Synchronize CUDA around a model forward for an accurate wall-clock sample."""
+    import torch
+
+    device = _model_device(model)
+    if getattr(device, "type", None) == "cuda":
+        torch.cuda.synchronize(device)
 
 
 def _numpy_vector(value: Any, size: int, name: str) -> np.ndarray:
@@ -1848,7 +2456,9 @@ def _numpy_wrench_trajectory(value: Any) -> np.ndarray:
     return result
 
 
-def _numpy_action_chunk(value: Any) -> np.ndarray:
+def _numpy_action_chunk(
+    value: Any, *, require_quaternion: bool = True
+) -> np.ndarray:
     if hasattr(value, "detach"):
         value = value.detach().cpu().numpy()
     result = np.asarray(value, dtype=np.float64)
@@ -1862,9 +2472,10 @@ def _numpy_action_chunk(value: Any) -> np.ndarray:
         raise ValueError(
             f"DP future action must have shape [T,7] or [1,T,7], got {result.shape}"
         )
-    for action in result:
-        if np.linalg.norm(action[3:]) < 1.0e-8:
-            raise ValueError("DP future action contains a zero quaternion")
+    if require_quaternion:
+        for action in result:
+            if np.linalg.norm(action[3:]) < 1.0e-8:
+                raise ValueError("DP future action contains a zero quaternion")
     return result
 
 
@@ -1883,6 +2494,23 @@ def _nearest_timestamp_indices(
     return np.where(choose_right, right, left).astype(np.int64)
 
 
+def _previous_timestamp_indices(
+    sorted_timestamps: np.ndarray,
+    targets: np.ndarray,
+) -> np.ndarray:
+    """Select the latest source sample not newer than each target."""
+    source = np.asarray(sorted_timestamps, dtype=np.float64).reshape(-1)
+    values = np.asarray(targets, dtype=np.float64).reshape(-1)
+    if source.size == 0 or np.any(np.diff(source) <= 0.0):
+        raise ValueError("observation timestamps must be non-empty and increasing")
+    # Camera/CAN timestamps originate from integer microseconds but are stored
+    # as seconds, so tolerate one microsecond of floating-point roundoff when a
+    # target is exactly on a source tick.
+    return (
+        np.searchsorted(source, values + 1.0e-9, side="right") - 1
+    ).astype(np.int64)
+
+
 def _fit_horizon(wrenches: np.ndarray, horizon: int) -> np.ndarray:
     if len(wrenches) >= horizon:
         return wrenches[:horizon].copy()
@@ -1890,10 +2518,17 @@ def _fit_horizon(wrenches: np.ndarray, horizon: int) -> np.ndarray:
     return np.concatenate((wrenches, padding), axis=0)
 
 
-def _fit_action_horizon(actions: np.ndarray, horizon: int) -> np.ndarray:
+def _fit_action_horizon(
+    actions: np.ndarray,
+    horizon: int,
+    *,
+    require_quaternion: bool = True,
+) -> np.ndarray:
     if horizon < 1:
         raise ValueError("action horizon must be positive")
-    values = _numpy_action_chunk(actions)
+    values = _numpy_action_chunk(
+        actions, require_quaternion=require_quaternion
+    )
     if len(values) >= horizon:
         return values[:horizon].copy()
     padding = np.repeat(values[-1:], horizon - len(values), axis=0)
@@ -1952,6 +2587,21 @@ def _minimum_jerk_action_plan(
     return np.concatenate((position, quaternion), axis=1)
 
 
+def _minimum_jerk_joint_plan(
+    start_q: np.ndarray,
+    target_q: np.ndarray,
+    steps: int,
+) -> np.ndarray:
+    """Generate a C2 minimum-jerk trajectory between two joint targets."""
+    if not isinstance(steps, int) or isinstance(steps, bool) or steps < 1:
+        raise ValueError("minimum-jerk trajectory steps must be a positive integer")
+    start = _numpy_vector(start_q, 7, "minimum-jerk joint start")
+    target = _numpy_vector(target_q, 7, "minimum-jerk joint target")
+    progress = np.linspace(0.0, 1.0, steps + 1, dtype=np.float64)
+    time_scale = 10.0 * progress**3 - 15.0 * progress**4 + 6.0 * progress**5
+    return start + time_scale[:, None] * (target - start)
+
+
 def _mean_pose_chunk(actions: np.ndarray) -> np.ndarray:
     values = _numpy_action_chunk(actions)
     position = values[:, :3].mean(axis=0)
@@ -1970,6 +2620,7 @@ def _dp_execution_action_chunk(
     actions: np.ndarray,
     *,
     model_horizon: Any = None,
+    action_type: str = "eepose",
 ) -> np.ndarray:
     """Reduce the current DP's 8x8 high-rate output to seven row targets.
 
@@ -1978,7 +2629,9 @@ def _dp_execution_action_chunk(
     then discard row zero to preserve the previous DP execution convention.
     Legacy checkpoints with a non-64 horizon keep their existing action chunk.
     """
-    values = _numpy_action_chunk(actions)
+    values = _numpy_action_chunk(
+        actions, require_quaternion=action_type == "eepose"
+    )
     try:
         horizon = int(model_horizon)
     except (TypeError, ValueError):
@@ -1991,16 +2644,28 @@ def _dp_execution_action_chunk(
             f"got {values.shape}"
         )
     rows = values.reshape(8, 8, 7)
-    row_targets = np.stack([_mean_pose_chunk(row) for row in rows], axis=0)
+    row_targets = np.stack(
+        [
+            _mean_pose_chunk(row)
+            if action_type == "eepose"
+            else row.mean(axis=0)
+            for row in rows
+        ],
+        axis=0,
+    )
     return row_targets[1:].copy()
 
 
-def _select_action_chunk(actions: np.ndarray, mode: str) -> np.ndarray:
-    values = _numpy_action_chunk(actions)
+def _select_action_chunk(
+    actions: np.ndarray, mode: str, *, action_type: str = "eepose"
+) -> np.ndarray:
+    values = _numpy_action_chunk(
+        actions, require_quaternion=action_type == "eepose"
+    )
     if mode == "first":
         return values[0].copy()
     if mode == "mean":
-        return _mean_pose_chunk(values)
+        return _mean_pose_chunk(values) if action_type == "eepose" else values.mean(axis=0)
     if mode == "last":
         return values[-1].copy()
     if mode == "middle":

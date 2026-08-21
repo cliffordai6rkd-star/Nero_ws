@@ -13,8 +13,9 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from nero_collection.config import load_config
-from nero_collection.contact_wrench import (
+from inference.wrench_mapping import (
     PinocchioContactWrenchEstimator,
+    WrenchMappingConfig,
     wrench_ext_dataset_attrs,
 )
 
@@ -48,7 +49,7 @@ def parse_args() -> argparse.Namespace:
         "--config",
         type=Path,
         default=ROOT / "configs" / "master_slave_can.yaml",
-        help="Collection config supplying URDF and wrench mapping settings",
+        help="Collection config supplying the inverse-dynamics URDF",
     )
     parser.add_argument(
         "--recursive",
@@ -199,7 +200,12 @@ def main() -> int:
     if not files:
         raise RuntimeError("No episode H5 files were found")
     config = load_config(args.config.expanduser().resolve())
-    mapping_config = config.realtime_plot.wrench_mapping
+    inverse_config = config.tau_ext_inference.inverse_dynamics
+    mapping_config = WrenchMappingConfig(
+        urdf_path=inverse_config.urdf_path,
+        locked_joint_names=inverse_config.locked_joint_names,
+        gravity_m_s2=inverse_config.gravity_m_s2,
+    )
     attrs = wrench_ext_dataset_attrs(mapping_config)
     estimator = None
     written = 0

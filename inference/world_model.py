@@ -4,11 +4,12 @@ from typing import Mapping
 
 import numpy as np
 
-from nero_collection.config import CollectionConfig, load_config
-from nero_collection.contact_wrench import (
+from inference.wrench_mapping import (
     PinocchioContactWrenchEstimator,
-    PinocchioJointTorqueResidualEstimator,
+    WrenchMappingConfig,
 )
+from nero_collection.config import CollectionConfig, load_config
+from nero_collection.inverse_dynamics import PinocchioJointTorqueResidualEstimator
 from nero_collection.tau_ext_inference import SequenceTorquePredictor
 
 
@@ -37,12 +38,20 @@ class WorldModelWrenchAdapter:
         self.inverse_dynamics = (
             inverse_dynamics
             or PinocchioJointTorqueResidualEstimator(
-                collection.realtime_plot.inverse_dynamics
+                collection.tau_ext_inference.inverse_dynamics
             )
         )
-        self.wrench_mapper = wrench_mapper or PinocchioContactWrenchEstimator(
-            collection.realtime_plot.wrench_mapping
-        )
+        if wrench_mapper is None:
+            inverse_config = collection.tau_ext_inference.inverse_dynamics
+            wrench_mapper = PinocchioContactWrenchEstimator(
+                WrenchMappingConfig(
+                    urdf_path=inverse_config.urdf_path,
+                    delay_s=0.0,
+                    locked_joint_names=inverse_config.locked_joint_names,
+                    gravity_m_s2=inverse_config.gravity_m_s2,
+                )
+            )
+        self.wrench_mapper = wrench_mapper
 
     @classmethod
     def from_collection_config(cls, path):

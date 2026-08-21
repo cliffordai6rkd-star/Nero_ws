@@ -26,6 +26,11 @@ def main() -> None:
     parser.add_argument("--backend", choices=("pyagxarm", "mock"), default=None)
     parser.add_argument("--duration", type=float, default=None)
     parser.add_argument(
+        "--single-step",
+        action="store_true",
+        help="start paused; press s for exactly one inference/control cycle, c to resume",
+    )
+    parser.add_argument(
         "--enable-command",
         action="store_true",
         help="send torque or direct-IK joint commands; otherwise inference is read-only",
@@ -76,6 +81,7 @@ def main() -> None:
                     "pinn": None if pinn is None else type(pinn).__qualname__,
                     "predictor_enabled": config.predictor.enabled,
                     "predictor_mode": config.predictor.mode,
+                    "execution_mode": config.execution.mode,
                     "inference_mode": config.predictor.inference_mode,
                     "action_chunk_mode": config.predictor.action_chunk_mode,
                     "action_step_s": config.predictor.action_step_s,
@@ -114,13 +120,18 @@ def main() -> None:
     mode_text = "COMMAND ENABLED" if args.enable_command else "read-only"
     print(
         f"Starting Nero inference ({mode_text}). "
-        "Press i to reset/start the next episode; press q or Ctrl-C to "
-        "reset and exit.",
+        "Press s for one inference cycle (pauses after it), c to resume "
+        "continuous inference, i to reset/start the next episode, or q/Ctrl-C "
+        "to reset and exit.",
         flush=True,
     )
     try:
         with TerminalKeys() as keys:
-            cycles = runtime.run(args.duration, read_key=keys.read_key)
+            cycles = runtime.run(
+                args.duration,
+                read_key=keys.read_key,
+                single_step=args.single_step,
+            )
     except KeyboardInterrupt:
         # Covers interrupts raised before NeroInferenceRuntime.run() takes
         # ownership. Interrupts during the control loop are reset there.

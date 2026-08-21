@@ -8,7 +8,7 @@ import numpy as np
 
 from nero_collection.arms.base import ArmState
 from nero_collection.config import BilateralMitConfig, InverseDynamicsConfig
-from nero_collection.contact_wrench import PinocchioJointTorqueResidualEstimator
+from nero_collection.inverse_dynamics import PinocchioJointTorqueResidualEstimator
 from nero_collection.filters import OnePoleLowPass
 
 

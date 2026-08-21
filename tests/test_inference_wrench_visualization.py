@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from collections import deque
-
 import numpy as np
 import pytest
 
@@ -67,15 +65,17 @@ def test_visualization_gate_zeros_all_wrench_components_below_threshold() -> Non
     runtime = object.__new__(NeroInferenceRuntime)
     runtime._dp_contact_threshold_n = 0.6
     runtime._dp_contact_force_dims = (0, 1, 2)
-    runtime._dp_contact_history_reducer = "mean"
-    runtime._dp_contact_history = deque(maxlen=2)
 
     above = runtime._apply_dp_contact_gate_for_visualization(
         np.asarray([1.0, 0.0, 0.0, 4.0, 5.0, 6.0])
+    )
+    equal = runtime._apply_dp_contact_gate_for_visualization(
+        np.asarray([0.6, 0.0, 0.0, 4.0, 5.0, 6.0])
     )
     below = runtime._apply_dp_contact_gate_for_visualization(
         np.asarray([0.2, 0.0, 0.0, 4.0, 5.0, 6.0])
     )
 
     np.testing.assert_allclose(above, [1.0, 0.0, 0.0, 4.0, 5.0, 6.0])
+    np.testing.assert_allclose(equal, np.zeros(6))
     np.testing.assert_allclose(below, np.zeros(6))

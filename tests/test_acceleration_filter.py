@@ -252,7 +252,7 @@ def test_episode_save_preserves_raw_aligned_state_and_torque(
 
     with h5py.File(output, "r") as h5:
         teleop = h5["teleop"]
-        assert h5.attrs["format"] == "factr_multimodal_episode/v11"
+        assert h5.attrs["format"] == "factr_multimodal_episode/v12"
         assert np.allclose(teleop["dq_follower"][:], 0.0)
         assert "ddq_follower" not in teleop
         assert "dq_follower_firmware_raw" not in teleop

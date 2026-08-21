@@ -63,7 +63,7 @@ class MasterSlaveTeleop:
                 rest_q_follower=_rest_q(pair.follower.rest_q),
                 controller=BilateralJointController(
                     config.teleop.command.bilateral_mit,
-                    config.realtime_plot.inverse_dynamics,
+                    config.tau_ext_inference.inverse_dynamics,
                 ),
             )
             for pair in config.teleop.master_slave
@@ -82,9 +82,10 @@ class MasterSlaveTeleop:
         self.online_tau_ext = (
             OnlineTauExtInference(
                 config.tau_ext_inference,
-                config.realtime_plot.inverse_dynamics,
+                config.tau_ext_inference.inverse_dynamics,
                 config.dynamics_processing,
                 config.robot_states,
+                source_sample_rate_hz=config.teleop.command.sample_rate_hz,
             )
             if inference_enabled
             else None

@@ -36,6 +36,20 @@ class PredictorConfig:
 
 
 @dataclass(frozen=True)
+class ExecutionConfig:
+    """How a q/tau world-model prediction is sent to the arm."""
+
+    # ``osc_qp`` preserves the historical predictor -> OSC-QP path.
+    mode: str = "osc_qp"
+    mit_kp: float | tuple[float, ...] = (0.0,) * 7
+    mit_kd: float | tuple[float, ...] = (0.0,) * 7
+    # Optional clamps applied only to the reconstructed MIT velocity target
+    # and the feedback contribution.  A scalar broadcasts to all joints.
+    mit_velocity_limit: float | tuple[float, ...] = 5.0
+    mit_feedback_torque_limit: float | tuple[float, ...] | None = None
+
+
+@dataclass(frozen=True)
 class IKConfig:
     max_iterations: int = 100
     position_tolerance_m: float = 1.0e-4
@@ -50,6 +64,7 @@ class IKConfig:
 class DPSamplingConfig:
     method: str = "ddim"
     num_inference_steps: int = 8
+    use_tau_ext_observation: bool = True
 
 
 @dataclass(frozen=True)
@@ -123,6 +138,9 @@ class InferenceConfig:
     dp_checkpoint: CheckpointConfig
     robot: RobotConfig
     runtime: RuntimeConfig
+    # Semantic contract of each seven-dimensional DP action.
+    # ``eepose`` is [x,y,z,qx,qy,qz,qw]; ``joint`` is absolute arm q.
+    action: str = "eepose"
     pinn_checkpoint: CheckpointConfig | None = None
     dp_sampling: DPSamplingConfig = field(default_factory=DPSamplingConfig)
     ik: IKConfig = field(default_factory=IKConfig)
@@ -137,6 +155,7 @@ class InferenceConfig:
         default_factory=WrenchVisualizationConfig
     )
     osc_qp: OSCQPConfig = field(default_factory=OSCQPConfig)
+    execution: ExecutionConfig = field(default_factory=ExecutionConfig)
 
 
 T = TypeVar("T")
@@ -152,6 +171,9 @@ def load_inference_config(path: str | Path) -> InferenceConfig:
     _reject_unknown(raw, InferenceConfig, "config")
     base = config_path.parent
     dp = _checkpoint(raw.get("dp_checkpoint"), base, "dp_checkpoint")
+    action = str(raw.get("action", "eepose")).strip().lower().replace("-", "_")
+    if action not in {"eepose", "joint"}:
+        raise ValueError("action must be 'eepose' or 'joint'")
     dp_sampling = _dataclass_from_mapping(
         DPSamplingConfig,
         raw.get("dp_sampling", {}),
@@ -166,9 +188,12 @@ def load_inference_config(path: str | Path) -> InferenceConfig:
         or dp_sampling.num_inference_steps < 1
     ):
         raise ValueError("dp_sampling.num_inference_steps must be positive")
+    if not isinstance(dp_sampling.use_tau_ext_observation, bool):
+        raise ValueError("dp_sampling.use_tau_ext_observation must be a boolean")
     dp_sampling = DPSamplingConfig(
         method=sampling_method,
         num_inference_steps=int(dp_sampling.num_inference_steps),
+        use_tau_ext_observation=dp_sampling.use_tau_ext_observation,
     )
     predictor = _dataclass_from_mapping(
         PredictorConfig,
@@ -178,16 +203,23 @@ def load_inference_config(path: str | Path) -> InferenceConfig:
     if not isinstance(predictor.enabled, bool):
         raise ValueError("predictor.enabled must be a boolean")
     predictor_mode = predictor.mode.strip().lower()
-    # if predictor_mode not in {
-    #     "wrench_gru",
-    #     "world_model_v3",
-    #     "world_model_v4",
-    #     "world_model_v5",
-    # }:
-    #     raise ValueError(
-    #         "predictor.mode must be 'wrench_gru', 'world_model_v3', "
-    #         "'world_model_v4', or 'world_model_v5'"
-    #     )
+    if predictor_mode == "world_model":
+        predictor_mode = "world_model_v5"
+    if predictor_mode not in {
+        "wrench_gru",
+        "world_model_v3",
+        "world_model_v4",
+        "world_model_v5",
+        "contact_world_model",
+        "contact_world_model_opd",
+        "contact_wm",
+        "contact_wm_opd",
+    }:
+        raise ValueError(
+            "predictor.mode must be 'wrench_gru', 'world_model_v3', "
+            "'world_model_v4', 'world_model_v5', 'contact_world_model', "
+            "or 'contact_world_model_opd'"
+        )
     inference_mode = predictor.inference_mode.strip().lower().replace("-", "_")
     if inference_mode == "async":
         inference_mode = "asynchronous"
@@ -259,6 +291,69 @@ def load_inference_config(path: str | Path) -> InferenceConfig:
         action_execution_mode=action_execution_mode,
         action_interpolation_duration_s=action_interpolation_duration_s,
         action_interpolation_steps=action_interpolation_steps,
+    )
+    execution = _dataclass_from_mapping(
+        ExecutionConfig,
+        raw.get("execution", {}),
+        "execution",
+    )
+    execution_mode = execution.mode.strip().lower().replace("-", "_")
+    if execution_mode not in {"mit", "osc_qp", "q", "tau"}:
+        raise ValueError("execution.mode must be one of 'mit', 'osc_qp', 'q', or 'tau'")
+    kp_array = np.asarray(execution.mit_kp, dtype=np.float64)
+    kd_array = np.asarray(execution.mit_kd, dtype=np.float64)
+    if kp_array.ndim == 0:
+        kp_array = np.repeat(kp_array, 7)
+    else:
+        kp_array = kp_array.reshape(-1)
+    if kd_array.ndim == 0:
+        kd_array = np.repeat(kd_array, 7)
+    else:
+        kd_array = kd_array.reshape(-1)
+    if kp_array.shape != (7,) or kd_array.shape != (7,):
+        raise ValueError("execution.mit_kp and execution.mit_kd must contain seven values")
+    mit_kp = tuple(float(value) for value in kp_array)
+    mit_kd = tuple(float(value) for value in kd_array)
+    velocity_limit = np.asarray(execution.mit_velocity_limit, dtype=np.float64)
+    if velocity_limit.ndim == 0:
+        velocity_limit = np.repeat(velocity_limit, 7)
+    else:
+        velocity_limit = velocity_limit.reshape(-1)
+    if (
+        velocity_limit.shape != (7,)
+        or not np.isfinite(velocity_limit).all()
+        or np.any(velocity_limit <= 0.0)
+    ):
+        raise ValueError("execution.mit_velocity_limit must be positive and finite")
+    feedback_limit = execution.mit_feedback_torque_limit
+    if feedback_limit is not None:
+        feedback_limit_array = np.asarray(feedback_limit, dtype=np.float64)
+        if feedback_limit_array.ndim == 0:
+            feedback_limit_array = np.repeat(feedback_limit_array, 7)
+        else:
+            feedback_limit_array = feedback_limit_array.reshape(-1)
+        if (
+            feedback_limit_array.shape != (7,)
+            or not np.isfinite(feedback_limit_array).all()
+            or np.any(feedback_limit_array <= 0.0)
+        ):
+            raise ValueError(
+                "execution.mit_feedback_torque_limit must be positive and finite or null"
+            )
+        feedback_limit = tuple(float(value) for value in feedback_limit_array)
+    if (
+        not np.isfinite(kp_array).all()
+        or not np.isfinite(kd_array).all()
+        or np.any(kp_array < 0.0)
+        or np.any(kd_array < 0.0)
+    ):
+        raise ValueError("execution.mit_kp and execution.mit_kd must be finite and non-negative")
+    execution = ExecutionConfig(
+        mode=execution_mode,
+        mit_kp=mit_kp,
+        mit_kd=mit_kd,
+        mit_velocity_limit=tuple(float(value) for value in velocity_limit),
+        mit_feedback_torque_limit=feedback_limit,
     )
     pinn_raw = raw.get("pinn_checkpoint")
     if pinn_raw is None:
@@ -424,9 +519,11 @@ def load_inference_config(path: str | Path) -> InferenceConfig:
         pinn_checkpoint=pinn,
         robot=robot,
         runtime=runtime,
+        action=action,
         dp_sampling=dp_sampling,
         ik=ik,
         predictor=predictor,
+        execution=execution,
         safety=safety,
         torque_filter=torque_filter,
         observation_protection=observation_protection,

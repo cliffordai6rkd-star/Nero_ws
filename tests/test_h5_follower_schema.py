@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
-
 import numpy as np
 import pytest
 
@@ -165,9 +163,8 @@ def test_episode_buffer_passes_raw_tau_to_online_filter_once(tmp_path: Path) -> 
 
 
 @pytest.mark.parametrize("feedback_source", ("tau_f", "tau_free"))
-def test_h5_v9_saves_matched_filter_dual_tau_ext_schema(
+def test_h5_v12_saves_matched_filter_dual_tau_ext_schema(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     feedback_source: str,
 ) -> None:
     try:
@@ -175,17 +172,6 @@ def test_h5_v9_saves_matched_filter_dual_tau_ext_schema(
     except (ImportError, ValueError) as exc:
         pytest.skip(f"h5py is unavailable or ABI-incompatible: {exc}")
 
-    class _WrenchMapper:
-        def __init__(self, _config):
-            pass
-
-        def map_joint_torque(self, q, tau):
-            return SimpleNamespace(wrench=np.asarray(tau, dtype=np.float64)[:6])
-
-    monkeypatch.setattr(
-        "nero_collection.h5_writer.PinocchioContactWrenchEstimator",
-        _WrenchMapper,
-    )
     inference = _Inference(tmp_path)
     buffer = EpisodeBuffer(
         config=_config(tmp_path, feedback_source),
@@ -217,10 +203,6 @@ def test_h5_v9_saves_matched_filter_dual_tau_ext_schema(
         "tau_ext_pred_raw",
         "tau_ext_cal",
         "tau_ext_pred",
-        "wrench_cal_raw",
-        "wrench_pred_raw",
-        "wrench_cal",
-        "wrench_pred",
     }
     removed_fields = {
         "tau_f_cal",
@@ -232,7 +214,7 @@ def test_h5_v9_saves_matched_filter_dual_tau_ext_schema(
     }
     with h5py.File(output, "r") as h5:
         teleop = h5["teleop"]
-        assert h5.attrs["format"] == "factr_multimodal_episode/v11"
+        assert h5.attrs["format"] == "factr_multimodal_episode/v12"
         assert new_fields <= set(teleop)
         assert removed_fields.isdisjoint(teleop)
         assert "ddq_kf_causal" not in teleop
@@ -241,8 +223,6 @@ def test_h5_v9_saves_matched_filter_dual_tau_ext_schema(
         np.testing.assert_allclose(teleop["tau_ext_pred_raw"], -6.0)
         np.testing.assert_allclose(teleop["tau_ext_cal"], -7.5)
         np.testing.assert_allclose(teleop["tau_ext_pred"], -6.0)
-        np.testing.assert_allclose(teleop["wrench_cal"], -7.5)
-        np.testing.assert_allclose(teleop["wrench_pred"], -6.0)
         assert (
             teleop["tau_ext_cal"].attrs["definition"]
             == "tau_ext_filter(tau_id_filtered + tau_f_pred - tau_follower)"

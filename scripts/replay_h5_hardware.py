@@ -136,7 +136,7 @@ def run(args: argparse.Namespace) -> Path | None:
     kd = np.asarray(gains.follower_kd, dtype=np.float64)
     zeros = np.zeros(7, dtype=np.float64)
     dynamics = BilateralJointController(
-        gains, config.realtime_plot.inverse_dynamics
+        gains, config.tau_ext_inference.inverse_dynamics
     ).dynamics
     gravity_scale = np.asarray(gains.follower_gravity_scale, dtype=np.float64)
     torque_limit = np.asarray(gains.follower_torque_limit_nm, dtype=np.float64)
