@@ -220,6 +220,7 @@ class GripperConfig:
     effector: str = "AGX_GRIPPER"
     attach_to: str = "follower"
     teleop_enabled: bool = False
+    reset_step_wait_s: float = 1.0
     scale: float = 1.0
     offset_m: float = 0.0
     min_width_m: float = 0.0
@@ -650,6 +651,7 @@ def _parse_gripper(data: dict[str, Any]) -> GripperConfig:
         raise ValueError("gripper.attach_to must be one of: leader, follower, both")
     scale = float(data.get("scale", 1.0))
     offset_m = float(data.get("offset_m", 0.0))
+    reset_step_wait_s = float(data.get("reset_step_wait_s", 1.0))
     min_width_m = float(data.get("min_width_m", 0.0))
     max_width_m = float(data.get("max_width_m", 0.07))
     force_n = float(data.get("force_n", 1.0))
@@ -659,6 +661,7 @@ def _parse_gripper(data: dict[str, Any]) -> GripperConfig:
     numeric_values = (
         scale,
         offset_m,
+        reset_step_wait_s,
         min_width_m,
         max_width_m,
         force_n,
@@ -670,6 +673,8 @@ def _parse_gripper(data: dict[str, Any]) -> GripperConfig:
         raise ValueError("gripper numeric parameters must be finite")
     if scale == 0:
         raise ValueError("gripper.scale must be non-zero")
+    if reset_step_wait_s < 0:
+        raise ValueError("gripper.reset_step_wait_s must be non-negative")
     if min_width_m < 0 or max_width_m <= min_width_m:
         raise ValueError("gripper width range must satisfy 0 <= min_width_m < max_width_m")
     if force_n < 0:
@@ -685,6 +690,7 @@ def _parse_gripper(data: dict[str, Any]) -> GripperConfig:
         effector=str(data.get("effector", "AGX_GRIPPER")),
         attach_to=attach_to,
         teleop_enabled=bool(data.get("teleop_enabled", False)),
+        reset_step_wait_s=reset_step_wait_s,
         scale=scale,
         offset_m=offset_m,
         min_width_m=min_width_m,

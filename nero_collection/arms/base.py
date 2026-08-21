@@ -105,6 +105,9 @@ class ArmInterface(Protocol):
     def init_gripper(self, effector: str = "AGX_GRIPPER") -> None:
         ...
 
+    def reset_gripper(self) -> bool:
+        ...
+
     def read_gripper_state(self) -> GripperState:
         ...
 

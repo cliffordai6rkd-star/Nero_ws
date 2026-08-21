@@ -72,7 +72,7 @@ tau_ext_inference:
 
   # 主臂力反馈来源：tau_f 使用 RNEA+tau_f residual；tau_free 使用自由空间
   # torque 模型 residual。两路若都配置，仍会同时推理、绘图并写入 H5。
-  feedback_source: tau_free
+  feedback_source: tau_f
   # 相邻底层源帧超过该间隔时只记录警告；不会按时间间隔补帧或清空模型历史。
   observation_gap_warning_s: 0.06
   maximum_prediction_age_s: 0.06
@@ -163,6 +163,8 @@ gripper:
   effector: AGX_GRIPPER
   attach_to: both
   teleop_enabled: true
+  # 启动时夹爪先闭合到 0，再张开到 max_width_m（归一化开度 1）。
+  reset_step_wait_s: 1.0
   scale: 1.0
   offset_m: 0.0
   min_width_m: 0.0

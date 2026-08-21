@@ -61,6 +61,26 @@ class StartupArm:
             timestamp_us=0,
         )
 
+    def init_gripper(self, effector: str = "AGX_GRIPPER") -> None:
+        self.events.append(f"{self.name}:gripper_init={effector}")
+
+    def reset_gripper(self) -> bool:
+        self.events.append(f"{self.name}:gripper_reset")
+        return True
+
+    def command_gripper(
+        self,
+        value: float,
+        force_n: float,
+        mode: str = "width",
+    ) -> None:
+        self.events.append(
+            f"{self.name}:gripper_command={value:.3f},{force_n:.1f},{mode}"
+        )
+
+    def disable_gripper(self) -> None:
+        self.events.append(f"{self.name}:gripper_disable")
+
 
 class StaleRefreshArm(StartupArm):
     def read_control_role(self, refresh: bool = False) -> str | None:
@@ -125,6 +145,48 @@ def test_matching_roles_are_not_switched() -> None:
     MasterSlaveTeleop._ensure_arm_role("main", follower, "follower")
 
     assert events == ["master:read_role=follower", "slave:read_role=follower"]
+
+
+def test_gripper_startup_reset_closes_then_opens_before_disabling_leader() -> None:
+    events: list[str] = []
+    leader = StartupArm("master", "follower", events)
+    follower = StartupArm("slave", "follower", events)
+    teleop = MasterSlaveTeleop.__new__(MasterSlaveTeleop)
+    teleop.config = CollectionConfig(
+        teleop=TeleopConfig(),
+        output=OutputConfig(directory=Path(".")),
+        gripper=GripperConfig(
+            enabled=True,
+            attach_to="both",
+            teleop_enabled=True,
+            reset_step_wait_s=0.0,
+            min_width_m=0.0,
+            max_width_m=0.1,
+            force_n=1.0,
+        ),
+    )
+    pair = ArmPairRuntime(
+        name="main",
+        leader=leader,
+        follower=follower,
+        rest_q_leader=np.zeros(7),
+        rest_q_follower=np.zeros(7),
+        controller=object(),
+    )
+
+    teleop._init_grippers(pair)
+
+    assert events == [
+        "master:gripper_init=AGX_GRIPPER",
+        "master:gripper_reset",
+        "master:gripper_command=0.000,1.0,width",
+        "master:gripper_command=0.100,1.0,width",
+        "master:gripper_disable",
+        "slave:gripper_init=AGX_GRIPPER",
+        "slave:gripper_reset",
+        "slave:gripper_command=0.000,1.0,width",
+        "slave:gripper_command=0.100,1.0,width",
+    ]
 
 
 def test_dual_arm_reset_sends_both_moves_before_waiting() -> None:

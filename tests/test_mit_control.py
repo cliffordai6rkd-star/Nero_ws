@@ -70,6 +70,7 @@ class FakeGripper:
     def __init__(self) -> None:
         self.calls: list[tuple[str, float, float]] = []
         self.disable_calls = 0
+        self.reset_calls = 0
         self.enabled = True
 
     def move_gripper_m(self, *, value: float, force: float) -> None:
@@ -80,6 +81,11 @@ class FakeGripper:
 
     def disable_gripper(self) -> bool:
         self.disable_calls += 1
+        self.enabled = False
+        return True
+
+    def reset_gripper(self) -> bool:
+        self.reset_calls += 1
         self.enabled = False
         return True
 
@@ -114,6 +120,7 @@ def test_master_slave_config_has_valid_control_parameters() -> None:
     assert "acceleration" not in config.robot_states
     assert config.gripper.teleop_enabled is True
     assert config.gripper.attach_to == "both"
+    assert config.gripper.reset_step_wait_s == pytest.approx(1.0)
     if config.tau_ext_inference.inverse_dynamics.manifest_path is not None:
         assert config.tau_ext_inference.inverse_dynamics.manifest_path.is_file()
     assert config.dynamics_processing.enabled is False
@@ -374,6 +381,15 @@ def test_pyagx_adapter_commands_gripper_in_width_mode() -> None:
     adapter.command_gripper(0.035, 2.0)
 
     assert gripper.calls == [("width", 0.035, 2.0)]
+
+
+def test_pyagx_adapter_resets_gripper() -> None:
+    adapter = PyAgxArmAdapter(ArmEndpointConfig(name="arm"))
+    gripper = FakeGripper()
+    adapter._gripper = gripper
+
+    assert adapter.reset_gripper() is True
+    assert gripper.reset_calls == 1
 
 
 def test_pyagx_adapter_commands_gripper_in_angle_mode() -> None:

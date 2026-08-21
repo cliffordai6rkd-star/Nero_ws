@@ -18,7 +18,7 @@ pinn_checkpoint:
   use_ema: true
 
 predictor:
-  enabled: false
+  enabled: true
   mode: contact_world_model_opd
   # DP samples a fresh image window, then holds its 8-token plan while the
   # contact WM continues to run at the CAN/state rate.
@@ -30,7 +30,7 @@ predictor:
 
 execution:
   # mit | osc_qp | q | tau
-  mode: mit
+  mode: q
   # Used only by mit. The WM torque is sent as feedforward; firmware applies
   # these gains to q_target/dq_target.
   mit_kp: [3.0, 3.0, 2.0, 3.5, 2.0, 2.0, 3.0]
@@ -39,8 +39,8 @@ execution:
   mit_feedback_torque_limit: [10, 10, 10, 8, 6, 5, 5]
 
 dp_sampling:
-  method: ddim
-  num_inference_steps: 8
+  method: ddpm
+  num_inference_steps: 100
   # false makes DP camera-only; force-aware checkpoints require true.
   use_tau_ext_observation: false
 
@@ -93,7 +93,7 @@ torque_filter:
   rate_limit_nm_s: [50, 50, 50, 40, 30, 20, 20]
 
 wrench_visualization:
-  enabled: true
+  enabled: false
   window_s: 20.0
   update_rate_hz: 20.0
 

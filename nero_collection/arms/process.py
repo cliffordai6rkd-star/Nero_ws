@@ -159,6 +159,9 @@ class IsolatedArmProcess:
     def init_gripper(self, effector: str = "AGX_GRIPPER") -> None:
         self._rpc("init_gripper", str(effector))
 
+    def reset_gripper(self) -> bool:
+        return bool(self._rpc("reset_gripper"))
+
     def read_gripper_state(self) -> GripperState:
         return self._rpc("read_gripper_state")
 

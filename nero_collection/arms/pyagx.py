@@ -389,6 +389,16 @@ class PyAgxArmAdapter:
             server_version if server_version is not None else "unavailable",
         )
 
+    def reset_gripper(self) -> bool:
+        if self._gripper is None:
+            raise RuntimeError(f"Gripper on arm {self.name} has not been initialized")
+        reset_gripper = getattr(self._gripper, "reset_gripper", None)
+        if not callable(reset_gripper):
+            raise RuntimeError(f"Arm {self.name} gripper does not expose reset_gripper()")
+        result = reset_gripper()
+        log.info("requested gripper reset arm=%s result=%s", self.name, result)
+        return bool(result)
+
     def read_gripper_state(self) -> GripperState:
         if self._gripper is None:
             return GripperState(value=np.nan, force=np.nan, timestamp_us=0, mode="unknown")

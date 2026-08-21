@@ -10,6 +10,18 @@ python -m nero_collection.cli --config configs/master_slave_can.yaml
 q ctrl c退出
 ```
 
+## 夹爪零点标定
+
+先停止数采进程，再运行交互式标定脚本：
+
+```bash
+python scripts/calibrate_gripper.py follower
+```
+
+夹爪失能后，手动轻轻闭合到机械零位并按 Enter 写入零点；随后脚本移动到
+`0 m`、张开到配置的 `max_width_m` 并打印反馈，最后将夹爪失能。标定主夹爪
+时运行 `python scripts/calibrate_gripper.py leader`。
+
 ## 在线 torque 推理与力反馈来源
 
 `configs/master_slave_can.yaml` 的 `tau_ext_inference.feedback_source` 支持：

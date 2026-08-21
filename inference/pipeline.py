@@ -1807,7 +1807,11 @@ class NeroInferencePipeline:
         _synchronize_model(self.dp)
         started_s = perf_counter()
         with torch.inference_mode():
-            output = self.dp.predict_action(obs)
+            output = _predict_dp_action(
+                self.dp,
+                obs,
+                action_type=self._dp_action_type,
+            )
         _synchronize_model(self.dp)
         elapsed_s = perf_counter() - started_s
         self._record_dp_inference_timing(elapsed_s)
@@ -2398,6 +2402,66 @@ def _dp_model_overrides(config: InferenceConfig) -> dict[str, Any]:
         raise ValueError(f"DP DINO model directory does not exist: {path}")
     overrides["dino_model_name_or_path"] = str(path)
     return overrides
+
+
+def _predict_dp_action(
+    model: Any,
+    obs: Mapping[str, Any],
+    *,
+    action_type: str,
+) -> Mapping[str, Any]:
+    """Run a DP checkpoint without changing the declared action semantics.
+
+    The pure visual Transformer policy used by the joint checkpoint shares its
+    seven-dimensional output container with pose policies.  Its historical
+    ``predict_action`` implementation therefore normalizes dimensions 3:7 as
+    a quaternion even when the action is ``action.joint``.  That silently turns
+    absolute joint angles into a unit quaternion.  Reconstruct the small
+    diffusion-policy inference wrapper here for joint actions so the sampled
+    trajectory is only unnormalized, never pose-normalized.
+
+    Injected/test models (and non-standard DP policies) keep using their public
+    ``predict_action`` method unless all of the standard diffusion methods are
+    present.
+    """
+    if action_type != "joint":
+        return model.predict_action(obs)
+
+    required = (
+        "_encode_observation",
+        "conditional_sample",
+        "normalizer",
+        "horizon",
+        "action_dim",
+        "n_action_steps",
+    )
+    if not all(hasattr(model, name) for name in required):
+        return model.predict_action(obs)
+
+    condition = model._encode_observation(obs)
+    batch_size = int(condition.shape[0])
+    horizon = int(model.horizon)
+    action_dim = int(model.action_dim)
+    if condition.ndim < 2 or horizon < 1 or action_dim != 7:
+        return model.predict_action(obs)
+    trajectory = model.conditional_sample(
+        (batch_size, horizon, action_dim),
+        condition,
+    )
+    action_prediction = model.normalizer["action"].unnormalize(trajectory)
+    start = int(
+        getattr(model, "action_start_index", int(getattr(model, "n_obs_steps", 1)) - 1)
+    )
+    n_action_steps = int(model.n_action_steps)
+    action = action_prediction[:, start : start + n_action_steps]
+    if action.ndim != 3 or action.shape[-1] != 7 or action.shape[1] < 1:
+        return model.predict_action(obs)
+    return {
+        "action": action,
+        "action_pred": action_prediction,
+        "model_action_pred": action_prediction,
+        "action_target": action.mean(dim=1),
+    }
 
 
 def _uses_link7_target_gripper_tcp_current_contract(

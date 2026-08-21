@@ -23,6 +23,7 @@ from inference.pipeline import (
     NeroInferencePipeline,
     _dp_execution_action_chunk,
     _dp_model_overrides,
+    _predict_dp_action,
     _minimum_jerk_action_plan,
     _relative_action_pose_torch,
     _select_action_chunk,
@@ -129,6 +130,51 @@ class _JointActionDP(_ActionDP):
             [[[0.4, -0.2, 0.3, 0.1, -0.1, 0.2, -0.3]]]
         )
         return {"action": chunk, "action_target": chunk[:, 0]}
+
+
+class _JointDiffusionDP(torch.nn.Module):
+    """Minimal policy-shaped fixture for the joint-action output contract."""
+
+    horizon = 2
+    n_obs_steps = 1
+    n_action_steps = 2
+    action_start_index = 0
+    action_dim = 7
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.anchor = torch.nn.Parameter(torch.zeros(()))
+        self.conditional_sample_calls = 0
+        self.predict_action_calls = 0
+
+        class _Normalizer:
+            def __getitem__(self, key):
+                assert key == "action"
+                return self
+
+            @staticmethod
+            def unnormalize(value):
+                return value * 2.0 + 0.5
+
+        self.normalizer = _Normalizer()
+
+    def _encode_observation(self, obs):
+        assert tuple(obs) == ("wrist",)
+        return torch.zeros((1, 1, 4))
+
+    def conditional_sample(self, shape, condition):
+        assert shape == (1, 2, 7)
+        assert tuple(condition.shape) == (1, 1, 4)
+        self.conditional_sample_calls += 1
+        return torch.tensor(
+            [[[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7],
+              [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]]]
+        )
+
+    def predict_action(self, obs):
+        del obs
+        self.predict_action_calls += 1
+        raise AssertionError("joint diffusion path must bypass pose normalization")
 
 
 class _TwoObservationActionDP(_ActionDP):
@@ -1276,6 +1322,24 @@ def test_joint_dp_action_bypasses_ik_and_uses_joint_safety(tmp_path: Path) -> No
         [0.1, -0.1, 0.1, 0.1, -0.1, 0.1, -0.1],
     )
     pipeline.close()
+
+
+def test_joint_diffusion_action_does_not_normalize_q_as_quaternion() -> None:
+    model = _JointDiffusionDP()
+    output = _predict_dp_action(
+        model,
+        {"wrist": torch.zeros((1, 1, 3, 8, 10))},
+        action_type="joint",
+    )
+
+    expected = torch.tensor(
+        [[[0.7, 0.9, 1.1, 1.3, 1.5, 1.7, 1.9],
+          [0.9, 1.1, 1.3, 1.5, 1.7, 1.9, 2.1]]]
+    )
+    torch.testing.assert_close(output["action"], expected)
+    torch.testing.assert_close(output["action_target"], expected.mean(dim=1))
+    assert model.conditional_sample_calls == 1
+    assert model.predict_action_calls == 0
 
 
 def test_open_loop_all_executes_complete_chunk_before_reobserving_direct_ik(

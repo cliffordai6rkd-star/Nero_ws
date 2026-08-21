@@ -130,6 +130,11 @@ class MockArm:
     def init_gripper(self, effector: str = "AGX_GRIPPER") -> None:
         self._ensure_connected()
 
+    def reset_gripper(self) -> bool:
+        self._ensure_connected()
+        self._gripper_force = 0.0
+        return True
+
     def read_gripper_state(self) -> GripperState:
         self._ensure_connected()
         return GripperState(

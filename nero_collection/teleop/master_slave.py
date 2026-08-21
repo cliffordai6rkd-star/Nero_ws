@@ -205,10 +205,51 @@ class MasterSlaveTeleop:
             return
         if gripper.teleop_enabled or gripper.attach_to in {"leader", "both"}:
             pair.leader.init_gripper(gripper.effector)
+            self._reset_gripper_to_open(pair.name, "leader", pair.leader)
             if gripper.teleop_enabled:
                 pair.leader.disable_gripper()
         if gripper.teleop_enabled or gripper.attach_to in {"follower", "both"}:
             pair.follower.init_gripper(gripper.effector)
+            self._reset_gripper_to_open(pair.name, "follower", pair.follower)
+
+    def _reset_gripper_to_open(
+        self,
+        pair_name: str,
+        role: str,
+        arm: ArmInterface,
+    ) -> None:
+        gripper = self.config.gripper
+        closed_width_m = 0.0
+        arm.reset_gripper()
+        log.info(
+            "closing gripper to reset zero pair=%s role=%s arm=%s width=%.6fm",
+            pair_name,
+            role,
+            arm.name,
+            closed_width_m,
+        )
+        arm.command_gripper(
+            closed_width_m,
+            gripper.force_n,
+            mode="width",
+        )
+        if gripper.reset_step_wait_s > 0:
+            time.sleep(gripper.reset_step_wait_s)
+
+        log.info(
+            "opening reset gripper fully pair=%s role=%s arm=%s width=%.6fm",
+            pair_name,
+            role,
+            arm.name,
+            gripper.max_width_m,
+        )
+        arm.command_gripper(
+            gripper.max_width_m,
+            gripper.force_n,
+            mode="width",
+        )
+        if gripper.reset_step_wait_s > 0:
+            time.sleep(gripper.reset_step_wait_s)
 
     def _wait_for_valid_joints(self, read_fn, timeout_s: float, label: str) -> np.ndarray:
         deadline = time.monotonic() + timeout_s
