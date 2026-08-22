@@ -29,7 +29,7 @@ class _ClearHistory:
     pass
 
 
-class SlidingJointBuffer:
+class CumulativeJointBuffer:
     def __init__(self, window_s: float) -> None:
         self.window_s = float(window_s)
         self._timestamps_s: deque[float] = deque()
@@ -51,12 +51,6 @@ class SlidingJointBuffer:
         self._tau_ext_cal.append(tau_ext_cal)
         self._tau_ext_pred.append(tau_ext_pred)
 
-        cutoff_s = timestamp_s - self.window_s
-        while self._timestamps_s and self._timestamps_s[0] < cutoff_s:
-            self._timestamps_s.popleft()
-            self._tau_ext_cal.popleft()
-            self._tau_ext_pred.popleft()
-
     def arrays(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if not self._timestamps_s:
             return (
@@ -66,7 +60,7 @@ class SlidingJointBuffer:
             )
         timestamps = np.asarray(self._timestamps_s, dtype=np.float64)
         return (
-            timestamps - timestamps[-1],
+            timestamps - timestamps[0],
             np.stack(self._tau_ext_cal, axis=0),
             np.stack(self._tau_ext_pred, axis=0),
         )
@@ -75,6 +69,10 @@ class SlidingJointBuffer:
         self._timestamps_s.clear()
         self._tau_ext_cal.clear()
         self._tau_ext_pred.clear()
+
+
+# Keep the old import name available for callers outside this package.
+SlidingJointBuffer = CumulativeJointBuffer
 
 
 class RealtimeJointPlotter:
@@ -116,7 +114,7 @@ class RealtimeJointPlotter:
         self._process.start()
         log.info(
             "realtime plot process started datasets=tau_ext_cal,tau_ext_pred "
-            "window=%.1fs update=%.1fHz",
+            "cumulative=true initial_span=%.1fs update=%.1fHz",
             self.config.window_s,
             self.config.update_rate_hz,
         )
@@ -204,16 +202,16 @@ class RealtimeJointPlotter:
 class _MatplotlibPlotWindow:
     _PLOTS = (
         ("tau_ext_cal", "external torque [N.m]", tuple(f"J{index}" for index in range(1, 8))),
-        ("tau_ext_cal_l1", "||tau_ext_cal||_1 [N.m]", ("cal",)),
+        ("||tau_ext||", "||tau_ext|| [N.m]", ("cal",)),
         ("tau_ext_pred", "external torque [N.m]", tuple(f"J{index}" for index in range(1, 8))),
-        ("tau_ext_pred_l1", "||tau_ext_pred||_1 [N.m]", ("pred",)),
+        ("||tau_ext||", "||tau_ext|| [N.m]", ("pred",)),
     )
 
     def __init__(self, config: RealtimePlotConfig) -> None:
         import matplotlib.pyplot as plt
 
         self.config = config
-        self.buffer = SlidingJointBuffer(config.window_s)
+        self.buffer = CumulativeJointBuffer(config.window_s)
         self.plt = plt
         plt.ion()
         self.figure, axes_grid = plt.subplots(2, 2, figsize=(15, 9), sharex=True)
@@ -234,8 +232,8 @@ class _MatplotlibPlotWindow:
             )
             axis.set_title(title)
             axis.set_ylabel(ylabel)
-            axis.set_xlabel("time [s], live")
-            axis.set_xlim(-config.window_s, 0.0)
+            axis.set_xlabel("elapsed time [s]")
+            axis.set_xlim(0.0, config.window_s)
             axis.set_ylim(-_MINIMUM_Y_ABS_NM, _MINIMUM_Y_ABS_NM)
             axis.grid(True, alpha=0.25)
             axis.legend(loc="upper left", ncol=2, fontsize=8)
@@ -253,21 +251,22 @@ class _MatplotlibPlotWindow:
         self.buffer.append(*sample)
 
     def render(self) -> None:
-        relative_time, tau_ext_cal, tau_ext_pred = self.buffer.arrays()
-        if relative_time.size:
+        elapsed_time, tau_ext_cal, tau_ext_pred = self.buffer.arrays()
+        if elapsed_time.size:
             for index in range(7):
-                self.lines[0][index].set_data(relative_time, tau_ext_cal[:, index])
-                self.lines[2][index].set_data(relative_time, tau_ext_pred[:, index])
+                self.lines[0][index].set_data(elapsed_time, tau_ext_cal[:, index])
+                self.lines[2][index].set_data(elapsed_time, tau_ext_pred[:, index])
             tau_ext_cal_l1 = np.sum(np.abs(tau_ext_cal), axis=1)
             tau_ext_pred_l1 = np.sum(np.abs(tau_ext_pred), axis=1)
-            self.lines[1][0].set_data(relative_time, tau_ext_cal_l1)
-            self.lines[3][0].set_data(relative_time, tau_ext_pred_l1)
+            self.lines[1][0].set_data(elapsed_time, tau_ext_cal_l1)
+            self.lines[3][0].set_data(elapsed_time, tau_ext_pred_l1)
             _set_dynamic_ylim(self.axes[0], tau_ext_cal)
             _set_dynamic_ylim(self.axes[1], tau_ext_cal_l1[:, None])
             _set_dynamic_ylim(self.axes[2], tau_ext_pred)
             _set_dynamic_ylim(self.axes[3], tau_ext_pred_l1[:, None])
+            time_limit_s = max(self.config.window_s, float(elapsed_time[-1]))
             for axis in self.axes:
-                axis.set_xlim(-self.config.window_s, 0.0)
+                axis.set_xlim(0.0, time_limit_s)
             self.figure.canvas.draw()
         self.process_events()
 
@@ -276,7 +275,7 @@ class _MatplotlibPlotWindow:
         for axis, lines in zip(self.axes, self.lines):
             for line in lines:
                 line.set_data([], [])
-            axis.set_xlim(-self.config.window_s, 0.0)
+            axis.set_xlim(0.0, self.config.window_s)
             axis.set_ylim(-_MINIMUM_Y_ABS_NM, _MINIMUM_Y_ABS_NM)
         self.figure.canvas.draw()
         self.process_events()

@@ -39,7 +39,7 @@ tau_ext_inference:
 - `tau_f` 使用 `tau_id_filtered + tau_f_pred - tau_follower`。
 - `tau_free` 使用 `tau_free_pred - tau_follower`，配置块内部名称为 `tau_next`。
 - `input_keys` 是可选的 checkpoint 契约校验项，允许 `q/dq/ddq/delta_q/tau/tau_id` 的有序子集；省略时直接读取 checkpoint 的 `model.inputs`。100 Hz 源帧先按 `source_butterworth_filter` 过滤，再按 stride 取 50 Hz；`ddq` 由过滤后的 `q/dq` 经因果 Kalman 得到，`tau_id` 是直接的 `RNEA(q,dq,ddq)` 输出。`tau_id_filtered` 仅用于 `tau_f` 残差公式。`tau_free` 使用这两个动力学输入时必须同时启用同采样率的 `tau_f` 分支，以共享同一帧结果。
-- `tau_ext_inference.inverse_dynamics` 保存计算 `tau_ext_cal` 所需的 URDF/RNEA 参数；`realtime_plot` 只显示七轴 `tau_ext_cal/tau_ext_pred` 及其 L1 范数。新 H5 不再写入 `wrench_*` 数据集。
+- `tau_ext_inference.inverse_dynamics` 保存计算 `tau_ext_cal` 所需的 URDF/RNEA 参数；`realtime_plot` 累积显示当前 episode 的七轴 `tau_ext_cal/tau_ext_pred` 及其 L1 范数，开始新 episode 时清空。新 H5 不再写入 `wrench_*` 数据集。
 
 ## 轨迹规划器
 `joint_pose_coverage.yaml`从人类遥操数据集路径生成轨迹:
@@ -175,4 +175,11 @@ python scripts/infer_h5_mujoco.py \
   --max-steps 200 \
   --output /tmp/nero_contact_wm_osc_qp.npz \
   --scene-output /tmp/nero_contact_wm_osc_qp.xml
+```
+
+
+
+标定夹爪零点
+```
+python scripts/calibrate_gripper.py follower
 ```

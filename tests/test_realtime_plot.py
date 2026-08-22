@@ -23,10 +23,10 @@ from nero_collection.inverse_dynamics import PinocchioJointTorqueResidualEstimat
 from nero_collection.inverse_dynamics import JointTorqueResidualEstimate
 from nero_collection.realtime_dynamics import CenteredThreePointTorqueResidualStream
 from nero_collection.realtime_plot import (
+    CumulativeJointBuffer,
     _MatplotlibPlotWindow,
     _set_dynamic_ylim,
     RealtimeJointPlotter,
-    SlidingJointBuffer,
 )
 
 
@@ -69,8 +69,8 @@ def test_realtime_plot_config_rejects_invalid_rates(data: dict[str, object]) -> 
         _parse_realtime_plot(data)
 
 
-def test_sliding_joint_buffer_keeps_only_latest_ten_seconds() -> None:
-    buffer = SlidingJointBuffer(window_s=10.0)
+def test_cumulative_joint_buffer_keeps_complete_elapsed_history() -> None:
+    buffer = CumulativeJointBuffer(window_s=10.0)
     for timestamp_s, value in ((0, 1.0), (5, 2.0), (11, 3.0)):
         joints = np.full(7, value, dtype=np.float64)
         buffer.append(
@@ -81,14 +81,14 @@ def test_sliding_joint_buffer_keeps_only_latest_ten_seconds() -> None:
 
     time_s, tau_ext_cal, tau_ext_pred = buffer.arrays()
 
-    assert time_s == pytest.approx([-6.0, 0.0])
-    assert tau_ext_cal.shape == (2, 7)
-    assert np.allclose(tau_ext_cal[:, 0], [2.0, 3.0])
-    assert np.allclose(tau_ext_pred[:, 0], [6.0, 9.0])
+    assert time_s == pytest.approx([0.0, 5.0, 11.0])
+    assert tau_ext_cal.shape == (3, 7)
+    assert np.allclose(tau_ext_cal[:, 0], [1.0, 2.0, 3.0])
+    assert np.allclose(tau_ext_pred[:, 0], [3.0, 6.0, 9.0])
 
 
-def test_sliding_joint_buffer_rejects_non_seven_dimensional_data() -> None:
-    buffer = SlidingJointBuffer(window_s=10.0)
+def test_cumulative_joint_buffer_rejects_non_seven_dimensional_data() -> None:
+    buffer = CumulativeJointBuffer(window_s=10.0)
 
     with pytest.raises(RuntimeError, match="7D tau_ext_cal"):
         buffer.append(1, np.zeros(6), np.zeros(7))
@@ -97,8 +97,8 @@ def test_sliding_joint_buffer_rejects_non_seven_dimensional_data() -> None:
         buffer.append(1, np.zeros(7), np.zeros(6))
 
 
-def test_sliding_joint_buffer_clear_removes_all_history() -> None:
-    buffer = SlidingJointBuffer(window_s=10.0)
+def test_cumulative_joint_buffer_clear_removes_all_history() -> None:
+    buffer = CumulativeJointBuffer(window_s=10.0)
     buffer.append(1, np.ones(7), np.ones(7))
 
     buffer.clear()
@@ -112,10 +112,17 @@ def test_sliding_joint_buffer_clear_removes_all_history() -> None:
 def test_realtime_plot_places_cal_above_pred_without_mixing() -> None:
     assert tuple(item[0] for item in _MatplotlibPlotWindow._PLOTS) == (
         "tau_ext_cal",
-        "tau_ext_cal_l1",
+        "||tau_ext||",
         "tau_ext_pred",
-        "tau_ext_pred_l1",
+        "||tau_ext||",
     )
+
+
+def test_realtime_plot_uses_generic_tau_ext_norm_labels() -> None:
+    assert _MatplotlibPlotWindow._PLOTS[1][0] == "||tau_ext||"
+    assert _MatplotlibPlotWindow._PLOTS[3][0] == "||tau_ext||"
+    assert _MatplotlibPlotWindow._PLOTS[1][1] == "||tau_ext|| [N.m]"
+    assert _MatplotlibPlotWindow._PLOTS[3][1] == "||tau_ext|| [N.m]"
 
 
 def test_realtime_plot_y_scale_is_at_least_plus_minus_three_nm() -> None:

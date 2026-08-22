@@ -53,10 +53,10 @@ teleop:
           rest_q: [+0.00000, -0.14689, 0, +1.80020, 0, +0.02744, +1.50378]
 
 
-output:
-  # directory: ../runs/insert_usb
-  # directory: ../runs/next_data
-  directory: ../runs/wipe_board
+# output:
+#   directory: ../runs/insert_usb
+  # directory: ../runs/wipe_board
+  directory: ../runs/pick_dumbbell
   prefix: episode
   # 每个 episode 开始后先运行控制和滤波，但不保存或可视化这段数据。
   discard_initial_s: 0.5
@@ -85,7 +85,7 @@ tau_ext_inference:
   tau_next:
     checkpoint_path: model/tau_free/epoch_089_val_tau_mse_nm2_0.006167.pt
     # 同样取过滤后底层帧的第 0、2、4...帧。
-    observation_sample_rate_hz: 50.0
+    observation_sample_rate_hz: 50
 
   # 必须与 tau_f checkpoint 的 derived_target_config.state_estimator 一致；
   # 在线恢复 forward Kalman，RTS 不参与部署。
@@ -101,7 +101,7 @@ tau_ext_inference:
   tau_ext_filter:
     enabled: true
     mode: moving_average
-    window: 3
+    window: 10
     cutoff_hz: 50
 
   # URDF is used only by the online inverse-dynamics residual that produces tau_ext.
@@ -111,10 +111,10 @@ tau_ext_inference:
     locked_joint_names: [gripper, gripper_joint1, gripper_joint2]
     gravity_m_s2: [0.0, 0.0, -9.81]
 
-# 上排显示 tau_ext_cal 七轴及 L1 范数，下排显示 tau_ext_pred 七轴及 L1 范数。
 realtime_plot:
   # 当前图中预测量依赖 PINN/NEXT；新模型可用前必须关闭。
   enabled: true
+  # 累积显示当前 episode 的全部历史；该值只是初始横轴宽度。
   window_s: 20.0
   update_rate_hz: 20.0
 
@@ -131,7 +131,7 @@ cameras:
     width: 640
     height: 480
     fps: 25
-    exposure: 400
+    exposure: 200
     # 保持自动曝光，但禁止相机通过延长曝光主动降低采集帧率。
     exposure_dynamic_framerate: false
     depth: false
@@ -151,7 +151,7 @@ cameras:
     width: 640
     height: 480
     fps: 25
-    exposure: 400
+    exposure: 200
     # 保持自动曝光，但禁止相机通过延长曝光主动降低采集帧率。
     exposure_dynamic_framerate: false
     depth: false
@@ -169,8 +169,8 @@ gripper:
   offset_m: 0.0
   min_width_m: 0.0
   max_width_m: 0.1
-  force_n: 1.0
-  command_rate_hz: 50.0
+  force_n: 5
+  command_rate_hz: 25
   deadband_m: 0.0005
   keepalive_s: 0.5
 
