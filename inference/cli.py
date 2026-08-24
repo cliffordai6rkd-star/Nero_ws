@@ -92,6 +92,11 @@ def main() -> None:
                     "action_interpolation_steps": (
                         config.predictor.action_interpolation_steps
                     ),
+                    "architecture": {
+                        "enabled": config.architecture.enabled,
+                        "policy_type": config.architecture.policy_type,
+                        "world_model_type": config.architecture.world_model_type,
+                    },
                     "dp_sampling_method": config.dp_sampling.method,
                     "dp_inference_steps": config.dp_sampling.num_inference_steps,
                     "maximum_inference_steps": config.runtime.maximum_inference_steps,

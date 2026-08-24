@@ -300,7 +300,7 @@ def test_learned_tau_ext_is_used_once_for_feedback_and_teleop_values() -> None:
                 tau=np.asarray(tau),
                 tau_id=np.zeros(7),
                 tau_id_filtered=np.zeros(7),
-                tau_f_pred=np.ones(7),
+                tau_other_pred=np.ones(7),
                 tau_next_pred=np.ones(7) * 2.0,
                 tau_ext_cal=tau_ext_cal,
                 tau_ext_pred=tau_ext_pred,
@@ -341,7 +341,7 @@ def test_learned_tau_ext_feedback_stays_zero_during_history_warmup() -> None:
                 tau=np.asarray(tau),
                 tau_id=np.zeros(7),
                 tau_id_filtered=np.zeros(7),
-                tau_f_pred=np.ones(7),
+                tau_other_pred=np.ones(7),
                 tau_next_pred=np.ones(7) * 2.0,
                 tau_ext_cal=np.ones(7) * 3.0,
                 tau_ext_pred=np.ones(7) * 4.0,
@@ -365,7 +365,7 @@ def test_learned_tau_ext_feedback_stays_zero_during_history_warmup() -> None:
     )
 
 
-def test_tau_f_feedback_uses_calibrated_residual_and_branch_readiness() -> None:
+def test_tau_other_feedback_uses_calibrated_residual_and_branch_readiness() -> None:
     class Inference:
         def estimate_aligned(self, timestamp_us, q, dq, tau, q_cmd):
             return OnlineTauExtResult(
@@ -376,12 +376,12 @@ def test_tau_f_feedback_uses_calibrated_residual_and_branch_readiness() -> None:
                 tau=np.asarray(tau),
                 tau_id=np.zeros(7),
                 tau_id_filtered=np.zeros(7),
-                tau_f_pred=np.ones(7),
+                tau_other_pred=np.ones(7),
                 tau_next_pred=np.ones(7) * 2.0,
                 tau_ext_cal=np.linspace(0.1, 0.7, 7),
                 tau_ext_pred=np.linspace(1.1, 1.7, 7),
                 history_ready=False,
-                tau_f_history_ready=True,
+                tau_other_history_ready=True,
                 tau_free_history_ready=False,
             )
 
@@ -389,7 +389,7 @@ def test_tau_f_feedback_uses_calibrated_residual_and_branch_readiness() -> None:
         CommandConfig(),
         FakeLeader(),
         BiasedFollower(np.zeros(7)),
-        feedback_source="tau_f",
+        feedback_source="tau_other",
     )
     teleop.online_tau_ext = Inference()
     teleop._bilateral_active = True
@@ -427,7 +427,7 @@ def test_dual_tau_ext_uses_causal_previous_follower_q_cmd() -> None:
                 tau=np.asarray(tau),
                 tau_id=zeros,
                 tau_id_filtered=zeros,
-                tau_f_pred=zeros,
+                tau_other_pred=zeros,
                 tau_next_pred=zeros,
                 tau_ext_cal=zeros,
                 tau_ext_pred=zeros,
@@ -496,7 +496,7 @@ def test_fixed_rate_sampling_reuses_latest_sdk_cache_each_tick(monkeypatch) -> N
                 tau=np.asarray(tau, dtype=np.float64),
                 tau_id=zeros.copy(),
                 tau_id_filtered=zeros.copy(),
-                tau_f_pred=zeros.copy(),
+                tau_other_pred=zeros.copy(),
                 tau_next_pred=zeros.copy(),
                 tau_ext_cal=zeros.copy(),
                 tau_ext_pred=zeros.copy(),

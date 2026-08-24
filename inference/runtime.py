@@ -11,7 +11,7 @@ from typing import Any, Callable
 import numpy as np
 
 from inference.config import InferenceConfig
-from inference.pipeline import InferenceInput, NeroInferencePipeline
+from inference.pipeline import NeroInferencePipeline
 from inference.state_stream import (
     ContinuousInferenceSample,
     ContinuousInferenceStateStream,
@@ -21,6 +21,10 @@ from inference.wrench_mapping import (
     WrenchMappingConfig,
 )
 from inference.wrench_visualization import InferenceWrenchPlotter
+from inference.diagnostics.tau_ext import TauExtInferencePlotter
+from inference.core.nero_sampler import NeroObservationSampler
+from inference.core.legacy_runner import NeroPipelineRunner
+from inference.control.nero import NeroPipelineOutputController
 from nero_collection.arms.factory import build_arm
 from nero_collection.cameras import CameraFrame, CameraManager, CameraVisualizer
 from nero_collection.config import CollectionConfig, load_config
@@ -47,9 +51,17 @@ class NeroInferenceRuntime:
         online_tau_ext: OnlineTauExtInference | None = None,
         wrench_estimator: PinocchioContactWrenchEstimator | None = None,
         wrench_plotter: InferenceWrenchPlotter | None = None,
+        tau_ext_plotter: TauExtInferencePlotter | None = None,
         continuous_state_stream: bool | None = None,
     ) -> None:
         self.config = config
+        if config.architecture.enabled:
+            log.info(
+                "modular inference architecture enabled policy=%s world_model=%s; "
+                "legacy pipeline remains the model-stage compatibility adapter",
+                config.architecture.policy_type,
+                config.architecture.world_model_type,
+            )
         collection = load_config(config.runtime.collection_config)
         if backend is not None:
             collection = _with_backend(collection, backend)
@@ -109,7 +121,14 @@ class NeroInferenceRuntime:
             config.wrench_visualization,
             contact_threshold_n=self._dp_contact_threshold_n,
         )
+        self.tau_ext_plotter = tau_ext_plotter or TauExtInferencePlotter(collection)
         self.command_enabled = bool(command_enabled)
+        self.robot_controller = NeroPipelineOutputController(
+            arm=self.arm,
+            config=self.config,
+            command_enabled=self.command_enabled,
+        )
+        self.robot_controller.bind_q_command_sink(self._set_q_cmd)
         self._latest_frame: CameraFrame | None = None
         configured_image_keys = tuple(getattr(self.pipeline, "_image_keys", ()))
         self._pipeline_image_keys = configured_image_keys or (
@@ -157,6 +176,32 @@ class NeroInferenceRuntime:
             q_cmd_provider=self._get_q_cmd,
             poll_interval_s=1.0 / collection.teleop.command.sample_rate_hz,
         )
+        self._observation_sampler = NeroObservationSampler(
+            cameras=self.cameras,
+            camera_keys=self._pipeline_image_keys,
+            primary_camera=config.runtime.camera,
+            maximum_state_age_s=config.runtime.maximum_state_age_s,
+            read_state=self._read_inference_sample,
+            drain_state=self._drain_state_observations,
+            observation_ready=self._observation_is_ready,
+            open_loop=lambda: self.config.predictor.inference_mode == "open_loop",
+            open_loop_active=lambda: bool(
+                getattr(self.pipeline, "open_loop_execution_active", False)
+            ),
+            wrench_rotation=self._wrench_rotation_for_sample,
+        )
+        # Public component handles make the runtime usable as a compatibility
+        # container while callers migrate to ``InferenceBase`` directly.
+        self.observation_sampler = self._observation_sampler
+        self.controller = self.robot_controller
+        self.diagnostics = (self.tau_ext_plotter, self.wrench_plotter)
+        self.pipeline_runner = NeroPipelineRunner(
+            pipeline=self.pipeline,
+            sampler=self._observation_sampler,
+            controller=self.robot_controller,
+            image_keys=self._pipeline_image_keys,
+            on_observation=self._on_modular_observation,
+        )
         self._observation_warmup_started_us: int | None = None
         self._inference_control_mode_ready = False
 
@@ -182,8 +227,33 @@ class NeroInferenceRuntime:
             )
         return wrench, processed_wrench
 
-    def _on_stream_sample(self, _sample: ContinuousInferenceSample) -> None:
+    def _wrench_rotation_for_sample(
+        self,
+        sample: ContinuousInferenceSample,
+    ) -> np.ndarray | None:
+        """Return the wrench-to-control rotation for the modular sampler."""
+        if self._wrench_mapping.reference_frame != "local":
+            return None
+        model = getattr(self.pipeline, "model", self.pipeline.controller.model)
+        pose = model.snapshot(sample.q, sample.dq).pose
+        return np.asarray(pose[:3, :3], dtype=np.float64).copy()
+
+    def _on_modular_observation(self, _observation) -> None:
+        self._latest_frame = self._observation_sampler.latest_frame
+        self._latest_frames = self._observation_sampler.latest_frames
+
+    def _on_stream_sample(self, sample: ContinuousInferenceSample) -> None:
         self._last_valid_arm_state_s = time.monotonic()
+        if bool(getattr(self.tau_ext_plotter, "enabled", False)):
+            try:
+                self.tau_ext_plotter.append(
+                    sample.timestamp_us,
+                    sample.tau_result.tau_ext_cal,
+                    sample.tau_result.tau_ext_pred,
+                )
+            except Exception:
+                # Diagnostics must never stop the fixed-rate state stream.
+                log.warning("tau_ext inference plot update failed", exc_info=True)
 
     def _start_state_stream(self) -> None:
         if not self._continuous_state_stream_enabled:
@@ -233,9 +303,11 @@ class NeroInferenceRuntime:
             )
             self.cameras.start()
             self.wrench_plotter.start()
+            self.tau_ext_plotter.start()
             self.online_tau_ext.warm_up()
             self._reset_online_tau_ext_episode()
             self.pipeline.reset()
+            self._observation_sampler.reset_episode()
             self._reset_observation_protection()
             self._start_state_stream()
             self._started = True
@@ -243,6 +315,7 @@ class NeroInferenceRuntime:
             self._stop_state_stream(clear=True)
             self.cameras.stop()
             self.wrench_plotter.close()
+            self.tau_ext_plotter.close()
             recovered = False
             if self.command_enabled:
                 try:
@@ -401,8 +474,10 @@ class NeroInferenceRuntime:
     def _end_episode_state(self) -> None:
         self._stop_state_stream(clear=True)
         self.pipeline.reset()
+        self._observation_sampler.reset_episode()
         self._reset_online_tau_ext_episode()
         self.wrench_plotter.clear_history()
+        self.tau_ext_plotter.clear_history()
         self._latest_frame = None
         self._latest_frames.clear()
         self._reset_observation_protection()
@@ -757,162 +832,7 @@ class NeroInferenceRuntime:
     def step(self):
         if not self._started:
             raise RuntimeError("runtime must be started before step()")
-        open_loop = self.config.predictor.inference_mode == "open_loop"
-        executing = bool(
-            getattr(self.pipeline, "open_loop_execution_active", False)
-        )
-        for frame in self.cameras.poll():
-            if frame.camera_name in self._pipeline_image_keys:
-                self._latest_frames[frame.camera_name] = frame
-        primary_frame = self._latest_frames.get(self.config.runtime.camera)
-        if primary_frame is None:
-            return None
-        self._latest_frame = primary_frame
-        missing_frames = [
-            key for key in self._pipeline_image_keys if key not in self._latest_frames
-        ]
-        if missing_frames:
-            return None
-
-        current_us = now_us()
-        camera_age_s = max(
-            max(
-                0.0,
-                (current_us - int(self._latest_frames[key].timestamp_us)) * 1.0e-6,
-            )
-            for key in self._pipeline_image_keys
-        )
-        camera_is_stale = camera_age_s > self.config.runtime.maximum_state_age_s
-        if camera_is_stale:
-            if open_loop and not executing:
-                monotonic_s = time.monotonic()
-                if monotonic_s - self._last_stale_camera_warning_s >= 0.5:
-                    log.warning(
-                        "waiting for a fresh camera frame before the next open-loop "
-                        "observation batch camera=%s age=%.3fs limit=%.3fs",
-                        self.config.runtime.camera,
-                        camera_age_s,
-                        self.config.runtime.maximum_state_age_s,
-                    )
-                    self._last_stale_camera_warning_s = monotonic_s
-            if not open_loop:
-                raise RuntimeError(
-                    f"camera {self.config.runtime.camera!r} is stale: "
-                    f"age={camera_age_s:.3f}s, "
-                    f"limit={self.config.runtime.maximum_state_age_s:.3f}s"
-                )
-        sample = self._read_inference_sample()
-        if sample is None:
-            return None
-        self._drain_state_observations()
-        if not self._observation_is_ready(sample.timestamp_us):
-            return None
-        if open_loop and not executing and camera_is_stale:
-            return None
-
-        rotation = None
-        if self._wrench_mapping.reference_frame == "local":
-            model = getattr(self.pipeline, "model", self.pipeline.controller.model)
-            pose = model.snapshot(
-                sample.q, sample.dq
-            ).pose
-            rotation = pose[:3, :3].copy()
-
-        image = (
-            self._latest_frame.frame
-            if len(self._pipeline_image_keys) == 1
-            else {
-                key: self._latest_frames[key].frame
-                for key in self._pipeline_image_keys
-            }
-        )
-        image_timestamp_s = (
-            self._latest_frame.timestamp_us * 1.0e-6
-            if len(self._pipeline_image_keys) == 1
-            else {
-                key: self._latest_frames[key].timestamp_us * 1.0e-6
-                for key in self._pipeline_image_keys
-            }
-        )
-        output = self.pipeline.step(
-            InferenceInput(
-                q=sample.q,
-                dq=sample.dq,
-                ddq=sample.ddq,
-                tau=sample.tau,
-                image=image,
-                wrench_ext=sample.wrench,
-                timestamp_s=sample.timestamp_us * 1.0e-6,
-                wrench_to_control_rotation=rotation,
-                image_timestamp_s=image_timestamp_s,
-            )
-        )
-        if self.command_enabled:
-            if self.config.predictor.enabled:
-                control_mode = getattr(output, "control_mode", None)
-                if control_mode == "q":
-                    if output.joint_position_command is None:
-                        raise RuntimeError(
-                            "contact WM q mode did not produce a joint-position command"
-                        )
-                    q_cmd = np.asarray(
-                        output.joint_position_command, dtype=np.float64
-                    )
-                    self.arm.command_joint_positions(q_cmd)
-                elif control_mode == "mit":
-                    q_target = getattr(output, "joint_position_target", None)
-                    dq_target = getattr(output, "joint_velocity_target", None)
-                    tau_target = getattr(output, "torque_target", None)
-                    if q_target is None or dq_target is None or tau_target is None:
-                        raise RuntimeError(
-                            "contact WM MIT mode requires q/dq/tau targets"
-                        )
-                    q_cmd = np.asarray(q_target, dtype=np.float64)
-                    kp = np.asarray(
-                        getattr(output, "mit_kp", None)
-                        if getattr(output, "mit_kp", None) is not None
-                        else self.config.execution.mit_kp,
-                        dtype=np.float64,
-                    )
-                    kd = np.asarray(
-                        getattr(output, "mit_kd", None)
-                        if getattr(output, "mit_kd", None) is not None
-                        else self.config.execution.mit_kd,
-                        dtype=np.float64,
-                    )
-                    if kp.ndim == 0:
-                        kp = np.repeat(kp, 7)
-                    if kd.ndim == 0:
-                        kd = np.repeat(kd, 7)
-                    self.arm.command_joint_impedance(
-                        q=q_cmd,
-                        v_des=np.asarray(dq_target, dtype=np.float64),
-                        kp=kp,
-                        kd=kd,
-                        # The arm firmware adds the PD terms.  Send only the WM
-                        # feedforward torque here to avoid counting feedback twice.
-                        t_ff=np.asarray(tau_target, dtype=np.float64),
-                    )
-                else:
-                    # Legacy OSC-QP, contact OSC-QP, and direct-tau execution
-                    # all send a pure torque command through the MIT transport.
-                    q_cmd = np.asarray(sample.q, dtype=np.float64)
-                    self.arm.command_joint_impedance(
-                        q=q_cmd,
-                        v_des=np.zeros(7, dtype=np.float64),
-                        kp=np.zeros(7, dtype=np.float64),
-                        kd=np.asarray(self.config.runtime.command_kd, dtype=np.float64),
-                        t_ff=output.tau_command,
-                    )
-            else:
-                if output.joint_position_command is None:
-                    raise RuntimeError(
-                        "direct IK pipeline did not produce a joint-position command"
-                    )
-                q_cmd = np.asarray(output.joint_position_command, dtype=np.float64)
-                self.arm.command_joint_positions(q_cmd)
-            self._set_q_cmd(q_cmd)
-        return output
+        return self.pipeline_runner.step()
 
     def _get_q_cmd(self, timestamp_us: int) -> np.ndarray | None:
         with self._q_cmd_lock:
@@ -986,6 +906,7 @@ class NeroInferenceRuntime:
             self._stop_state_stream(clear=True)
             self.cameras.stop()
             self.wrench_plotter.close()
+            self.tau_ext_plotter.close()
             if not preserve_arm_enabled:
                 try:
                     self.arm.disable()

@@ -164,5 +164,5 @@ class CenteredThreePointTorqueResidualStream:
 def _finite_vector(name: str, value: np.ndarray, size: int) -> np.ndarray:
     vector = np.asarray(value, dtype=np.float64).reshape(-1)
     if vector.size != size or not np.isfinite(vector).all():
-        raise RuntimeError(f"Realtime tau_f requires a finite {size}D {name} vector; got {vector}")
+        raise RuntimeError(f"Realtime tau_other requires a finite {size}D {name} vector; got {vector}")
     return vector.copy()

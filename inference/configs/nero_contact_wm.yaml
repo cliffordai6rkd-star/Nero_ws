@@ -11,6 +11,11 @@ dp_checkpoint:
 # by URDF FK to [x,y,z,qx,qy,qz,qw] in robot.action_frame_name.
 action: joint
 
+architecture:
+  enabled: false
+  policy_type: legacy_pipeline
+  world_model_type: contact_world_model
+
 pinn_checkpoint:
   # Use a checkpoint trained from contact_world_model.yaml or its OPD student.
   path: ../../../PINN/outputs/contact_world_model_opd_sweep/20260819_113728/teacher/checkpoints/step_00100000.pt

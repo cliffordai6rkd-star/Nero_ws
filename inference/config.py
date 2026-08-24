@@ -134,6 +134,20 @@ class RuntimeConfig:
 
 
 @dataclass(frozen=True)
+class ArchitectureConfig:
+    """Selection for the modular orchestration layer.
+
+    ``enabled`` remains false by default while legacy runtime compatibility is
+    maintained.  New deployments can opt into the same contracts without
+    changing checkpoint-specific settings.
+    """
+
+    enabled: bool = False
+    policy_type: str = "legacy_pipeline"
+    world_model_type: str = "none"
+
+
+@dataclass(frozen=True)
 class InferenceConfig:
     dp_checkpoint: CheckpointConfig
     robot: RobotConfig
@@ -156,6 +170,7 @@ class InferenceConfig:
     )
     osc_qp: OSCQPConfig = field(default_factory=OSCQPConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+    architecture: ArchitectureConfig = field(default_factory=ArchitectureConfig)
 
 
 T = TypeVar("T")
@@ -514,6 +529,24 @@ def load_inference_config(path: str | Path) -> InferenceConfig:
         if not np.isfinite(value) or value <= 0:
             raise ValueError(f"wrench_visualization.{name} must be positive and finite")
     osc_qp = _dataclass_from_mapping(OSCQPConfig, raw.get("osc_qp", {}), "osc_qp")
+    architecture = _dataclass_from_mapping(
+        ArchitectureConfig,
+        raw.get("architecture", {}),
+        "architecture",
+    )
+    if not isinstance(architecture.enabled, bool):
+        raise ValueError("architecture.enabled must be a boolean")
+    policy_type = str(architecture.policy_type).strip().lower()
+    world_model_type = str(architecture.world_model_type).strip().lower()
+    if not policy_type:
+        raise ValueError("architecture.policy_type must be non-empty")
+    if not world_model_type:
+        raise ValueError("architecture.world_model_type must be non-empty")
+    architecture = ArchitectureConfig(
+        enabled=architecture.enabled,
+        policy_type=policy_type,
+        world_model_type=world_model_type,
+    )
     return InferenceConfig(
         dp_checkpoint=dp,
         pinn_checkpoint=pinn,
@@ -530,6 +563,7 @@ def load_inference_config(path: str | Path) -> InferenceConfig:
         timing=timing,
         wrench_visualization=wrench_visualization,
         osc_qp=osc_qp,
+        architecture=architecture,
     )
 
 

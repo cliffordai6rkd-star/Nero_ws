@@ -57,6 +57,19 @@ class RealtimePlotConfig:
     enabled: bool = False
     window_s: float = 10.0
     update_rate_hz: float = 20.0
+    norm: str = "l1"
+    precontact_threshold: float | None = None
+    contact_threshold: float | None = None
+
+    # Keep the spellings used in the original configuration request available
+    # as read-only aliases while exposing correctly spelled Python attributes.
+    @property
+    def precontact_threshhold(self) -> float | None:
+        return self.precontact_threshold
+
+    @property
+    def comntact_treshhold(self) -> float | None:
+        return self.contact_threshold
 
 
 @dataclass(frozen=True)
@@ -84,8 +97,10 @@ class CausalKalmanConfig:
 class TauExtFilterConfig:
     enabled: bool = True
     mode: str = "hampel_butterworth"
-    window: int = 5
-    cutoff_hz: float = 8.0
+    # A scalar applies to every joint; a seven-element tuple configures joints
+    # independently while preserving the scalar configuration contract.
+    window: int | tuple[int, ...] = 5
+    cutoff_hz: float | tuple[float, ...] = 8.0
     hampel_n_sigma: float = 3.0
     order: int = 4
     sample_rate_hz: float = 100.0
@@ -106,7 +121,7 @@ class TauExtInferenceConfig:
     feedback_source: str = "tau_free"
     observation_gap_warning_s: float = 0.06
     maximum_prediction_age_s: float = 0.06
-    tau_f: SequenceCheckpointConfig = field(default_factory=SequenceCheckpointConfig)
+    tau_other: SequenceCheckpointConfig = field(default_factory=SequenceCheckpointConfig)
     tau_next: SequenceCheckpointConfig = field(default_factory=SequenceCheckpointConfig)
     source_butterworth_filter: SourceButterworthFilterConfig = field(
         default_factory=SourceButterworthFilterConfig
@@ -137,6 +152,9 @@ class CameraConfig:
     depth: bool = False
     crop: tuple[int | None, int | None, int | None, int | None] = (0, None, 0, None)
     output_size: tuple[int, int] | None = None
+    # Preview is an independent consumer of the decoded frame.  ``None`` keeps
+    # the cropped/native resolution even when output_size downsamples policy input.
+    preview_output_size: tuple[int, int] | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -285,9 +303,9 @@ def load_config(path: str | Path) -> CollectionConfig:
         data.get("tau_ext_inference", {}),
         config_path.parent,
     )
-    if "tau_f_inference" in data:
+    if "tau_other_inference" in data:
         raise ValueError(
-            "tau_f_inference was removed; configure the two-model "
+            "tau_other_inference was removed; configure the two-model "
             "tau_ext_inference block instead."
         )
     if realtime_plot.enabled and not tau_ext_inference.enabled:
@@ -562,9 +580,11 @@ def _parse_camera(data: dict[str, Any]) -> CameraConfig:
         "depth",
         "crop",
         "output_size",
+        "preview_output_size",
     }
     crop = tuple(data.get("crop", (0, None, 0, None)))
     output_size = data.get("output_size")
+    preview_output_size = data.get("preview_output_size")
     device = data.get("device")
     if device is not None and not isinstance(device, (str, int)):
         raise ValueError("camera.device must be a device path or integer index")
@@ -617,6 +637,18 @@ def _parse_camera(data: dict[str, Any]) -> CameraConfig:
         len(normalized_output_size) != 2 or any(value <= 0 for value in normalized_output_size)
     ):
         raise ValueError("camera.output_size must contain positive [width, height]")
+    normalized_preview_output_size = (
+        tuple(int(value) for value in preview_output_size)
+        if preview_output_size
+        else None
+    )
+    if normalized_preview_output_size is not None and (
+        len(normalized_preview_output_size) != 2
+        or any(value <= 0 for value in normalized_preview_output_size)
+    ):
+        raise ValueError(
+            "camera.preview_output_size must contain positive [width, height]"
+        )
     return CameraConfig(
         name=str(name),
         enabled=bool(data.get("enabled", True)),
@@ -637,6 +669,7 @@ def _parse_camera(data: dict[str, Any]) -> CameraConfig:
         depth=bool(data.get("depth", False)),
         crop=normalized_crop,
         output_size=normalized_output_size,
+        preview_output_size=normalized_preview_output_size,
         extra={key: value for key, value in data.items() if key not in known},
     )
 
@@ -711,11 +744,37 @@ def _parse_realtime_plot(
         raise ValueError("realtime_plot must be a mapping")
     window_s = float(data.get("window_s", 10.0))
     update_rate_hz = float(data.get("update_rate_hz", 20.0))
+    norm = str(data.get("norm", "l1")).strip().lower()
+    precontact_threshold = _optional_nonnegative_threshold(
+        data.get(
+            "precontact_threshold",
+            data.get("precontact_threshhold"),
+        ),
+        "realtime_plot.precontact_threshold",
+    )
+    contact_threshold = _optional_nonnegative_threshold(
+        data.get(
+            "contact_threshold",
+            data.get("comntact_treshhold"),
+        ),
+        "realtime_plot.contact_threshold",
+    )
     if not isfinite(window_s) or window_s <= 0:
         raise ValueError("realtime_plot.window_s must be positive and finite")
     if not isfinite(update_rate_hz) or update_rate_hz <= 0:
         raise ValueError("realtime_plot.update_rate_hz must be positive and finite")
-    unknown = set(data) - {"enabled", "window_s", "update_rate_hz"}
+    if norm not in {"l1", "l2"}:
+        raise ValueError("realtime_plot.norm must be l1 or l2")
+    unknown = set(data) - {
+        "enabled",
+        "window_s",
+        "update_rate_hz",
+        "norm",
+        "precontact_threshold",
+        "contact_threshold",
+        "precontact_threshhold",
+        "comntact_treshhold",
+    }
     if unknown:
         raise ValueError(
             f"realtime_plot contains removed options: {sorted(unknown)}; "
@@ -725,7 +784,22 @@ def _parse_realtime_plot(
         enabled=bool(data.get("enabled", False)),
         window_s=window_s,
         update_rate_hz=update_rate_hz,
+        norm=norm,
+        precontact_threshold=precontact_threshold,
+        contact_threshold=contact_threshold,
     )
+
+
+def _optional_nonnegative_threshold(value: Any, name: str) -> float | None:
+    if value is None:
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be non-negative, finite, or null") from exc
+    if not isfinite(result) or result < 0.0:
+        raise ValueError(f"{name} must be non-negative, finite, or null")
+    return result
 
 
 def _parse_inverse_dynamics(
@@ -798,7 +872,7 @@ def _parse_tau_ext_inference(
         "feedback_source",
         "observation_gap_warning_s",
         "maximum_prediction_age_s",
-        "tau_f",
+        "tau_other",
         "tau_next",
         "source_butterworth_filter",
         "state_estimator",
@@ -812,9 +886,9 @@ def _parse_tau_ext_inference(
 
     enabled = bool(data.get("enabled", False))
     feedback_source = str(data.get("feedback_source", "tau_free")).strip().lower()
-    if feedback_source not in {"tau_f", "tau_free"}:
+    if feedback_source not in {"tau_other", "tau_free"}:
         raise ValueError(
-            "tau_ext_inference.feedback_source must be tau_f or tau_free"
+            "tau_ext_inference.feedback_source must be tau_other or tau_free"
         )
     observation_gap_warning_s = float(data.get("observation_gap_warning_s", 0.06))
     maximum_prediction_age_s = float(data.get("maximum_prediction_age_s", 0.06))
@@ -824,9 +898,9 @@ def _parse_tau_ext_inference(
     ):
         if not isfinite(value) or value <= 0:
             raise ValueError(f"tau_ext_inference.{name} must be positive and finite")
-    tau_f = _parse_sequence_checkpoint(
-        data.get("tau_f", {}),
-        "tau_ext_inference.tau_f",
+    tau_other = _parse_sequence_checkpoint(
+        data.get("tau_other", {}),
+        "tau_ext_inference.tau_other",
         config_dir,
     )
     tau_next = _parse_sequence_checkpoint(
@@ -852,7 +926,7 @@ def _parse_tau_ext_inference(
         feedback_source=feedback_source,
         observation_gap_warning_s=observation_gap_warning_s,
         maximum_prediction_age_s=maximum_prediction_age_s,
-        tau_f=tau_f,
+        tau_other=tau_other,
         tau_next=tau_next,
         source_butterworth_filter=source_butterworth_filter,
         state_estimator=state_estimator,
@@ -923,16 +997,20 @@ def _parse_tau_ext_filter(data: dict[str, Any]) -> TauExtFilterConfig:
             "tau_ext_inference.tau_ext_filter.mode must be "
             "hampel_butterworth, moving_average, or median"
         )
-    window = int(data.get("window", 5))
-    if window < 1:
+    window = _parse_tau_ext_filter_window(data.get("window", 5))
+    if any(item < 1 for item in _tau_ext_values(window)):
         raise ValueError("tau_ext_inference.tau_ext_filter.window must be positive")
-    if mode in {"hampel_butterworth", "median"} and window % 2 == 0:
+    if mode in {"hampel_butterworth", "median"} and any(
+        item % 2 == 0 for item in _tau_ext_values(window)
+    ):
         raise ValueError(
             "tau_ext_inference.tau_ext_filter.window must be odd in "
             "hampel_butterworth or median mode"
         )
-    cutoff_hz = float(data.get("cutoff_hz", 8.0))
-    if not isfinite(cutoff_hz) or cutoff_hz <= 0.0:
+    cutoff_hz = _parse_tau_ext_filter_cutoff(data.get("cutoff_hz", 8.0))
+    if any(
+        not isfinite(item) or item <= 0.0 for item in _tau_ext_values(cutoff_hz)
+    ):
         raise ValueError(
             "tau_ext_inference.tau_ext_filter.cutoff_hz must be positive and finite"
         )
@@ -951,7 +1029,9 @@ def _parse_tau_ext_filter(data: dict[str, Any]) -> TauExtFilterConfig:
             "tau_ext_inference.tau_ext_filter.sample_rate_hz must be positive "
             "and finite"
         )
-    if mode == "hampel_butterworth" and cutoff_hz >= 0.5 * sample_rate_hz:
+    if mode == "hampel_butterworth" and any(
+        item >= 0.5 * sample_rate_hz for item in _tau_ext_values(cutoff_hz)
+    ):
         raise ValueError(
             "tau_ext_inference.tau_ext_filter.cutoff_hz must be below the "
             "Nyquist frequency"
@@ -965,6 +1045,83 @@ def _parse_tau_ext_filter(data: dict[str, Any]) -> TauExtFilterConfig:
         order=order,
         sample_rate_hz=sample_rate_hz,
     )
+
+
+def _tau_ext_values(value: int | float | tuple[int, ...] | tuple[float, ...]) -> tuple:
+    """Return scalar or per-joint tau_ext_filter values as a tuple."""
+
+    return value if isinstance(value, tuple) else (value,)
+
+
+def _parse_tau_ext_filter_window(value: Any) -> int | tuple[int, ...]:
+    if isinstance(value, bool):
+        raise ValueError(
+            "tau_ext_inference.tau_ext_filter.window must be a positive integer "
+            "or seven integers"
+        )
+    if not isinstance(value, (list, tuple)):
+        try:
+            integer = int(value)
+            if float(value) != integer:
+                raise ValueError
+            return integer
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "tau_ext_inference.tau_ext_filter.window must be a positive integer "
+                "or seven integers"
+            ) from exc
+    if len(value) != 7:
+        raise ValueError(
+            "tau_ext_inference.tau_ext_filter.window must contain exactly 7 values"
+        )
+    result = []
+    for item in value:
+        if isinstance(item, bool):
+            raise ValueError(
+                "tau_ext_inference.tau_ext_filter.window values must be integers"
+            )
+        try:
+            integer = int(item)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "tau_ext_inference.tau_ext_filter.window values must be integers"
+            ) from exc
+        if isinstance(item, float) and item != integer:
+            raise ValueError(
+                "tau_ext_inference.tau_ext_filter.window values must be integers"
+            )
+        result.append(integer)
+    return tuple(result)
+
+
+def _parse_tau_ext_filter_cutoff(value: Any) -> float | tuple[float, ...]:
+    if isinstance(value, bool):
+        raise ValueError(
+            "tau_ext_inference.tau_ext_filter.cutoff_hz must be a positive number "
+            "or seven numbers"
+        )
+    if not isinstance(value, (list, tuple)):
+        try:
+            return float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "tau_ext_inference.tau_ext_filter.cutoff_hz must be a positive number "
+                "or seven numbers"
+            ) from exc
+    if len(value) != 7:
+        raise ValueError(
+            "tau_ext_inference.tau_ext_filter.cutoff_hz must contain exactly 7 values"
+        )
+    if any(isinstance(item, bool) for item in value):
+        raise ValueError(
+            "tau_ext_inference.tau_ext_filter.cutoff_hz values must be numbers"
+        )
+    try:
+        return tuple(float(item) for item in value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "tau_ext_inference.tau_ext_filter.cutoff_hz values must be numbers"
+        ) from exc
 
 
 def _parse_sequence_checkpoint(

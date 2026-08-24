@@ -7,6 +7,53 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 from scipy.signal import butter, sosfilt, sosfilt_zi
 
+
+def _expand_axis_parameter(
+    value: Any,
+    size: int,
+    name: str,
+    cast: type[int] | type[float],
+) -> np.ndarray:
+    """Expand a scalar or validate a per-axis parameter for one feature vector."""
+
+    if np.isscalar(value):
+        values = [value] * size
+    else:
+        values = list(value)
+        if len(values) != size:
+            raise ValueError(
+                f"{name} must be a scalar or contain exactly {size} values"
+            )
+    result: list[int | float] = []
+    for item in values:
+        if isinstance(item, (bool, np.bool_)):
+            raise ValueError(f"{name} values must be numeric")
+        try:
+            converted = cast(item)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{name} values must be numeric") from exc
+        if cast is int and float(item) != converted:
+            raise ValueError(f"{name} values must be integers")
+        result.append(converted)
+    return np.asarray(result, dtype=np.int64 if cast is int else np.float64)
+
+
+def _validate_filter_parameter(value: Any, name: str, cast: type[int] | type[float]) -> None:
+    """Validate scalar/list values before the feature dimension is known."""
+
+    if np.isscalar(value):
+        values = [value]
+    else:
+        values = list(value)
+        if not values:
+            raise ValueError(f"{name} must not be empty")
+    _expand_axis_parameter(values if len(values) > 1 else values[0], len(values), name, cast)
+
+
+def _filter_parameter_values(value: Any) -> list[Any]:
+    return [value] if np.isscalar(value) else list(value)
+
+
 @dataclass
 class CausalTrailingMedian:
     """Causal trailing median with first-sample padding at startup."""
@@ -261,33 +308,101 @@ class VariableStepButterworthLowPass:
 
 @dataclass
 class CausalHampelButterworth:
-    """Hampel outlier rejection followed once by a Butterworth low-pass."""
+    """Hampel rejection followed by Butterworth, optionally per feature axis."""
 
-    window: int = 5
+    window: int | Sequence[int] = 5
     n_sigma: float = 3.0
-    cutoff_hz: float = 8.0
+    cutoff_hz: float | Sequence[float] = 8.0
     sample_rate_hz: float = 100.0
     order: int = 4
-    hampel: CausalTrailingHampel = field(init=False)
-    lowpass: ButterworthLowPass = field(init=False)
+    hampel: list[CausalTrailingHampel] | None = field(init=False, default=None)
+    lowpass: list[ButterworthLowPass] | None = field(init=False, default=None)
+    _window_values: np.ndarray | None = field(init=False, default=None, repr=False)
+    _cutoff_values: np.ndarray | None = field(init=False, default=None, repr=False)
+    _feature_shape: tuple[int, ...] | None = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
-        self.hampel = CausalTrailingHampel(self.window, self.n_sigma)
-        self.lowpass = ButterworthLowPass(
-            cutoff_hz=self.cutoff_hz,
-            sample_rate_hz=self.sample_rate_hz,
-            order=self.order,
+        _validate_filter_parameter(self.window, "Hampel window", int)
+        _validate_filter_parameter(self.cutoff_hz, "Butterworth cutoff_hz", float)
+        window_values = _filter_parameter_values(self.window)
+        cutoff_values = _filter_parameter_values(self.cutoff_hz)
+        if any(int(window) < 1 or int(window) % 2 == 0 for window in window_values):
+            raise ValueError("Hampel window must be a positive odd integer")
+        if any(
+            not np.isfinite(float(cutoff))
+            or float(cutoff) <= 0.0
+            or float(cutoff) >= 0.5 * self.sample_rate_hz
+            for cutoff in cutoff_values
+        ):
+            raise ValueError("cutoff_hz must be positive and below Nyquist")
+        if not np.isfinite(self.n_sigma) or self.n_sigma <= 0.0:
+            raise ValueError("Hampel n_sigma must be positive and finite")
+        if not np.isfinite(self.sample_rate_hz) or self.sample_rate_hz <= 0.0:
+            raise ValueError("sample_rate_hz must be positive and finite")
+        if self.order < 1:
+            raise ValueError("Butterworth order must be positive")
+
+    def _initialize(self, size: int) -> None:
+        self._window_values = _expand_axis_parameter(
+            self.window, size, "Hampel window", int
         )
+        self._cutoff_values = _expand_axis_parameter(
+            self.cutoff_hz, size, "Butterworth cutoff_hz", float
+        )
+        if np.any(self._window_values < 1) or np.any(self._window_values % 2 == 0):
+            raise ValueError("Hampel window must be a positive odd integer")
+        if np.any(
+            ~np.isfinite(self._cutoff_values)
+            | (self._cutoff_values <= 0.0)
+            | (self._cutoff_values >= 0.5 * self.sample_rate_hz)
+        ):
+            raise ValueError("cutoff_hz must be positive and below Nyquist")
+        self.hampel = [
+            CausalTrailingHampel(int(window), self.n_sigma)
+            for window in self._window_values
+        ]
+        self.lowpass = [
+            ButterworthLowPass(
+                cutoff_hz=float(cutoff),
+                sample_rate_hz=self.sample_rate_hz,
+                order=self.order,
+            )
+            for cutoff in self._cutoff_values
+        ]
+        self._feature_shape = (size,)
 
     def apply(self, value: np.ndarray, timestamp_us: int) -> np.ndarray:
-        return self.lowpass.apply(
-            self.hampel.apply(value, timestamp_us),
-            timestamp_us,
+        value = np.asarray(value, dtype=np.float64)
+        if value.ndim != 1 or not np.all(np.isfinite(value)):
+            raise ValueError("Hampel/Butterworth filter expects one finite feature vector")
+        if self._feature_shape is None:
+            self._initialize(value.size)
+        elif value.shape != self._feature_shape:
+            raise ValueError(
+                f"filter shape changed from {self._feature_shape} to {value.shape}"
+            )
+        assert self.hampel is not None and self.lowpass is not None
+        hampel_value = np.asarray(
+            [
+                stage.apply(np.asarray([value[index]]), timestamp_us)[0]
+                for index, stage in enumerate(self.hampel)
+            ],
+            dtype=np.float64,
+        )
+        return np.asarray(
+            [
+                stage.apply(np.asarray([hampel_value[index]]), timestamp_us)[0]
+                for index, stage in enumerate(self.lowpass)
+            ],
+            dtype=np.float64,
         )
 
     def reset(self) -> None:
-        self.hampel.reset()
-        self.lowpass.reset()
+        self.hampel = None
+        self.lowpass = None
+        self._window_values = None
+        self._cutoff_values = None
+        self._feature_shape = None
 
 
 @dataclass
@@ -345,48 +460,106 @@ class CausalWindowLowPass:
     ``moving_average`` matches the PINN rollout visualizer: the startup window
     is padded with the first real sample, then a trailing boxcar average is
     passed through a one-pole IIR. ``median`` uses the same startup convention
-    through :class:`OnePoleLowPass`.
+    through :class:`OnePoleLowPass`. ``window`` and ``cutoff_hz`` may each be a
+    scalar or a sequence matching the feature vector length.
     """
 
     mode: str
-    window: int
-    cutoff_hz: float
+    window: int | Sequence[int]
+    cutoff_hz: float | Sequence[float]
     history: deque[np.ndarray] = field(default_factory=deque)
-    lowpass: OnePoleLowPass = field(init=False)
+    lowpass: list[OnePoleLowPass] | None = field(init=False, default=None)
+    _window_values: np.ndarray | None = field(init=False, default=None, repr=False)
+    _cutoff_values: np.ndarray | None = field(init=False, default=None, repr=False)
+    _feature_shape: tuple[int, ...] | None = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.mode = str(self.mode).strip().lower()
         if self.mode not in {"moving_average", "median"}:
             raise ValueError("filter mode must be moving_average or median")
-        if self.window < 1:
+        _validate_filter_parameter(self.window, "filter window", int)
+        _validate_filter_parameter(self.cutoff_hz, "cutoff_hz", float)
+        window_values = _filter_parameter_values(self.window)
+        cutoff_values = _filter_parameter_values(self.cutoff_hz)
+        if any(int(window) < 1 for window in window_values):
             raise ValueError("filter window must be positive")
-        if self.mode == "median" and self.window % 2 == 0:
+        if self.mode == "median" and any(int(window) % 2 == 0 for window in window_values):
             raise ValueError("median filter window must be odd")
-        median_window = self.window if self.mode == "median" else 1
-        self.lowpass = OnePoleLowPass(self.cutoff_hz, median_window)
+        if any(
+            not np.isfinite(float(cutoff)) or float(cutoff) <= 0.0
+            for cutoff in cutoff_values
+        ):
+            raise ValueError("cutoff_hz must be positive and finite")
+
+    def _initialize(self, size: int) -> None:
+        self._window_values = _expand_axis_parameter(
+            self.window, size, "filter window", int
+        )
+        self._cutoff_values = _expand_axis_parameter(
+            self.cutoff_hz, size, "cutoff_hz", float
+        )
+        if np.any(self._window_values < 1):
+            raise ValueError("filter window must be positive")
+        if self.mode == "median" and np.any(self._window_values % 2 == 0):
+            raise ValueError("median filter window must be odd")
+        if np.any(~np.isfinite(self._cutoff_values) | (self._cutoff_values <= 0.0)):
+            raise ValueError("cutoff_hz must be positive and finite")
+        median_windows = (
+            self._window_values
+            if self.mode == "median"
+            else np.ones(size, dtype=np.int64)
+        )
+        self.lowpass = [
+            OnePoleLowPass(float(cutoff), int(median_window))
+            for cutoff, median_window in zip(self._cutoff_values, median_windows)
+        ]
+        self._feature_shape = (size,)
 
     def apply(self, value: np.ndarray, timestamp_us: int) -> np.ndarray:
         value = np.asarray(value, dtype=np.float64)
-        if not np.all(np.isfinite(value)):
-            raise ValueError("filter inputs must be finite")
-        if self.mode == "median":
-            return self.lowpass.apply(value, timestamp_us)
-
-        if self.history and value.shape != self.history[0].shape:
+        if value.ndim != 1 or not np.all(np.isfinite(value)):
+            raise ValueError("filter expects one finite feature vector")
+        if self._feature_shape is None:
+            self._initialize(value.size)
+        elif value.shape != self._feature_shape:
             raise ValueError(
-                f"filter shape changed from {self.history[0].shape} to {value.shape}"
+                f"filter shape changed from {self._feature_shape} to {value.shape}"
             )
+        assert self._window_values is not None
+        assert self.lowpass is not None
+        if self.mode == "median":
+            return np.asarray(
+                [
+                    stage.apply(np.asarray([value[index]]), timestamp_us)[0]
+                    for index, stage in enumerate(self.lowpass)
+                ],
+                dtype=np.float64,
+            )
+
         self.history.append(value.copy())
-        while len(self.history) > self.window:
+        max_window = int(np.max(self._window_values))
+        while len(self.history) > max_window:
             self.history.popleft()
-        samples = list(self.history)
-        samples = [samples[0]] * (self.window - len(samples)) + samples
-        averaged = np.mean(np.stack(samples, axis=0), axis=0)
-        return self.lowpass.apply(averaged, timestamp_us)
+        history = list(self.history)
+        averaged = np.empty_like(value)
+        for index, window in enumerate(self._window_values):
+            samples = [item[index] for item in history[-int(window) :]]
+            samples = [samples[0]] * (int(window) - len(samples)) + samples
+            averaged[index] = float(np.mean(samples))
+        return np.asarray(
+            [
+                stage.apply(np.asarray([averaged[index]]), timestamp_us)[0]
+                for index, stage in enumerate(self.lowpass)
+            ],
+            dtype=np.float64,
+        )
 
     def reset(self) -> None:
         self.history.clear()
-        self.lowpass.reset()
+        self.lowpass = None
+        self._window_values = None
+        self._cutoff_values = None
+        self._feature_shape = None
 
 
 @dataclass

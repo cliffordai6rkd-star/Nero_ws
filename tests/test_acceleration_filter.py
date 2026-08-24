@@ -189,7 +189,7 @@ def test_finalize_teleop_data_preserves_aligned_derivatives_without_h5py(
     assert data["q_follower"] == pytest.approx(q)
     assert data["dq_follower"] == pytest.approx(dq)
     assert "ddq_follower" not in data
-    assert "tau_f" not in data
+    assert "tau_other" not in data
 
 
 def test_episode_save_preserves_raw_aligned_state_and_torque(
@@ -264,7 +264,7 @@ def test_episode_save_preserves_raw_aligned_state_and_torque(
         assert teleop["tau_follower"].attrs["median_window"] == 1
         assert "tau_ext_follower" not in teleop
         assert teleop["q_follower"].shape == (100, 7)
-        assert "tau_f" not in teleop
+        assert "tau_other" not in teleop
         assert np.allclose(teleop["timestamp_us"][:], timestamps)
         assert teleop["dq_follower"].attrs["derivative_method"] == (
             "sign_corrected_official_motor_velocity_unfiltered"

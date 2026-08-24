@@ -71,7 +71,7 @@ class MasterSlaveTeleop:
         inference_enabled = config.tau_ext_inference.enabled and any(
             branch.checkpoint_path is not None
             for branch in (
-                config.tau_ext_inference.tau_f,
+                config.tau_ext_inference.tau_other,
                 config.tau_ext_inference.tau_next,
             )
         )
@@ -93,12 +93,12 @@ class MasterSlaveTeleop:
         if self.online_tau_ext is not None:
             feedback_source = config.tau_ext_inference.feedback_source
             feedback_predictor = (
-                self.online_tau_ext.tau_f_predictor
-                if feedback_source == "tau_f"
+                self.online_tau_ext.tau_other_predictor
+                if feedback_source == "tau_other"
                 else self.online_tau_ext.tau_next_predictor
             )
             if feedback_predictor is None:
-                checkpoint_key = "tau_f" if feedback_source == "tau_f" else "tau_next"
+                checkpoint_key = "tau_other" if feedback_source == "tau_other" else "tau_next"
                 raise RuntimeError(
                     "configured force-feedback source has no checkpoint: "
                     f"feedback_source={feedback_source!r}; configure "
@@ -1131,13 +1131,17 @@ class MasterSlaveTeleop:
                 "torque",
                 _concat([result.tau_id for result in inference_results]),
             )
+            values["tau_g"] = (
+                "torque",
+                _concat([result.tau_g for result in inference_results]),
+            )
             values["tau_id_filtered"] = (
                 "torque",
                 _concat([result.tau_id_filtered for result in inference_results]),
             )
-            values["tau_f_pred"] = (
+            values["tau_other_pred"] = (
                 "torque",
-                _concat([result.tau_f_pred for result in inference_results]),
+                _concat([result.tau_other_pred for result in inference_results]),
             )
             values["tau_next_pred"] = (
                 "torque",

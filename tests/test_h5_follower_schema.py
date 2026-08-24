@@ -22,8 +22,12 @@ from nero_collection.tau_ext_inference import (
 def _model_metadata(path: Path, output_key: str) -> SequenceCheckpointMetadata:
     filters = {
         "tau": {
-            "enabled": True,
-            "operations": [{"type": "lowpass", "cutoff_hz": 10.0}],
+            "enabled": output_key != "tau_other",
+            "operations": (
+                [{"type": "lowpass", "cutoff_hz": 10.0}]
+                if output_key != "tau_other"
+                else []
+            ),
         }
     }
     return SequenceCheckpointMetadata(
@@ -34,21 +38,37 @@ def _model_metadata(path: Path, output_key: str) -> SequenceCheckpointMetadata:
         output_key=output_key,
         output_dim=7,
         architecture="lstm",
-        normalize_mode="quantile" if output_key == "tau_f" else "gaussian",
+        normalize_mode="quantile" if output_key == "tau_other" else "gaussian",
         sample_rate_hz=50.0,
         dataloader_filters=filters,
         target_contract=(
-            "matched_causal_torque_filter_v1" if output_key == "tau_f" else None
+            "causal_gravity_residual_v1" if output_key == "tau_other" else None
         ),
-        target_filter_cutoff_hz=10.0 if output_key == "tau_f" else None,
-        target_filter_median_window=1 if output_key == "tau_f" else None,
+        derived_target_config=(
+            {
+                "enabled": True,
+                "method": "causal_gravity_residual_v1",
+                "target_key": "tau_other",
+                "source_keys": {"q": "q", "dq": "dq", "tau": "tau"},
+                "dq_sign": [1.0] * 7,
+                "torque_filter_key": "tau",
+                "torque_filter_operations": [],
+                "ddq_source": "unused",
+                "measured_tau_source": "observation.torque",
+                "residual_formula": "tau_other=tau_measured-tau_g",
+            }
+            if output_key == "tau_other"
+            else {}
+        ),
+        target_filter_cutoff_hz=None,
+        target_filter_median_window=1 if output_key == "tau_other" else None,
     )
 
 
 class _Inference:
     def __init__(self, tmp_path: Path) -> None:
         self.metadata = TauExtInferenceMetadata(
-            tau_f=_model_metadata(tmp_path / "tau_f.pt", "tau_f"),
+            tau_other=_model_metadata(tmp_path / "tau_other.pt", "tau_other"),
             tau_next=_model_metadata(tmp_path / "tau_next.pt", "tau"),
             input_keys=("q", "dq", "delta_q"),
         )
@@ -62,7 +82,8 @@ class _Inference:
         tau = np.asarray(tau, dtype=np.float64)
         self.taus.append(tau.copy())
         tau_id = np.full(7, 2.0)
-        tau_f = np.full(7, 0.5)
+        tau_g = np.full(7, 2.0)
+        tau_other = np.full(7, 0.5)
         tau_next = np.full(7, 4.0)
         return OnlineTauExtResult(
             timestamp_us=int(timestamp_us),
@@ -70,11 +91,12 @@ class _Inference:
             dq=dq.copy(),
             ddq_kf_causal=np.full(7, 3.0),
             tau=tau.copy(),
+            tau_g=tau_g,
             tau_id=tau_id,
             tau_id_filtered=tau_id.copy(),
-            tau_f_pred=tau_f,
+            tau_other_pred=tau_other,
             tau_next_pred=tau_next,
-            tau_ext_cal=tau_id + tau_f - tau,
+            tau_ext_cal=tau_g + tau_other - tau,
             tau_ext_pred=tau_next - tau,
         )
 
@@ -162,7 +184,7 @@ def test_episode_buffer_passes_raw_tau_to_online_filter_once(tmp_path: Path) -> 
     np.testing.assert_allclose(buffer.teleop_data["tau_follower"][1], 10.0)
 
 
-@pytest.mark.parametrize("feedback_source", ("tau_f", "tau_free"))
+@pytest.mark.parametrize("feedback_source", ("tau_other", "tau_free"))
 def test_h5_v12_saves_matched_filter_dual_tau_ext_schema(
     tmp_path: Path,
     feedback_source: str,
@@ -195,9 +217,10 @@ def test_h5_v12_saves_matched_filter_dual_tau_ext_schema(
 
     assert inference.calls == 3
     new_fields = {
+        "tau_g",
         "tau_id",
         "tau_id_filtered",
-        "tau_f_pred",
+        "tau_other_pred",
         "tau_next_pred",
         "tau_ext_cal_raw",
         "tau_ext_pred_raw",
@@ -205,7 +228,7 @@ def test_h5_v12_saves_matched_filter_dual_tau_ext_schema(
         "tau_ext_pred",
     }
     removed_fields = {
-        "tau_f_cal",
+        "tau_other_cal",
         "tau_bg_pred",
         "tau_ext_raw",
         "tau_ext_filtered",
@@ -225,14 +248,14 @@ def test_h5_v12_saves_matched_filter_dual_tau_ext_schema(
         np.testing.assert_allclose(teleop["tau_ext_pred"], -6.0)
         assert (
             teleop["tau_ext_cal"].attrs["definition"]
-            == "tau_ext_filter(tau_id_filtered + tau_f_pred - tau_follower)"
+            == "tau_ext_filter(tau_g + tau_other_pred - tau_follower)"
         )
         assert (
             teleop["tau_ext_pred"].attrs["definition"]
             == "tau_ext_filter(tau_next_pred - checkpoint_causal_filter(tau_follower))"
         )
         assert bool(teleop["tau_ext_cal"].attrs["feedback_source"]) == (
-            feedback_source == "tau_f"
+            feedback_source == "tau_other"
         )
         assert bool(teleop["tau_ext_pred"].attrs["feedback_source"]) == (
             feedback_source == "tau_free"
@@ -243,15 +266,17 @@ def test_h5_v12_saves_matched_filter_dual_tau_ext_schema(
         )
         assert teleop["tau_next_pred"].attrs["history_warmup_samples"] == 50
         assert teleop["tau_ext_pred"].attrs["history_warmup_output"] == "zeros"
-        assert not bool(teleop["tau_f_pred"].attrs["lowpass"])
+        assert not bool(teleop["tau_other_pred"].attrs["lowpass"])
         assert not bool(teleop["q_follower"].attrs["lowpass"])
         assert not bool(teleop["dq_follower"].attrs["lowpass"])
         assert not bool(teleop["tau_follower"].attrs["lowpass"])
         assert teleop["tau_follower"].attrs["processing_method"] == (
             "nearest_motor_sample_unfiltered"
         )
-        assert bool(teleop["tau_id_filtered"].attrs["lowpass"])
-        assert teleop["tau_id_filtered"].attrs["lowpass_cutoff_hz"] == 10.0
+        assert not bool(teleop["tau_id_filtered"].attrs["lowpass"])
+        assert teleop["tau_id_filtered"].attrs["processing_method"] == (
+            "duplicate_full_rnea"
+        )
         assert bool(teleop["tau_ext_cal"].attrs["lowpass"])
         assert (
             teleop["tau_ext_cal"].attrs["processing_method"]
@@ -279,7 +304,7 @@ def test_precomputed_dual_results_are_not_inferred_twice(tmp_path: Path) -> None
         "q_cmd": ("q", zeros),
         "ddq_kf_causal": ("acceleration", zeros),
         "tau_id": ("torque", zeros),
-        "tau_f_pred": ("torque", zeros),
+        "tau_other_pred": ("torque", zeros),
         "tau_next_pred": ("torque", zeros),
         "tau_ext_cal": ("torque", zeros),
         "tau_ext_pred": ("torque", zeros),

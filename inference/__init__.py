@@ -1,6 +1,21 @@
 """Nero DP inference with predictor/OSC-QP and direct-IK execution."""
 
-from inference.config import ExecutionConfig, InferenceConfig, load_inference_config
+from inference.core import (
+    ActionChunk,
+    ActionChunkScheduler,
+    ControlTarget,
+    InferenceBase,
+    InferenceCycle,
+    NeroPipelineRunner,
+    Observation,
+)
+
+from inference.config import (
+    ArchitectureConfig,
+    ExecutionConfig,
+    InferenceConfig,
+    load_inference_config,
+)
 from inference.pipeline import (
     InferenceInput,
     InferenceOutput,
@@ -26,6 +41,14 @@ from inference.h5_observation_stream import (
     load_h5_observation_stream,
 )
 from inference.runtime import NeroInferenceRuntime
+from inference.model_inference import DiffusionPolicyInference, VLAInference
+from inference.policies import DiffusionPolicy, DPPolicy
+from inference.factory import (
+    CONTROLLER_REGISTRY,
+    POLICY_REGISTRY,
+    WORLD_MODEL_REGISTRY,
+    ComponentRegistry,
+)
 from inference.simulation_runner import (
     SimulationRunResult,
     SimulationRunnerConfig,
@@ -34,7 +57,18 @@ from inference.simulation_runner import (
 )
 
 __all__ = [
+    "ActionChunk",
+    "ActionChunkScheduler",
+    "ControlTarget",
     "InferenceConfig",
+    "ArchitectureConfig",
+    "ComponentRegistry",
+    "POLICY_REGISTRY",
+    "WORLD_MODEL_REGISTRY",
+    "CONTROLLER_REGISTRY",
+    "InferenceBase",
+    "InferenceCycle",
+    "NeroPipelineRunner",
     "ExecutionConfig",
     "InferenceInput",
     "InferenceOutput",
@@ -53,6 +87,11 @@ __all__ = [
     "H5ObservationTick",
     "load_h5_observation_stream",
     "NeroInferenceRuntime",
+    "DiffusionPolicyInference",
+    "VLAInference",
+    "DiffusionPolicy",
+    "DPPolicy",
+    "Observation",
     "SimulationRunnerConfig",
     "SimulationRunResult",
     "build_pipeline",

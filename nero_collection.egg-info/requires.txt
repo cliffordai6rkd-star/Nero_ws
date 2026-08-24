@@ -17,5 +17,5 @@ cmeel-urdfdom<5,>=4
 [gpu-identification:platform_system == "Linux" and python_version < "3.11"]
 jax[cuda12]==0.6.2
 
-[tau-f-inference]
+[tau-other-inference]
 torch<3,>=2.3

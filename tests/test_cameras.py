@@ -16,6 +16,7 @@ from nero_collection.cameras import (
     ProcessCameraSource,
     V4L2Camera,
     _FrameRateMeasurement,
+    _FPS_MEASUREMENT_WINDOW_S,
     _build_camera,
     _camera_acquisition_worker,
     _camera_visualizer_worker,
@@ -99,6 +100,28 @@ def test_process_camera_source_continuously_publishes_mock_frames() -> None:
         assert frame is not None
         assert frame.camera_name == "process_mock"
         assert frame.frame.shape == (12, 16, 3)
+    finally:
+        source.stop()
+
+
+def test_mock_camera_keeps_high_resolution_preview_when_policy_is_resized() -> None:
+    source = _build_camera(
+        CameraConfig(
+            name="preview_mock",
+            backend="mock",
+            width=16,
+            height=12,
+            output_size=(4, 3),
+            visualize=True,
+        )
+    )
+    source.start()
+    try:
+        frame = source.poll()
+        assert frame is not None
+        assert frame.frame.shape == (3, 4, 3)
+        assert frame.preview_frame is not None
+        assert frame.preview_frame.shape == (12, 16, 3)
     finally:
         source.stop()
 
@@ -207,6 +230,27 @@ def test_v4l2_preprocessing_crops_resizes_and_converts_to_rgb() -> None:
     assert output.dtype == np.uint8
     assert output.flags.c_contiguous
     assert np.all(output == np.asarray([30, 20, 10], dtype=np.uint8))
+
+
+@pytest.mark.skipif(find_spec("cv2") is None, reason="OpenCV is not installed")
+def test_v4l2_preprocessing_returns_independent_preview_resolution() -> None:
+    import cv2
+
+    frame = np.zeros((4, 6, 3), dtype=np.uint8)
+    config = CameraConfig(
+        name="camera",
+        backend="v4l2",
+        device="/dev/video2",
+        width=6,
+        height=4,
+        output_size=(2, 1),
+    )
+
+    from nero_collection.cameras import _prepare_v4l2_frames
+
+    policy, preview = _prepare_v4l2_frames(frame, config, cv2)
+    assert policy.shape == (1, 2, 3)
+    assert preview.shape == (4, 6, 3)
 
 
 def test_v4l2_poll_returns_each_latest_frame_once() -> None:
@@ -360,6 +404,10 @@ def test_frame_rate_measurement_reports_completed_window_once() -> None:
 
     assert result == pytest.approx((2.0, 2.0))
     assert measurement.observe(12.5) is None
+
+
+def test_camera_fps_monitor_uses_ten_second_window() -> None:
+    assert _FPS_MEASUREMENT_WINDOW_S == pytest.approx(10.0)
 
 
 def test_set_v4l2_boolean_control_sets_and_verifies(monkeypatch) -> None:

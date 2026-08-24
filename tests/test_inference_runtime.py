@@ -160,7 +160,7 @@ class _TauExt:
             tau=np.asarray(tau).copy(),
             tau_id=np.zeros(7),
             tau_id_filtered=np.zeros(7),
-            tau_f_pred=np.zeros(7),
+            tau_other_pred=np.zeros(7),
             tau_next_pred=np.zeros(7),
             tau_ext_cal=np.zeros(7),
             tau_ext_pred=np.zeros(7),
@@ -337,7 +337,7 @@ def test_runtime_waits_for_consumer_only_when_hardware_ring_is_fresh() -> None:
     assert stream.wait_calls[0][1] == pytest.approx(0.1)
 
 
-def test_observation_warmup_samples_tau_f_and_wrench_without_inference() -> None:
+def test_observation_warmup_samples_tau_other_and_wrench_without_inference() -> None:
     arm, pipeline, tau_ext, wrench = _Arm(), _Pipeline(), _TauExt(), _Wrench()
     runtime = NeroInferenceRuntime(
         _protected_config(warmup_duration_s=0.002),

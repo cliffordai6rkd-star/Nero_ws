@@ -69,7 +69,7 @@ class PinocchioJointTorqueResidualEstimator:
         )
         log.info(
             "Pinocchio inverse-dynamics residual estimator ready urdf=%s manifest=%s "
-            "(friction/bias ignored for tau_f)",
+            "(friction/bias ignored for tau_other)",
             config.urdf_path,
             config.manifest_path or "none (RNEA only)",
         )

@@ -236,7 +236,7 @@ def test_inverse_dynamics_estimator_returns_tau_id_minus_measured() -> None:
 
 
 @pytest.mark.skipif(find_spec("pinocchio") is None, reason="Pinocchio is not installed")
-def test_inverse_dynamics_estimator_ignores_identified_friction_and_bias_for_tau_f(
+def test_inverse_dynamics_estimator_ignores_identified_friction_and_bias_for_tau_other(
     tmp_path: Path,
 ) -> None:
     import pinocchio as pin

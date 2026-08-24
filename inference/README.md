@@ -1,5 +1,52 @@
 # Nero 完整推理
 
+> 开发模块、公共契约和新增 DP/PI0 action expert 的指南见
+> [`README_DEVELOPMENT.md`](README_DEVELOPMENT.md)。本文主要记录运行时配置、真机启动、H5 回放和 MuJoCo 使用方式。
+
+## Modular inference components
+
+在线运行时正在收敛到以下稳定边界：
+
+```text
+NeroObservationSampler -> ObservationProcessor -> HighLevelPolicy
+                       -> ActionScheduler -> WorldModel
+                       -> ActionResolver/SafetyGuard -> RobotController
+```
+
+公共契约位于 `inference/core/`。`InferenceBase` 只负责生命周期和阶段编排，
+模型适配器位于 `inference/policies/`，WM 位于 `inference/world_models/`，控制器
+适配器位于 `inference/control/`。现有 `NeroInferenceRuntime` 已经使用独立的
+`NeroObservationSampler` 和 `NeroPipelineOutputController`，因此 DP、Contact WM
+和 direct-IK 的旧入口仍保持兼容，后续可以逐步替换 `pipeline.py` 内部阶段。
+
+`architecture` 配置块用于选择新的编排层，默认关闭以保持旧 YAML 行为：
+
+```yaml
+architecture:
+  enabled: false
+  policy_type: legacy_pipeline
+  world_model_type: none
+```
+
+WM 尚未确定时使用 `NullWorldModel`，它不会在基类中引入额外的分支。
+
+相机的 `output_size` 只影响模型输入；开启 `visualize` 后预览默认使用裁剪后的
+采集分辨率。需要单独缩放预览时配置 `preview_output_size`：
+
+```yaml
+cameras:
+  - name: wrist
+    width: 640
+    height: 480
+    output_size: [256, 192]
+    preview_output_size: null
+    visualize: true
+```
+
+推理时的 `tau_ext` 图复用数采的 `RealtimeJointPlotter`，数据由
+`inference/diagnostics/tau_ext.py` 适配，不会阻塞状态采样和控制线程。
+`realtime_plot.norm` 默认为 `l1` 以保持历史曲线；需要数学上的欧氏范数时设置为 `l2`。
+
 `predictor.enabled` 是执行链路开关：
 
 - `true`：加载 predictor；旧模型走 OSC-QP，contact WM 按 `execution.mode` 选择 MIT、
@@ -235,7 +282,7 @@ V3 运行时数据流为：
 ```text
 image + wrench history -> DP checkpoint -> action_target (xyz + xyzw)
 q/v/a/tau/wrench history + future action -> world_model_v3 -> future q/v/a/tau
-future q/v/a/tau -> RNEA tau_id + frozen tau_f - tau -> tau_ext_cal
+future q/v/a/tau -> RNEA tau_g + frozen tau_other - tau -> tau_ext_cal
 tau_ext -> damped J(q)^T inverse -> future target wrench_ext
 latest action pose + target f_ext + measured f_ext -> OSC-QP -> tau_command
 ```
@@ -248,7 +295,7 @@ DP physical action -> V4 checkpoint action normalization
 q/tau history + normalized future action -> world_model_v4 -> future q/tau
 [observed q history, predicted future q]
   -> causal q mean/LPF -> difference -> dq LPF -> difference -> ddq LPF
-future q/dq/ddq/tau -> RNEA tau_id + frozen tau_f - tau -> tau_ext_cal
+future q/dq/ddq/tau -> RNEA tau_g + frozen tau_other - tau -> tau_ext_cal
 tau_ext -> damped J(q)^T inverse -> future target wrench_ext
 latest action pose + target f_ext + measured f_ext -> OSC-QP -> tau_command
 ```
@@ -277,7 +324,7 @@ current q/v/a/tau + future action -> wrench_gru -> future target wrench_ext
 
 - 从臂 CAN、固件和 rest pose；
 - 腕部相机；
-- `tau_f` checkpoint；
+- `tau_other` checkpoint；
 - Pinocchio 逆动力学；
 - `tau_ext -> wrench_ext` 阻尼 Jacobian 映射。
 
@@ -294,7 +341,7 @@ follower pyAgxArm latest SDK cache
   -> 由 teleop.command.sample_rate_hz 驱动的固定 tick
   -> 同一 tick 的 q/dq/ddq/tau
   -> tau-ext estimate_aligned(timestamp,q,dq,tau,q_cmd)
-  -> tau_id - tau - tau_f_pred
+  -> tau_g + tau_other_pred - tau
   -> tau_ext
   -> damped J(q)^T inverse
   -> measured wrench_ext
@@ -312,11 +359,11 @@ main runtime       <- latest state for control
                    <- drain all accumulated wrench samples for DP history
 ```
 
-每个状态样本的 `q/dq/ddq/tau/tau_f/wrench` 都使用同一个固定 tick
+每个状态样本的 `q/dq/ddq/tau/tau_other/wrench` 都使用同一个固定 tick
 `timestamp_us`；`acquired_timestamp_us` 只用于控制侧检查状态是否过期。PyAgx SDK、CAN parser、
 状态采样和机械臂指令只存在于独立硬件子进程。主循环忙于 DP 推理或 minimum-jerk 动作执行
 时，固定频率状态线程仍持续调用 SDK getter，进程内有界历史保留中间状态；主循环随后按时间顺序消费这些状态，
-推进 tau-f/tau-next 两个 50 帧滑动窗口，并把期间产生的每一帧 wrench 补回 open-loop 的带时间戳状态历史。相机帧仍由
+推进 tau-other/tau-next 两个 50 帧滑动窗口，并把期间产生的每一帧 wrench 补回 open-loop 的带时间戳状态历史。相机帧仍由
 `CameraManager` 连续采集，DP 在形成完整窗口时再按相机时间戳与状态历史对齐；因此
 不会重复消费同一个 tick 来填充 checkpoint 所需的历史（例如一张图像对应 8 个互不重复的状态
 样本）。
@@ -337,20 +384,19 @@ episode reset、startup recovery 和 shutdown 会先停止并清空连续流，�
 `MasterSlaveTeleop` 使用同一固定频率最新缓存语义。外力矩 RNEA 不使用普通状态字段 `ddq_follower`，
 而是由与 PINN offline forward pass 一致的因果 Kalman 从同一 tick 的 `q/dq` 估计 `ddq_kf_causal`。
 每个底层状态帧先复制，并由共享的 `source_butterworth_filter` 对 `q/dq/tau/q_cmd` 做因果滤波；
-随后 `tau_f` 和 `tau_next` 分别按
+随后 `tau_other` 和 `tau_next` 分别按
 `teleop.command.sample_rate_hz / observation_sample_rate_hz` 的整数 stride 取第 0、N、2N…帧。
 两路不再按时间戳执行最近邻或 Unix epoch 固定相位重采样；无法得到整数 stride 的配置会在启动时报错。
 episode 复位会重启固定频率状态流，并清空两个固定窗口、Kalman 状态和两条 tau_ext 滤波状态，等待新的有限
 `q/dq/tau/q_cmd` 有效后才恢复推理。collection runtime 要求 `tau_ext_inference.enabled: true`
 并至少配置实际使用的 checkpoint。主从遥操作通过
-`tau_ext_inference.feedback_source: tau_f | tau_free` 选择反馈分支：`tau_f` 对应
+`tau_ext_inference.feedback_source: tau_other | tau_free` 选择反馈分支：`tau_other` 对应
 `tau_ext_cal`，`tau_free` 对应内部历史名 `tau_next` 的 `tau_ext_pred`。两路同时配置时仍会同时推理和记录，
 选择项只影响主臂反馈；每路独立执行 history-ready 和 prediction-age 判定，所选分支未就绪时反馈为零。
-模型输入不在运行时代码中固定为三路：加载器按 checkpoint 的 `model.inputs` 顺序组装
-`q/dq/delta_q/tau` 的任意有序子集。配置中的 `input_keys` 仅作为可选的严格校验，省略时采用
-checkpoint 自带列表。对于 `causal_rnea_residual_v1`，在线侧还会恢复并校验 checkpoint 中的
-Kalman、`dq_sign`、RNEA state source 和 torque filter 契约；滤波后的同一份 `tau` 同时进入模型和
-`tau_f=tau_filtered-tau_id_filtered` 残差链，避免二次滤波造成训练/部署偏差。
+`tau_other` checkpoint 的输入严格为 `q/dq/delta_q`，不接收测量力矩、`ddq` 或 `tau_id`。
+其目标契约为 `tau_other=tau_measured-tau_g`，其中 `tau_measured=observation.torque`、
+`tau_g=RNEA(q,0,0)`；在线反馈使用 `tau_g + tau_other_pred - tau_follower`。`tau_id` 仍单独由
+因果 Kalman 得到 `ddq` 后计算完整的 `RNEA(q,dq,ddq)`，只用于记录和其他需要动力学输入的分支。
 
 DP 的 observation 也按 checkpoint 时间契约取样：只把新相机 timestamp 加入图像时间线，
 以训练配置的 `timestamp_step_sec=0.1` 选择 10 Hz image anchors；每个 anchor 从带时间戳的
@@ -445,16 +491,16 @@ runtime 会在送入 OSC-QP 前将 measured/target wrench 旋转至
 `LOCAL_WORLD_ALIGNED`。
 
 `predictor.mode: world_model_v3` 对应原生 `DeterministicWorldModelV3.predict()`。
-推理端使用 collection 配置中的同一个 tau_f checkpoint、Pinocchio URDF、重力、锁定关节、
-末端 frame、参考坐标系和阻尼系数。tau_f 对“实测历史 + V3 预测未来”做一次无状态序列推理，
-因此不会修改 runtime 中用于当前实测 wrench 的在线 tau_f GRU 隐状态。V3 的
-`history_horizon` 必须不小于 tau_f checkpoint 的训练 horizon（当前均为 50）。
+推理端使用 collection 配置中的同一个 tau_other checkpoint、Pinocchio URDF、重力、锁定关节、
+末端 frame、参考坐标系和阻尼系数。tau_other 对“实测历史 + V3 预测未来”做一次无状态序列推理，
+因此不会修改 runtime 中用于当前实测 wrench 的在线 tau_other GRU 隐状态。V3 的
+`history_horizon` 必须不小于 tau_other checkpoint 的训练 horizon（当前均为 50）。
 
 `predictor.mode: world_model_v4` 对应原生 `DeterministicWorldModelV4.predict()`。
 V4 checkpoint 的 `model.state_estimator` 保存 `sampling_dt`、q 均值窗口和 q/dq/ddq
 三个低通截止频率。推理端反归一化 q/tau 后调用 checkpoint 模型自带的
 `reconstruct_future_state()`，训练与部署因此使用同一份 Torch 因果递推实现；实测历史
-v/a 仍用于 tau_f 历史，预测未来 v/a 只从预测 q 得到。当前打包训练数据没有每个子采样
+v/a 仍用于 tau_other 历史，预测未来 v/a 只从预测 q 得到。当前打包训练数据没有每个子采样
 timestamp，所以该固定网格保证的是训练/部署约定一致，不等价于逐点复现原始异步 CAN
 滤波状态。
 

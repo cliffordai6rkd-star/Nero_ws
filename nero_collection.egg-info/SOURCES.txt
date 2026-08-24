@@ -29,7 +29,7 @@ nero_collection/h5_writer.py
 nero_collection/keyboard.py
 nero_collection/realtime_dynamics.py
 nero_collection/realtime_plot.py
-nero_collection/tau_f_inference.py
+nero_collection/tau_other_inference.py
 nero_collection/time_utils.py
 nero_collection.egg-info/PKG-INFO
 nero_collection.egg-info/SOURCES.txt
@@ -60,4 +60,4 @@ tests/test_osc_qp.py
 tests/test_post_save_reset.py
 tests/test_realtime_plot.py
 tests/test_startup_sequence.py
-tests/test_tau_f_inference.py
+tests/test_tau_other_inference.py

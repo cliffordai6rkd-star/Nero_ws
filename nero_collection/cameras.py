@@ -21,7 +21,9 @@ from nero_collection.time_utils import now_us
 
 log = logging.getLogger(__name__)
 
-_FPS_MEASUREMENT_WINDOW_S = 3.0
+# Measure decoded frames over a full 10-second interval before deciding that
+# the configured camera stream is persistently running below target rate.
+_FPS_MEASUREMENT_WINDOW_S = 10.0
 _FPS_WARNING_RATIO = 0.90
 
 
@@ -59,6 +61,9 @@ class CameraFrame:
     camera_name: str
     timestamp_us: int
     frame: np.ndarray
+    # Optional independent preview frame. ``frame`` remains the policy/data
+    # path so existing callers keep the configured output_size contract.
+    preview_frame: np.ndarray | None = None
 
 
 class CameraVisualizer:
@@ -187,10 +192,15 @@ class CameraVisualizer:
                 frame_queue = self._queue
                 if frame_queue is None:
                     return
+                preview_frame = (
+                    item.preview_frame
+                    if item.preview_frame is not None
+                    else item.frame
+                )
                 preview = CameraFrame(
                     camera_name=item.camera_name,
                     timestamp_us=int(item.timestamp_us),
-                    frame=np.asarray(item.frame).copy(),
+                    frame=np.asarray(preview_frame).copy(),
                 )
                 _put_latest_camera_preview(frame_queue, preview)
             except Exception:
@@ -236,7 +246,11 @@ def _camera_visualizer_worker(
                     stop = True
                     break
                 if isinstance(item, CameraFrame) and item.camera_name in selected:
-                    latest_frames[item.camera_name] = np.asarray(item.frame)
+                    latest_frames[item.camera_name] = np.asarray(
+                        item.preview_frame
+                        if item.preview_frame is not None
+                        else item.frame
+                    )
             if stop:
                 break
 
@@ -590,14 +604,42 @@ class MockCamera(CameraSource):
             return None
         period = 1.0 / max(self.config.fps, 1.0)
         self._next_frame_t = now + period
-        width, height = self.config.output_size or (self.config.width, self.config.height)
+        width, height = self.config.width, self.config.height
         yy, xx = np.mgrid[0:height, 0:width]
-        frame = np.zeros((height, width, 3), dtype=np.uint8)
-        frame[..., 0] = (xx + self._counter) % 255
-        frame[..., 1] = (yy + 2 * self._counter) % 255
-        frame[..., 2] = (40 + 3 * self._counter) % 255
+        preview = np.zeros((height, width, 3), dtype=np.uint8)
+        preview[..., 0] = (xx + self._counter) % 255
+        preview[..., 1] = (yy + 2 * self._counter) % 255
+        preview[..., 2] = (40 + 3 * self._counter) % 255
         self._counter += 1
-        return CameraFrame(self.name, now_us(), frame)
+        policy = preview
+        if self.config.output_size is not None:
+            output_width, output_height = self.config.output_size
+            y_index = np.minimum(
+                (np.arange(output_height) * height / output_height).astype(int),
+                height - 1,
+            )
+            x_index = np.minimum(
+                (np.arange(output_width) * width / output_width).astype(int),
+                width - 1,
+            )
+            policy = preview[y_index][:, x_index]
+        if self.config.preview_output_size is not None:
+            preview_width, preview_height = self.config.preview_output_size
+            y_index = np.minimum(
+                (np.arange(preview_height) * height / preview_height).astype(int),
+                height - 1,
+            )
+            x_index = np.minimum(
+                (np.arange(preview_width) * width / preview_width).astype(int),
+                width - 1,
+            )
+            preview = preview[y_index][:, x_index]
+        return CameraFrame(
+            self.name,
+            now_us(),
+            policy,
+            preview if self.config.visualize else None,
+        )
 
 
 @dataclass
@@ -633,6 +675,7 @@ class V4L2Camera(CameraSource):
     _stop_event: threading.Event = field(init=False, default_factory=threading.Event)
     _frame_lock: threading.Lock = field(init=False, default_factory=threading.Lock)
     _latest_frame: np.ndarray | None = field(init=False, default=None)
+    _latest_preview_frame: np.ndarray | None = field(init=False, default=None)
     _latest_timestamp_us: int = field(init=False, default=0)
     _delivered_timestamp_us: int = field(init=False, default=0)
     _last_frame_monotonic_s: float = field(init=False, default=0.0)
@@ -698,6 +741,7 @@ class V4L2Camera(CameraSource):
         with self._frame_lock:
             self._reader_error = None
             self._latest_frame = None
+            self._latest_preview_frame = None
             self._latest_timestamp_us = 0
             self._delivered_timestamp_us = 0
             self._last_frame_monotonic_s = 0.0
@@ -793,8 +837,13 @@ class V4L2Camera(CameraSource):
                 return None
             timestamp_us = self._latest_timestamp_us
             frame = self._latest_frame.copy()
+            preview_frame = (
+                None
+                if self._latest_preview_frame is None
+                else self._latest_preview_frame.copy()
+            )
             self._delivered_timestamp_us = timestamp_us
-        return CameraFrame(self.name, timestamp_us, frame)
+        return CameraFrame(self.name, timestamp_us, frame, preview_frame)
 
     def _configure_device_controls(self, device: str) -> None:
         if self.config.exposure is not None:
@@ -821,8 +870,17 @@ class V4L2Camera(CameraSource):
                 if self._stop_event.is_set():
                     return
                 frame = decoded_frame.to_ndarray(format="bgr24")
-                prepared = _prepare_v4l2_frame(frame, self.config, cv2)
-                self._store_frame(prepared, now_us())
+                prepared, preview = _prepare_v4l2_frames(
+                    frame,
+                    self.config,
+                    cv2,
+                    include_preview=self.config.visualize,
+                )
+                self._store_frame(
+                    prepared,
+                    now_us(),
+                    preview_frame=preview if self.config.visualize else None,
+                )
                 result = (
                     fps_measurement.observe(time.monotonic())
                     if self._fps_measurement_enabled.is_set()
@@ -879,9 +937,18 @@ class V4L2Camera(CameraSource):
                 f"{duration_s:.1f}s warmup"
             )
 
-    def _store_frame(self, frame: np.ndarray, timestamp_us: int) -> None:
+    def _store_frame(
+        self,
+        frame: np.ndarray,
+        timestamp_us: int,
+        *,
+        preview_frame: np.ndarray | None = None,
+    ) -> None:
         with self._frame_lock:
             self._latest_frame = frame
+            self._latest_preview_frame = (
+                None if preview_frame is None else np.asarray(preview_frame).copy()
+            )
             self._latest_timestamp_us = int(timestamp_us)
             self._last_frame_monotonic_s = time.monotonic()
 
@@ -1152,7 +1219,19 @@ def _configure_pyav_decoder(stream) -> None:
     codec_context.thread_type = "NONE"
 
 
-def _prepare_v4l2_frame(frame: np.ndarray, config: CameraConfig, cv2) -> np.ndarray:
+def _prepare_v4l2_frames(
+    frame: np.ndarray,
+    config: CameraConfig,
+    cv2,
+    *,
+    include_preview: bool = True,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Return independent policy and preview RGB frames.
+
+    ``output_size`` is intentionally applied only to the policy path.  The
+    preview defaults to the cropped decoded resolution and can be resized
+    independently through ``preview_output_size``.
+    """
     frame = np.asarray(frame)
     if frame.ndim == 2:
         frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
@@ -1170,12 +1249,45 @@ def _prepare_v4l2_frame(frame: np.ndarray, config: CameraConfig, cv2) -> np.ndar
         raise RuntimeError(
             f"camera {config.name} crop {config.crop} is outside frame {width}x{height}"
         )
-    frame = frame[y0:y1, x0:x1]
+    cropped = frame[y0:y1, x0:x1]
+    preview = cropped if include_preview else None
+    if include_preview and config.preview_output_size is not None:
+        preview_width, preview_height = config.preview_output_size
+        shrinking = preview_width < cropped.shape[1] or preview_height < cropped.shape[0]
+        interpolation = cv2.INTER_AREA if shrinking else cv2.INTER_LINEAR
+        preview = cv2.resize(
+            cropped,
+            (preview_width, preview_height),
+            interpolation=interpolation,
+        )
+    if preview is not None:
+        preview = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
+    policy = cropped
     if config.output_size is not None:
         output_width, output_height = config.output_size
-        shrinking = output_width < frame.shape[1] or output_height < frame.shape[0]
+        shrinking = output_width < policy.shape[1] or output_height < policy.shape[0]
         interpolation = cv2.INTER_AREA if shrinking else cv2.INTER_LINEAR
-        frame = cv2.resize(frame, (output_width, output_height), interpolation=interpolation)
+        policy = cv2.resize(
+            policy,
+            (output_width, output_height),
+            interpolation=interpolation,
+        )
     # OpenCV V4L2 decodes to BGR; datasets use conventional RGB channel order.
-    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    return np.ascontiguousarray(frame, dtype=np.uint8)
+    policy = cv2.cvtColor(policy, cv2.COLOR_BGR2RGB)
+    return (
+        np.ascontiguousarray(policy, dtype=np.uint8),
+        None
+        if preview is None
+        else np.ascontiguousarray(preview, dtype=np.uint8),
+    )
+
+
+def _prepare_v4l2_frame(frame: np.ndarray, config: CameraConfig, cv2) -> np.ndarray:
+    """Backward-compatible policy-frame helper used by existing callers/tests."""
+    policy, _preview = _prepare_v4l2_frames(
+        frame,
+        config,
+        cv2,
+        include_preview=False,
+    )
+    return policy

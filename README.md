@@ -29,16 +29,16 @@ python scripts/calibrate_gripper.py follower
 ```yaml
 tau_ext_inference:
   enabled: true
-  feedback_source: tau_f  # 可选 tau_f / tau_free
-  tau_f:
-    checkpoint_path: ../../PINN/outputs/tau_f_sequence/lstm_causal_derived/checkpoints/epoch_083_val_loss_0.003087.pt
-    input_keys: [q, dq, ddq, delta_q, tau, tau_id]
+  feedback_source: tau_other  # 可选 tau_other / tau_free
+  tau_other:
+    checkpoint_path: ../../PINN/outputs/tau_other_sequence/lstm_causal_derived/checkpoints/epoch_083_val_loss_0.003087.pt
+    input_keys: [q, dq, delta_q]
   tau_next:
     checkpoint_path: null
 ```
-- `tau_f` 使用 `tau_id_filtered + tau_f_pred - tau_follower`。
+- `tau_other` 使用 `tau_g + tau_other_pred - tau_follower`，其中 `tau_g=RNEA(q,0,0)`。
 - `tau_free` 使用 `tau_free_pred - tau_follower`，配置块内部名称为 `tau_next`。
-- `input_keys` 是可选的 checkpoint 契约校验项，允许 `q/dq/ddq/delta_q/tau/tau_id` 的有序子集；省略时直接读取 checkpoint 的 `model.inputs`。100 Hz 源帧先按 `source_butterworth_filter` 过滤，再按 stride 取 50 Hz；`ddq` 由过滤后的 `q/dq` 经因果 Kalman 得到，`tau_id` 是直接的 `RNEA(q,dq,ddq)` 输出。`tau_id_filtered` 仅用于 `tau_f` 残差公式。`tau_free` 使用这两个动力学输入时必须同时启用同采样率的 `tau_f` 分支，以共享同一帧结果。
+- `tau_other` 的 checkpoint 输入严格为 `q/dq/delta_q`，目标为 `tau_measured-tau_g`，其中 `tau_measured=observation.torque`；`tau_id` 单独记录完整的 `RNEA(q,dq,ddq)` 结果。100 Hz 源帧先按 `source_butterworth_filter` 过滤，再按 stride 取 50 Hz。`tau_free` 使用动力学输入时必须同时启用同采样率的 `tau_other` 分支，以共享同一帧状态。
 - `tau_ext_inference.inverse_dynamics` 保存计算 `tau_ext_cal` 所需的 URDF/RNEA 参数；`realtime_plot` 累积显示当前 episode 的七轴 `tau_ext_cal/tau_ext_pred` 及其 L1 范数，开始新 episode 时清空。新 H5 不再写入 `wrench_*` 数据集。
 
 ## 轨迹规划器

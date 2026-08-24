@@ -13,7 +13,7 @@ teleop:
       # 主臂拖动阻尼；主臂 kp 固定使用代码默认值 0。
       leader_kd: [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]
       # 下面的两个值尽量都不要修改，比较危险  并且改了的话需要重新采背景力矩数据   因为这些值会改变动力学系统
-      follower_kp: [3.0, 3.0, 2.0, 3.5, 2.0, 2.0, 3.0]   # q
+      follower_kp: [4.0, 3.0, 4.0, 3.5, 5.0, 2.0, 3.0]   # q
       # insert_usb和wipe_board的参数
       #  follower_kp: [3.0, 3.0, 2.0, 3.5, 2.0, 2.0, 3.0]   # q
       follower_kd: [0.1, 0.1, 0.25, 0.25, 0.1, 0.1, 0.1]  # v
@@ -21,10 +21,10 @@ teleop:
       force_feedback_gain: [1, 1, 1, 1, 1, 1, 1]
       # force_feedback_gain: [0, 0, 0, 0, 0, 0, 0]
       force_feedback_sign: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
-      force_feedback_deadband_nm: [0.25, 1.0, 0.25, 1.0, 0.25, 0.25, 0.25]
+      force_feedback_deadband_nm: [0.25, 0.6, 0.25, 0.6, 0.25, 0.25, 0.25]
       # force_feedback_limit_nm: [5, 5, 5, 5, 5, 5, 5]
-      force_feedback_limit_nm: [5, 5, 10, 10, 10, 10, 10]
-      # null 表示关闭内部动力学残差力反馈的低通；tau_f/tau_free override 不经过此滤波。
+      force_feedback_limit_nm: [20, 20, 20, 20, 20, 20, 20]
+      # null 表示关闭内部动力学残差力反馈的低通；tau_other/tau_free override 不经过此滤波。
       force_feedback_lowpass_hz: null
     joint_step_limit_rad: 0.3
     reset_on_start: true
@@ -53,10 +53,12 @@ teleop:
           rest_q: [+0.00000, -0.14689, 0, +1.80020, 0, +0.02744, +1.50378]
 
 
-# output:
-#   directory: ../runs/insert_usb
+output:
+  # directory: ../runs/bg_data
+  # directory: ../runs/insert_usb
   # directory: ../runs/wipe_board
-  directory: ../runs/pick_dumbbell
+  # directory: ../runs/cut_cuccumber
+  directory: ../runs/push_button
   prefix: episode
   # 每个 episode 开始后先运行控制和滤波，但不保存或可视化这段数据。
   discard_initial_s: 0.5
@@ -70,25 +72,22 @@ tau_ext_inference:
     cutoff_hz: 15
     order: 2
 
-  # 主臂力反馈来源：tau_f 使用 RNEA+tau_f residual；tau_free 使用自由空间
-  # torque 模型 residual。两路若都配置，仍会同时推理、绘图并写入 H5。
-  feedback_source: tau_f
+  # 主臂力反馈来源：tau_other 使用 RNEA+tau_other residual；tau_free 使用自由空间
+  feedback_source: tau_free
   # 相邻底层源帧超过该间隔时只记录警告；不会按时间间隔补帧或清空模型历史。
   observation_gap_warning_s: 0.06
   maximum_prediction_age_s: 0.06
 
-  tau_f:
-    checkpoint_path: model/tau_f/epoch_075_val_loss_0.001229.pt
+  tau_other:
+    checkpoint_path: model/tau_other/epoch_122_val_loss_0.014045.pt
     # stride = teleop.command.sample_rate_hz / observation_sample_rate_hz = 2。
     observation_sample_rate_hz: 50.0
 
   tau_next:
-    checkpoint_path: model/tau_free/epoch_089_val_tau_mse_nm2_0.006167.pt
-    # 同样取过滤后底层帧的第 0、2、4...帧。
+    checkpoint_path: model/tau_free/epoch_124_val_tau_mse_nm2_0.005756.pt
     observation_sample_rate_hz: 50
 
-  # 必须与 tau_f checkpoint 的 derived_target_config.state_estimator 一致；
-  # 在线恢复 forward Kalman，RTS 不参与部署。
+  # 用于在线计算 tau_id=RNEA(q,dq,ddq) 的因果 Kalman；tau_other 的重力目标不依赖 ddq。
   state_estimator:
     position_std: 5.0e-4
     velocity_std: 3.0e-2
@@ -101,8 +100,9 @@ tau_ext_inference:
   tau_ext_filter:
     enabled: true
     mode: moving_average
-    window: 10
-    cutoff_hz: 50
+    # 可按关节分别设置；标量仍表示所有关节共用同一参数。
+    window: [8, 10, 8, 10, 5, 5, 5]
+    cutoff_hz: [5, 5, 20, 5, 30, 30, 30]
 
   # URDF is used only by the online inverse-dynamics residual that produces tau_ext.
   inverse_dynamics:
@@ -115,8 +115,11 @@ realtime_plot:
   # 当前图中预测量依赖 PINN/NEXT；新模型可用前必须关闭。
   enabled: true
   # 累积显示当前 episode 的全部历史；该值只是初始横轴宽度。
-  window_s: 20.0
-  update_rate_hz: 20.0
+  window_s: 0.1
+  update_rate_hz: 50.0
+  # 填写数值后会在两个 ||tau_ext|| 窗口绘制红色虚线；null 表示不绘制。
+  precontact_threshold: 0.6
+  contact_threshold: 2.5
 
 cameras:
   - name: side
@@ -169,7 +172,7 @@ gripper:
   offset_m: 0.0
   min_width_m: 0.0
   max_width_m: 0.1
-  force_n: 5
+  force_n: 3
   command_rate_hz: 25
   deadband_m: 0.0005
   keepalive_s: 0.5

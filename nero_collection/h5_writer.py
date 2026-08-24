@@ -31,9 +31,10 @@ FOLLOWER_TELEOP_DATASETS = frozenset(
         "current_leader",
         "gripper_follower",
         "gripper_cmd",
+        "tau_g",
         "tau_id",
         "tau_id_filtered",
-        "tau_f_pred",
+        "tau_other_pred",
         "tau_next_pred",
         "tau_ext_cal_raw",
         "tau_ext_pred_raw",
@@ -83,7 +84,7 @@ class EpisodeBuffer:
             inference_enabled = inference_enabled and any(
                 branch.checkpoint_path is not None
                 for branch in (
-                    self.config.tau_ext_inference.tau_f,
+                    self.config.tau_ext_inference.tau_other,
                     self.config.tau_ext_inference.tau_next,
                 )
             )
@@ -154,9 +155,10 @@ class EpisodeBuffer:
                 processed_values["q_cmd"][1],
             )
             for name, value in (
+                ("tau_g", result.tau_g),
                 ("tau_id", result.tau_id),
                 ("tau_id_filtered", result.tau_id_filtered),
-                ("tau_f_pred", result.tau_f_pred),
+                ("tau_other_pred", result.tau_other_pred),
                 ("tau_next_pred", result.tau_next_pred),
                 (
                     "tau_ext_cal_raw",
@@ -365,7 +367,7 @@ class EpisodeBuffer:
         sample_rates = {
             name: model_metadata.sample_rate_hz
             for name, model_metadata in (
-                ("tau_f", metadata.tau_f),
+                ("tau_other", metadata.tau_other),
                 ("tau_next", metadata.tau_next),
             )
             if model_metadata is not None
@@ -403,12 +405,31 @@ class EpisodeBuffer:
                 NERO_V120_MOTOR_VELOCITY_TO_JOINT_SIGN
             ),
         }
-        if metadata.tau_f is not None:
+        if metadata.tau_other is not None:
+            attrs["tau_g"].update(
+                {
+                    **common,
+                    "first_valid_sample_index": 0,
+                    "definition": "RNEA(q, 0, 0) = tau_g",
+                    "processing_method": "online_pinocchio_gravity_rnea",
+                    "lowpass": False,
+                    "zero_phase": False,
+                    "q_source_dataset": "teleop/q_follower",
+                    "dq_source": "zero",
+                    "ddq_source": "zero",
+                    "model_urdf": str(
+                        self.config.tau_ext_inference.inverse_dynamics.urdf_path
+                    ),
+                    "model_manifest": str(
+                        self.config.tau_ext_inference.inverse_dynamics.manifest_path or ""
+                    ),
+                }
+            )
             attrs["tau_id"].update(
                 {
                 **common,
                 "first_valid_sample_index": 0,
-                "definition": "RNEA using internal causal Kalman acceleration",
+                "definition": "RNEA(q, dq, ddq) = tau_id",
                 "processing_method": "online_pinocchio_rnea",
                 "lowpass": False,
                 "zero_phase": False,
@@ -426,58 +447,37 @@ class EpisodeBuffer:
         else:
             disabled_dynamics = {
                 **common,
-                "definition": "disabled because tau_f checkpoint is empty",
+                "definition": "disabled because tau_other checkpoint is empty",
                 "processing_method": "disabled_zero_output",
                 "lowpass": False,
                 "zero_phase": False,
             }
+            attrs["tau_g"].update(disabled_dynamics)
             attrs["tau_id"].update(disabled_dynamics)
-        if metadata.tau_f is not None:
+        if metadata.tau_other is not None:
             attrs["tau_id_filtered"].update(
                 {
                 **common,
                 "first_valid_sample_index": 0,
-                "definition": "checkpoint_causal_filter(tau_id)",
-                "processing_method": "checkpoint_dataloader_filter_pipeline",
-                "lowpass": _pipeline_has_operation(
-                    metadata.tau_f.dataloader_filters,
-                    "tau",
-                    "lowpass",
-                ),
-                "median_window": _pipeline_window(
-                    metadata.tau_f.dataloader_filters,
-                    "tau",
-                    "median",
-                    fallback=metadata.tau_f.target_filter_median_window or 1,
-                ),
-                "filter_operations_json": json.dumps(
-                    _metadata_filter_operations(metadata.tau_f, "tau")
-                ),
+                "definition": "duplicate of RNEA(q, dq, ddq) = tau_id",
+                "processing_method": "duplicate_full_rnea",
+                "lowpass": False,
                 "zero_phase": False,
-                "filter_timeline": "teleop/timestamp_us",
-                "filter_initialization": "first_sample",
                 "source_dataset": "teleop/tau_id",
                 }
             )
-            lowpass_cutoff_hz = _pipeline_cutoff_hz(
-                metadata.tau_f.dataloader_filters,
-                "tau",
-                fallback=metadata.tau_f.target_filter_cutoff_hz,
-            )
-            if lowpass_cutoff_hz is not None:
-                attrs["tau_id_filtered"]["lowpass_cutoff_hz"] = lowpass_cutoff_hz
         else:
             attrs["tau_id_filtered"].update(
                 {
                     **common,
-                    "definition": "disabled because tau_f checkpoint is empty",
+                    "definition": "disabled because tau_other checkpoint is empty",
                     "processing_method": "disabled_zero_output",
                     "lowpass": False,
                     "zero_phase": False,
                 }
             )
         for dataset_name, model_metadata, definition in (
-            ("tau_f_pred", metadata.tau_f, "checkpoint prediction of tau_f"),
+            ("tau_other_pred", metadata.tau_other, "checkpoint prediction of tau_other"),
             ("tau_next_pred", metadata.tau_next, "checkpoint prediction of tau"),
         ):
             if model_metadata is None:
@@ -493,7 +493,7 @@ class EpisodeBuffer:
                     }
                 )
                 continue
-            model_name = "tau_f" if dataset_name == "tau_f_pred" else "tau_next"
+            model_name = "tau_other" if dataset_name == "tau_other_pred" else "tau_next"
             observation_sample_rate_hz = (
                 self.online_tau_ext.observation_sample_rate_hz(model_name)
                 if hasattr(self.online_tau_ext, "observation_sample_rate_hz")
@@ -580,14 +580,14 @@ class EpisodeBuffer:
                 }
             )
         tau_source_lowpass = bool(
-            metadata.tau_f is not None
+            metadata.tau_other is not None
             and (
                 _pipeline_has_operation(
-                    metadata.tau_f.dataloader_filters,
+                    metadata.tau_other.dataloader_filters,
                     "tau",
                     "lowpass",
                 )
-                or metadata.tau_f.target_filter_cutoff_hz
+                or metadata.tau_other.target_filter_cutoff_hz
             )
         )
         tau_next_target = "tau_follower"
@@ -614,10 +614,10 @@ class EpisodeBuffer:
             (
                 "tau_ext_cal_raw",
                 "tau_ext_cal",
-                "tau_id_filtered + tau_f_pred - tau_follower",
+                "tau_g + tau_other_pred - tau_follower",
                 "online_inverse_dynamics_residual",
-                feedback_source == "tau_f",
-                metadata.tau_f,
+                feedback_source == "tau_other",
+                metadata.tau_other,
             ),
             (
                 "tau_ext_pred_raw",

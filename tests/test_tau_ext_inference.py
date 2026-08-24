@@ -47,12 +47,28 @@ def _metadata(output_key: str) -> SequenceCheckpointMetadata:
         architecture="lstm",
         normalize_mode="gaussian",
         target_contract=(
-            "matched_causal_torque_filter_v1" if output_key == "tau_f" else None
+            "causal_gravity_residual_v1" if output_key == "tau_other" else None
         ),
-        target_filter_enabled=True,
-        target_filter_cutoff_hz=10.0 if output_key == "tau_f" else None,
-        target_filter_moving_average_window=(3 if output_key != "tau_f" else None),
-        target_filter_median_window=1 if output_key == "tau_f" else None,
+        derived_target_config=(
+            {
+                "enabled": True,
+                "method": "causal_gravity_residual_v1",
+                "target_key": "tau_other",
+                "source_keys": {"q": "q", "dq": "dq", "tau": "tau"},
+                "dq_sign": [1.0] * 7,
+                "torque_filter_key": "tau",
+                "torque_filter_operations": [],
+                "ddq_source": "unused",
+                "measured_tau_source": "observation.torque",
+                "residual_formula": "tau_other=tau_measured-tau_g",
+            }
+            if output_key == "tau_other"
+            else {}
+        ),
+        target_filter_enabled=output_key != "tau_other",
+        target_filter_cutoff_hz=None,
+        target_filter_moving_average_window=(3 if output_key != "tau_other" else None),
+        target_filter_median_window=None,
     )
 
 
@@ -62,7 +78,7 @@ def test_checkpoint_directory_ranks_any_named_loss_metric(tmp_path: Path) -> Non
     worse.touch()
     best.touch()
 
-    assert _resolve_checkpoint_path(tmp_path, "tau_f") == best.resolve()
+    assert _resolve_checkpoint_path(tmp_path, "tau_other") == best.resolve()
 
 
 class _Predictor:
@@ -118,15 +134,19 @@ class _StateEstimator:
 class _InverseDynamics:
     def __init__(self, tau_id: np.ndarray) -> None:
         self.tau_id = np.asarray(tau_id, dtype=np.float64)
+        self.tau_g = self.tau_id.copy()
         self.calls = []
 
     def estimate(self, q, dq, ddq, tau):
         self.calls.append((q.copy(), dq.copy(), ddq.copy(), tau.copy()))
         return type("Estimate", (), {"tau_id": self.tau_id.copy()})()
 
+    def gravity_torque(self, q):
+        return self.tau_g.copy()
+
 
 def _inference(
-    tau_f_predictor,
+    tau_other_predictor,
     tau_next_predictor,
     estimator,
     state_estimator,
@@ -136,7 +156,7 @@ def _inference(
     return OnlineTauExtInference(
         TauExtInferenceConfig(
             enabled=True,
-            tau_f=SequenceCheckpointConfig(
+            tau_other=SequenceCheckpointConfig(
                 observation_sample_rate_hz=observation_sample_rate_hz,
             ),
             tau_next=SequenceCheckpointConfig(
@@ -152,7 +172,7 @@ def _inference(
                 median_window=1,
             )
         },
-        tau_f_predictor=tau_f_predictor,
+        tau_other_predictor=tau_other_predictor,
         tau_next_predictor=tau_next_predictor,
         estimator=estimator,
         state_estimator=state_estimator,
@@ -160,11 +180,11 @@ def _inference(
 
 
 def test_dual_inference_uses_one_aligned_feature_sample_and_exact_formulas() -> None:
-    tau_f = _Predictor("tau_f", np.full(7, 0.5))
+    tau_other = _Predictor("tau_other", np.full(7, 0.5))
     tau_next = _Predictor("tau", np.full(7, 4.0))
     inverse_dynamics = _InverseDynamics(np.full(7, 2.0))
     state_estimator = _StateEstimator(np.full(7, 3.0))
-    inference = _inference(tau_f, tau_next, inverse_dynamics, state_estimator)
+    inference = _inference(tau_other, tau_next, inverse_dynamics, state_estimator)
     q = np.linspace(0.0, 0.6, 7)
     dq = np.linspace(0.1, 0.7, 7)
     tau = np.full(7, 10.0)
@@ -172,9 +192,9 @@ def test_dual_inference_uses_one_aligned_feature_sample_and_exact_formulas() -> 
 
     result = inference.estimate_aligned(1_000_000, q, dq, tau, q_cmd)
 
-    assert tau_f.feature_ids == tau_next.feature_ids
-    assert len(tau_f.feature_ids) == 1
-    np.testing.assert_allclose(tau_f.features[0]["delta_q"], 0.2)
+    assert len(tau_other.feature_ids) == len(tau_next.feature_ids)
+    assert len(tau_other.feature_ids) == 1
+    np.testing.assert_allclose(tau_other.features[0]["delta_q"], 0.2)
     np.testing.assert_allclose(tau_next.features[0]["delta_q"], 0.2)
     np.testing.assert_allclose(inverse_dynamics.calls[0][2], 3.0)
     np.testing.assert_allclose(result.ddq_kf_causal, 3.0)
@@ -182,20 +202,17 @@ def test_dual_inference_uses_one_aligned_feature_sample_and_exact_formulas() -> 
     np.testing.assert_allclose(result.tau_ext_pred, -6.0)
 
 
-def test_dual_inference_connects_ddq_and_raw_tau_id_to_both_branches() -> None:
-    tau_f = _Predictor("tau_f", np.full(7, 0.5))
+def test_tau_next_can_use_dynamics_inputs_without_leaking_them_to_tau_other() -> None:
+    tau_other = _Predictor("tau_other", np.full(7, 0.5))
     tau_next = _Predictor("tau", np.full(7, 4.0))
     input_keys = ("q", "dq", "ddq", "delta_q", "tau", "tau_id")
     input_dims = {key: 7 for key in input_keys}
-    tau_f.metadata = replace(
-        tau_f.metadata, input_keys=input_keys, input_dims=input_dims
-    )
     tau_next.metadata = replace(
         tau_next.metadata, input_keys=input_keys, input_dims=input_dims
     )
     inverse_dynamics = _InverseDynamics(np.full(7, 2.0))
     state_estimator = _StateEstimator(np.full(7, 3.0))
-    inference = _inference(tau_f, tau_next, inverse_dynamics, state_estimator)
+    inference = _inference(tau_other, tau_next, inverse_dynamics, state_estimator)
 
     inference.estimate_aligned(
         1_000_000,
@@ -213,20 +230,20 @@ def test_dual_inference_connects_ddq_and_raw_tau_id_to_both_branches() -> None:
         np.full(7, 0.2),
     )
 
-    for predictor in (tau_f, tau_next):
-        np.testing.assert_allclose(predictor.features[-1]["ddq"], 3.0)
-        np.testing.assert_allclose(predictor.features[-1]["tau_id"], 4.0)
-    assert np.all(result.tau_id_filtered < 4.0)
+    assert set(tau_other.features[-1]) == {"q", "dq", "delta_q"}
+    np.testing.assert_allclose(tau_next.features[-1]["ddq"], 3.0)
+    np.testing.assert_allclose(tau_next.features[-1]["tau_id"], 4.0)
+    np.testing.assert_allclose(result.tau_g, 2.0)
 
 
-def test_tau_free_dynamics_inputs_require_tau_f_provider() -> None:
+def test_tau_free_dynamics_inputs_require_tau_other_provider() -> None:
     tau_next = _Predictor("tau", np.zeros(7))
     tau_next.metadata = replace(
         tau_next.metadata,
         input_keys=("q", "ddq", "tau_id"),
         input_dims={"q": 7, "ddq": 7, "tau_id": 7},
     )
-    with pytest.raises(RuntimeError, match="require the tau_f branch"):
+    with pytest.raises(RuntimeError, match="require the tau_other branch"):
         OnlineTauExtInference(
             TauExtInferenceConfig(
                 enabled=True,
@@ -239,7 +256,7 @@ def test_tau_free_dynamics_inputs_require_tau_f_provider() -> None:
         )
 
 
-def test_tau_next_only_skips_tau_f_and_produces_prediction() -> None:
+def test_tau_next_only_skips_tau_other_and_produces_prediction() -> None:
     tau_next = _Predictor("tau", np.full(7, 4.0))
     inference = OnlineTauExtInference(
         TauExtInferenceConfig(
@@ -261,27 +278,27 @@ def test_tau_next_only_skips_tau_f_and_produces_prediction() -> None:
         zeros,
     )
 
-    assert inference.tau_f_predictor is None
+    assert inference.tau_other_predictor is None
     assert result.history_ready
-    np.testing.assert_allclose(result.tau_f_pred, 0.0)
+    np.testing.assert_allclose(result.tau_other_pred, 0.0)
     np.testing.assert_allclose(result.tau_ext_cal, 0.0)
     np.testing.assert_allclose(result.tau_next_pred, 4.0)
     np.testing.assert_allclose(result.tau_ext_pred, -6.0)
 
 
 def test_each_active_checkpoint_uses_its_own_observation_rate() -> None:
-    tau_f = _Predictor("tau_f", np.zeros(7))
+    tau_other = _Predictor("tau_other", np.zeros(7))
     tau_next = _Predictor("tau", np.zeros(7))
     inference = OnlineTauExtInference(
         TauExtInferenceConfig(
             enabled=True,
-            tau_f=SequenceCheckpointConfig(observation_sample_rate_hz=100.0),
+            tau_other=SequenceCheckpointConfig(observation_sample_rate_hz=100.0),
             tau_next=SequenceCheckpointConfig(observation_sample_rate_hz=50.0),
         ),
         InverseDynamicsConfig(),
         DynamicsProcessingConfig(),
         {"torque": StateParamConfig(lowpass=True, lowpass_cutoff_hz=10.0)},
-        tau_f_predictor=tau_f,
+        tau_other_predictor=tau_other,
         tau_next_predictor=tau_next,
         estimator=_InverseDynamics(np.zeros(7)),
         state_estimator=_StateEstimator(np.zeros(7)),
@@ -297,19 +314,19 @@ def test_each_active_checkpoint_uses_its_own_observation_rate() -> None:
             zeros,
         )
 
-    assert len(tau_f.features) == 11
+    assert len(tau_other.features) == 11
     assert len(tau_next.features) == 6
 
 
 def test_source_butterworth_filters_all_features_once_before_both_samplers() -> None:
-    tau_f = _Predictor("tau_f", np.zeros(7))
+    tau_other = _Predictor("tau_other", np.zeros(7))
     tau_next = _Predictor("tau", np.zeros(7))
     inverse_dynamics = _InverseDynamics(np.zeros(7))
     state_estimator = _StateEstimator(np.zeros(7))
     inference = OnlineTauExtInference(
         TauExtInferenceConfig(
             enabled=True,
-            tau_f=SequenceCheckpointConfig(observation_sample_rate_hz=100.0),
+            tau_other=SequenceCheckpointConfig(observation_sample_rate_hz=100.0),
             tau_next=SequenceCheckpointConfig(observation_sample_rate_hz=100.0),
             source_butterworth_filter=SourceButterworthFilterConfig(
                 enabled=True,
@@ -320,7 +337,7 @@ def test_source_butterworth_filters_all_features_once_before_both_samplers() -> 
         InverseDynamicsConfig(),
         DynamicsProcessingConfig(),
         {"torque": StateParamConfig(lowpass=True, lowpass_cutoff_hz=10.0)},
-        tau_f_predictor=tau_f,
+        tau_other_predictor=tau_other,
         tau_next_predictor=tau_next,
         estimator=inverse_dynamics,
         state_estimator=state_estimator,
@@ -350,30 +367,21 @@ def test_source_butterworth_filters_all_features_once_before_both_samplers() -> 
     expected_tau = tau_reference.apply(3.0 * ones, 1_010_000)
     expected_q_cmd = q_cmd_reference.apply(4.0 * ones, 1_010_000)
 
-    np.testing.assert_allclose(tau_f.features[1]["q"], expected_q)
+    np.testing.assert_allclose(tau_other.features[1]["q"], expected_q)
     np.testing.assert_allclose(tau_next.features[1]["q"], expected_q)
-    np.testing.assert_allclose(tau_f.features[1]["dq"], expected_dq)
+    np.testing.assert_allclose(tau_other.features[1]["dq"], expected_dq)
     np.testing.assert_allclose(tau_next.features[1]["dq"], expected_dq)
     np.testing.assert_allclose(
-        tau_f.features[1]["delta_q"], expected_q_cmd - expected_q
+        tau_other.features[1]["delta_q"], expected_q_cmd - expected_q
     )
     np.testing.assert_allclose(
         tau_next.features[1]["delta_q"], expected_q_cmd - expected_q
     )
-    source_tau_filter = OnePoleLowPass(10.0, 1)
-    source_tau_filter.apply(zeros, 1_000_000)
-    expected_tau_after_checkpoint_filter = source_tau_filter.apply(
-        expected_tau,
-        1_010_000,
-    )
-    np.testing.assert_allclose(
-        inverse_dynamics.calls[1][3],
-        expected_tau_after_checkpoint_filter,
-    )
+    np.testing.assert_allclose(inverse_dynamics.calls[1][3], 3.0)
 
     inference.reset_episode()
     inference.estimate_aligned(2_000_000, 7.0 * ones, zeros, zeros, 8.0 * ones)
-    np.testing.assert_allclose(tau_f.features[-1]["q"], 7.0)
+    np.testing.assert_allclose(tau_other.features[-1]["q"], 7.0)
     np.testing.assert_allclose(tau_next.features[-1]["q"], 7.0)
 
 
@@ -422,10 +430,10 @@ def test_source_butterworth_updates_on_skipped_frames_before_stride_sampling() -
     )
 
 
-def test_tau_id_uses_the_same_causal_filter_as_measured_torque() -> None:
+def test_tau_id_is_full_rnea_and_tau_other_residual_uses_gravity_only() -> None:
     inverse_dynamics = _InverseDynamics(np.full(7, 2.0))
     inference = _inference(
-        _Predictor("tau_f", np.full(7, 0.5)),
+        _Predictor("tau_other", np.full(7, 0.5)),
         _Predictor("tau", np.full(7, 4.0)),
         inverse_dynamics,
         _StateEstimator(np.zeros(7)),
@@ -437,15 +445,14 @@ def test_tau_id_uses_the_same_causal_filter_as_measured_torque() -> None:
     inverse_dynamics.tau_id = np.full(7, 4.0)
     result = inference.estimate_aligned(1_010_000, zeros, zeros, tau, zeros)
 
-    alpha = 1.0 - np.exp(-2.0 * np.pi * 10.0 * 0.01)
-    expected_tau_id_filtered = 2.0 + alpha * (4.0 - 2.0)
     np.testing.assert_allclose(result.tau_id, 4.0)
-    np.testing.assert_allclose(result.tau_id_filtered, expected_tau_id_filtered)
+    np.testing.assert_allclose(result.tau_id_filtered, 4.0)
+    np.testing.assert_allclose(result.tau_g, 2.0)
     np.testing.assert_allclose(
         result.tau_ext_cal_raw,
-        expected_tau_id_filtered + 0.5 - 10.0,
+        2.0 + 0.5 - 10.0,
     )
-    assert np.all(result.tau_ext_cal < result.tau_ext_cal_raw)
+    np.testing.assert_allclose(result.tau_ext_cal, result.tau_ext_cal_raw)
 
     inference.reset_episode()
     reset_result = inference.estimate_aligned(2_000_000, zeros, zeros, tau, zeros)
@@ -454,7 +461,7 @@ def test_tau_id_uses_the_same_causal_filter_as_measured_torque() -> None:
 
 def test_tau_next_replays_three_point_moving_average_after_shared_source_filter() -> None:
     inference = _inference(
-        _Predictor("tau_f", np.zeros(7)),
+        _Predictor("tau_other", np.zeros(7)),
         _Predictor("tau", np.zeros(7)),
         _InverseDynamics(np.zeros(7)),
         _StateEstimator(np.zeros(7)),
@@ -470,12 +477,11 @@ def test_tau_next_replays_three_point_moving_average_after_shared_source_filter(
         zeros,
     )
 
-    alpha = 1.0 - np.exp(-2.0 * np.pi * 10.0 * 0.01)
     # The event-aligned result keeps the collected source torque raw; residuals
-    # use the checkpoint-restored filtered copy internally.
+    # use tau_g and the checkpoint-restored tau_next target filter internally.
     np.testing.assert_allclose(spike.tau, 10.0)
-    np.testing.assert_allclose(spike.tau_ext_cal_raw, -alpha * 10.0)
-    np.testing.assert_allclose(spike.tau_ext_pred_raw, -alpha * 10.0 / 3.0)
+    np.testing.assert_allclose(spike.tau_ext_cal_raw, -10.0)
+    np.testing.assert_allclose(spike.tau_ext_pred_raw, -10.0 / 3.0)
 
     inference.reset_episode()
     restarted = inference.estimate_aligned(
@@ -488,22 +494,22 @@ def test_tau_next_replays_three_point_moving_average_after_shared_source_filter(
     np.testing.assert_allclose(restarted.tau_ext_pred_raw, -5.0)
 
 
-def test_tau_f_checkpoint_rejects_missing_label_contract() -> None:
-    tau_f = _Predictor("tau_f", np.zeros(7))
+def test_tau_other_checkpoint_rejects_missing_gravity_contract() -> None:
+    tau_other = _Predictor("tau_other", np.zeros(7))
     tau_next = _Predictor("tau", np.zeros(7))
     inverse_dynamics = _InverseDynamics(np.zeros(7))
     state_estimator = _StateEstimator(np.zeros(7))
 
-    tau_f.metadata = replace(tau_f.metadata, target_contract=None)
-    with pytest.raises(RuntimeError, match="rebuild matched-filter labels"):
-        _inference(tau_f, tau_next, inverse_dynamics, state_estimator)
+    tau_other.metadata = replace(tau_other.metadata, target_contract=None)
+    with pytest.raises(RuntimeError, match="target_contract"):
+        _inference(tau_other, tau_next, inverse_dynamics, state_estimator)
 
 
-def test_derived_tau_f_reuses_one_filtered_tau_for_model_and_residual() -> None:
-    tau_f = _Predictor("tau_f", np.zeros(7))
+def test_tau_other_rejects_the_legacy_rnea_residual_contract() -> None:
+    tau_other = _Predictor("tau_other", np.zeros(7))
     operations = [{"type": "lowpass", "cutoff_hz": 10.0}]
-    tau_f.metadata = replace(
-        tau_f.metadata,
+    tau_other.metadata = replace(
+        tau_other.metadata,
         input_keys=("q", "dq", "delta_q", "tau"),
         input_dims={"q": 7, "dq": 7, "delta_q": 7, "tau": 7},
         target_contract="causal_rnea_residual_v1",
@@ -515,7 +521,7 @@ def test_derived_tau_f_reuses_one_filtered_tau_for_model_and_residual() -> None:
         derived_target_config={
             "enabled": True,
             "method": "causal_rnea_residual_v1",
-            "target_key": "tau_f",
+            "target_key": "tau_other",
             "source_keys": {"q": "q", "dq": "dq", "tau": "tau"},
             "state_estimator": {
                 "position_std": 5.0e-4,
@@ -531,51 +537,29 @@ def test_derived_tau_f_reuses_one_filtered_tau_for_model_and_residual() -> None:
             "torque_filter_key": "tau",
             "torque_filter_operations": operations,
             "ddq_source": "variable_dt_kalman_forward_filter",
-            "residual_formula": "tau_f=tau_filtered-tau_id_filtered",
+            "residual_formula": "tau_other=tau_filtered-tau_id_filtered",
         },
     )
-    inverse_dynamics = _InverseDynamics(np.zeros(7))
-    inference = OnlineTauExtInference(
-        TauExtInferenceConfig(
-            enabled=True,
-            tau_f=SequenceCheckpointConfig(observation_sample_rate_hz=50.0),
-        ),
-        InverseDynamicsConfig(),
-        DynamicsProcessingConfig(),
-        {},
-        tau_f_predictor=tau_f,
-        estimator=inverse_dynamics,
-        state_estimator=_StateEstimator(np.zeros(7)),
-    )
-    zeros = np.zeros(7)
-    inference.estimate_aligned(1_000_000, zeros, zeros, zeros, zeros)
-    inference.estimate_aligned(
-        1_010_000,
-        zeros,
-        zeros,
-        np.full(7, 10.0),
-        zeros,
-    )
-    result = inference.estimate_aligned(
-        1_020_000,
-        zeros,
-        zeros,
-        np.full(7, 10.0),
-        zeros,
-    )
-
-    alpha = 1.0 - np.exp(-2.0 * np.pi * 10.0 * 0.02)
-    expected_tau = np.full(7, alpha * 10.0)
-    np.testing.assert_allclose(tau_f.features[-1]["tau"], expected_tau)
-    np.testing.assert_allclose(inverse_dynamics.calls[-1][3], expected_tau)
-    np.testing.assert_allclose(result.tau_ext_cal_raw, -expected_tau)
+    with pytest.raises(RuntimeError, match="v3 checkpoint inputs"):
+        OnlineTauExtInference(
+            TauExtInferenceConfig(
+                enabled=True,
+                tau_other=SequenceCheckpointConfig(observation_sample_rate_hz=50.0),
+            ),
+            InverseDynamicsConfig(),
+            DynamicsProcessingConfig(),
+            {},
+            tau_other_predictor=tau_other,
+            estimator=_InverseDynamics(np.zeros(7)),
+            state_estimator=_StateEstimator(np.zeros(7)),
+        )
 
 
 def test_same_timestamp_returns_cached_dual_result_without_advancing_models() -> None:
-    tau_f = _Predictor("tau_f", np.zeros(7))
+    tau_other = _Predictor("tau_other", np.zeros(7))
     tau_next = _Predictor("tau", np.zeros(7))
     inference = _inference(
-        tau_f,
+        tau_other,
         tau_next,
         _InverseDynamics(np.zeros(7)),
         _StateEstimator(np.zeros(7)),
@@ -586,23 +570,23 @@ def test_same_timestamp_returns_cached_dual_result_without_advancing_models() ->
 
     assert not second.observation_updated
     assert second.observation_timestamp_us == first.observation_timestamp_us
-    assert len(tau_f.features) == 1
+    assert len(tau_other.features) == 1
     assert len(tau_next.features) == 1
 
 
 def test_both_models_select_first_then_every_second_source_frame() -> None:
-    tau_f = _Predictor("tau_f", np.zeros(7))
+    tau_other = _Predictor("tau_other", np.zeros(7))
     tau_next = _Predictor("tau", np.zeros(7))
     inference = OnlineTauExtInference(
         TauExtInferenceConfig(
             enabled=True,
-            tau_f=SequenceCheckpointConfig(observation_sample_rate_hz=50.0),
+            tau_other=SequenceCheckpointConfig(observation_sample_rate_hz=50.0),
             tau_next=SequenceCheckpointConfig(observation_sample_rate_hz=50.0),
         ),
         InverseDynamicsConfig(),
         DynamicsProcessingConfig(),
         {"torque": StateParamConfig(lowpass=True, lowpass_cutoff_hz=10.0)},
-        tau_f_predictor=tau_f,
+        tau_other_predictor=tau_other,
         tau_next_predictor=tau_next,
         estimator=_InverseDynamics(np.zeros(7)),
         state_estimator=_StateEstimator(np.zeros(7)),
@@ -624,7 +608,7 @@ def test_both_models_select_first_then_every_second_source_frame() -> None:
     assert [result.observation_updated for result in results] == [
         True, False, True, False, True, False
     ]
-    assert [features["q"][0] for features in tau_f.features] == [0.0, 2.0, 4.0]
+    assert [features["q"][0] for features in tau_other.features] == [0.0, 2.0, 4.0]
     assert [features["q"][0] for features in tau_next.features] == [0.0, 2.0, 4.0]
     assert len(tau_next.features) == 3
     assert results[1].observation_timestamp_us == 100_000
@@ -634,7 +618,7 @@ def test_both_models_select_first_then_every_second_source_frame() -> None:
     inference.reset_episode()
     restarted = inference.estimate_aligned(1_000_000, zeros, zeros, zeros, zeros)
     assert restarted.observation_updated
-    assert len(tau_f.features) == 4
+    assert len(tau_other.features) == 4
     assert len(tau_next.features) == 4
 
 
@@ -666,9 +650,9 @@ def test_stride_selection_uses_source_frame_count_not_timestamp_phase() -> None:
 
 
 def test_stride_selects_current_frame_without_nearest_timestamp_lookup() -> None:
-    tau_f = _Predictor("tau_f", np.zeros(7))
+    tau_other = _Predictor("tau_other", np.zeros(7))
     inference = _inference(
-        tau_f,
+        tau_other,
         _Predictor("tau", np.zeros(7)),
         _InverseDynamics(np.zeros(7)),
         _StateEstimator(np.zeros(7)),
@@ -680,13 +664,13 @@ def test_stride_selects_current_frame_without_nearest_timestamp_lookup() -> None
     inference.estimate_aligned(110_000, np.ones(7), zeros, zeros, zeros)
     inference.estimate_aligned(130_000, np.full(7, 2.0), zeros, zeros, zeros)
 
-    assert [features["q"][0] for features in tau_f.features] == [0.0, 2.0]
+    assert [features["q"][0] for features in tau_other.features] == [0.0, 2.0]
 
 
 def test_stride_ignores_source_timestamp_jitter() -> None:
-    tau_f = _Predictor("tau_f", np.zeros(7))
+    tau_other = _Predictor("tau_other", np.zeros(7))
     inference = _inference(
-        tau_f,
+        tau_other,
         _Predictor("tau", np.zeros(7)),
         _InverseDynamics(np.zeros(7)),
         _StateEstimator(np.zeros(7)),
@@ -706,7 +690,7 @@ def test_stride_ignores_source_timestamp_jitter() -> None:
             zeros,
         )
 
-    assert len(tau_f.features) == 59
+    assert len(tau_other.features) == 59
 
 
 def test_observation_rate_must_divide_source_rate_exactly() -> None:
@@ -727,10 +711,10 @@ def test_observation_rate_must_divide_source_rate_exactly() -> None:
 
 
 def test_dual_inference_returns_zero_until_full_real_history_is_ready() -> None:
-    tau_f = _Predictor("tau_f", np.full(7, 0.5), ready_after=50)
+    tau_other = _Predictor("tau_other", np.full(7, 0.5), ready_after=50)
     tau_next = _Predictor("tau", np.full(7, 4.0), ready_after=50)
     inference = _inference(
-        tau_f,
+        tau_other,
         tau_next,
         _InverseDynamics(np.full(7, 2.0)),
         _StateEstimator(np.zeros(7)),
@@ -746,7 +730,7 @@ def test_dual_inference_returns_zero_until_full_real_history_is_ready() -> None:
             zeros,
         )
         assert not result.history_ready
-        np.testing.assert_allclose(result.tau_f_pred, 0.0)
+        np.testing.assert_allclose(result.tau_other_pred, 0.0)
         np.testing.assert_allclose(result.tau_next_pred, 0.0)
         np.testing.assert_allclose(result.tau_ext_cal, 0.0)
         np.testing.assert_allclose(result.tau_ext_pred, 0.0)
@@ -765,14 +749,14 @@ def test_dual_inference_returns_zero_until_full_real_history_is_ready() -> None:
 
 
 def test_large_source_gap_warns_without_filling_or_resetting_history(caplog) -> None:
-    tau_f = _Predictor("tau_f", np.full(7, 0.5), ready_after=50)
+    tau_other = _Predictor("tau_other", np.full(7, 0.5), ready_after=50)
     tau_next = _Predictor("tau", np.full(7, 4.0), ready_after=50)
     inference = OnlineTauExtInference(
         TauExtInferenceConfig(enabled=True, observation_gap_warning_s=0.06),
         InverseDynamicsConfig(),
         DynamicsProcessingConfig(),
         {"torque": StateParamConfig(lowpass=True, lowpass_cutoff_hz=10.0)},
-        tau_f_predictor=tau_f,
+        tau_other_predictor=tau_other,
         tau_next_predictor=tau_next,
         estimator=_InverseDynamics(np.full(7, 2.0)),
         state_estimator=_StateEstimator(np.zeros(7)),
@@ -787,7 +771,7 @@ def test_large_source_gap_warns_without_filling_or_resetting_history(caplog) -> 
             zeros,
         )
 
-    reset_counts = (tau_f.reset_count, tau_next.reset_count)
+    reset_counts = (tau_other.reset_count, tau_next.reset_count)
     with caplog.at_level("WARNING"):
         result = inference.estimate_aligned(
             2_500_000,
@@ -798,8 +782,8 @@ def test_large_source_gap_warns_without_filling_or_resetting_history(caplog) -> 
         )
 
     assert not result.history_ready
-    assert len(tau_f.features) == len(tau_next.features) == 25
-    assert (tau_f.reset_count, tau_next.reset_count) == reset_counts
+    assert len(tau_other.features) == len(tau_next.features) == 25
+    assert (tau_other.reset_count, tau_next.reset_count) == reset_counts
     assert "retaining existing observations" in caplog.text
 
     inference.estimate_aligned(
@@ -809,7 +793,7 @@ def test_large_source_gap_warns_without_filling_or_resetting_history(caplog) -> 
         np.full(7, 10.0),
         zeros,
     )
-    assert len(tau_f.features) == len(tau_next.features) == 26
+    assert len(tau_other.features) == len(tau_next.features) == 26
 
 
 def test_causal_kalman_matches_pinn_forward_filter() -> None:
@@ -936,16 +920,16 @@ def test_checkpoint_filter_pipeline_matches_pinn_unified_filter_exactly() -> Non
 
 
 def test_checkpoint_sample_rate_must_match_online_observation_rate() -> None:
-    tau_f = _Predictor("tau_f", np.zeros(7))
+    tau_other = _Predictor("tau_other", np.zeros(7))
     tau_next = _Predictor("tau", np.zeros(7))
-    tau_f.metadata = replace(tau_f.metadata, sample_rate_hz=100.0)
+    tau_other.metadata = replace(tau_other.metadata, sample_rate_hz=100.0)
     tau_next.metadata = replace(tau_next.metadata, sample_rate_hz=100.0)
 
     with pytest.raises(RuntimeError, match="sample_rate_hz=100"):
         OnlineTauExtInference(
             TauExtInferenceConfig(
                 enabled=True,
-                tau_f=SequenceCheckpointConfig(
+                tau_other=SequenceCheckpointConfig(
                     observation_sample_rate_hz=50.0,
                 ),
                 tau_next=SequenceCheckpointConfig(
@@ -955,7 +939,7 @@ def test_checkpoint_sample_rate_must_match_online_observation_rate() -> None:
             InverseDynamicsConfig(),
             DynamicsProcessingConfig(),
             {"torque": StateParamConfig(lowpass=True)},
-            tau_f_predictor=tau_f,
+            tau_other_predictor=tau_other,
             tau_next_predictor=tau_next,
             estimator=_InverseDynamics(np.zeros(7)),
             state_estimator=_StateEstimator(np.zeros(7)),
@@ -1032,31 +1016,31 @@ def test_causal_kalman_resets_acceleration_after_large_gap() -> None:
 
 
 def test_tau_ext_config_allows_independent_or_empty_checkpoints(tmp_path: Path) -> None:
-    tau_f_only = _parse_tau_ext_inference(
+    tau_other_only = _parse_tau_ext_inference(
         {
             "enabled": True,
-            "tau_f": {
-                "checkpoint_path": "tau_f.pt",
+            "tau_other": {
+                "checkpoint_path": "tau_other.pt",
                 "observation_sample_rate_hz": 100.0,
             },
         },
         tmp_path,
     )
-    assert tau_f_only.tau_f.checkpoint_path is not None
-    assert tau_f_only.tau_next.checkpoint_path is None
-    assert tau_f_only.tau_f.observation_sample_rate_hz == pytest.approx(100.0)
+    assert tau_other_only.tau_other.checkpoint_path is not None
+    assert tau_other_only.tau_next.checkpoint_path is None
+    assert tau_other_only.tau_other.observation_sample_rate_hz == pytest.approx(100.0)
 
     empty = _parse_tau_ext_inference({"enabled": True}, tmp_path)
-    assert empty.tau_f.checkpoint_path is None
+    assert empty.tau_other.checkpoint_path is None
     assert empty.tau_next.checkpoint_path is None
 
     config = _parse_tau_ext_inference(
         {
             "enabled": True,
-            "tau_f": {
-                "checkpoint_path": "tau_f.pt",
+            "tau_other": {
+                "checkpoint_path": "tau_other.pt",
                 "input_keys": ["q", "dq", "delta_q", "tau"],
-                "output_key": "tau_f",
+                "output_key": "tau_other",
             },
             "tau_next": {
                 "checkpoint_path": "tau_next.pt",
@@ -1066,8 +1050,8 @@ def test_tau_ext_config_allows_independent_or_empty_checkpoints(tmp_path: Path) 
         },
         tmp_path,
     )
-    assert config.tau_f.output_key == "tau_f"
-    assert config.tau_f.input_keys == ("q", "dq", "delta_q", "tau")
+    assert config.tau_other.output_key == "tau_other"
+    assert config.tau_other.input_keys == ("q", "dq", "delta_q", "tau")
     assert config.tau_next.output_key == "tau"
     assert config.tau_ext_filter.enabled
     assert config.tau_ext_filter.mode == "hampel_butterworth"
@@ -1142,7 +1126,7 @@ def test_tau_ext_config_rejects_removed_observation_stride(tmp_path: Path) -> No
 def test_tau_ext_filter_config_is_explicit_and_validated(tmp_path: Path) -> None:
     common = {
         "enabled": True,
-        "tau_f": {"checkpoint_path": "tau_f.pt"},
+        "tau_other": {"checkpoint_path": "tau_other.pt"},
         "tau_next": {"checkpoint_path": "tau_next.pt"},
     }
     config = _parse_tau_ext_inference(
@@ -1172,7 +1156,7 @@ def test_tau_ext_filter_config_is_explicit_and_validated(tmp_path: Path) -> None
         )
 
 
-@pytest.mark.parametrize("source", ("tau_f", "tau_free"))
+@pytest.mark.parametrize("source", ("tau_other", "tau_free"))
 def test_force_feedback_source_is_configurable(
     source: str,
     tmp_path: Path,
@@ -1186,25 +1170,25 @@ def test_force_feedback_source_is_configurable(
 
 
 def test_force_feedback_source_rejects_unknown_value(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="must be tau_f or tau_free"):
+    with pytest.raises(ValueError, match="must be tau_other or tau_free"):
         _parse_tau_ext_inference(
             {"enabled": True, "feedback_source": "tau_next"},
             tmp_path,
         )
 
 
-def test_collection_config_rejects_removed_tau_f_inference_key(tmp_path: Path) -> None:
+def test_collection_config_rejects_removed_tau_other_inference_key(tmp_path: Path) -> None:
     source = Path(__file__).resolve().parents[1] / "configs/master_slave_can.yaml"
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         source.read_text(encoding="utf-8").replace(
             "tau_ext_inference:",
-            "tau_f_inference:",
+            "tau_other_inference:",
             1,
         ),
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="tau_f_inference was removed"):
+    with pytest.raises(ValueError, match="tau_other_inference was removed"):
         load_config(config_path)
 
 
@@ -1218,9 +1202,9 @@ def test_sequence_checkpoint_restores_configured_recurrent_type(
 
     model_config = {
         "architecture": architecture,
-        "inputs": ["q", "dq", "delta_q", "tau"],
-        "input_dims": {"q": 7, "dq": 7, "delta_q": 7, "tau": 7},
-        "target_key": "tau_f",
+        "inputs": ["q", "dq", "delta_q"],
+        "input_dims": {"q": 7, "dq": 7, "delta_q": 7},
+        "target_key": "tau_other",
         "output_dim": 7,
         "hidden_dim": 8,
         "num_layers": 1,
@@ -1228,8 +1212,7 @@ def test_sequence_checkpoint_restores_configured_recurrent_type(
         "head_num_layers": 2,
         "activation": "relu",
         "dropout": 0.0,
-        "target_contract": "matched_causal_torque_filter_v1",
-        "target_filter": {"cutoff_hz": 10.0, "median_window": 1},
+        "target_contract": "causal_gravity_residual_v1",
     }
     model = _build_checkpoint_model(
         torch,
@@ -1240,7 +1223,7 @@ def test_sequence_checkpoint_restores_configured_recurrent_type(
     )
     stats = {
         key: {"mean": np.zeros(7), "std": np.ones(7)}
-        for key in ("q", "dq", "delta_q", "tau", "tau_f")
+        for key in ("q", "dq", "delta_q", "tau_other")
     }
     path = tmp_path / f"{architecture}.pt"
     torch.save(
@@ -1260,23 +1243,34 @@ def test_sequence_checkpoint_restores_configured_recurrent_type(
                 "eps": 1.0e-6,
             },
             "model": model.state_dict(),
+            "derived_target_config": {
+                "enabled": True,
+                "method": "causal_gravity_residual_v1",
+                "target_key": "tau_other",
+                "source_keys": {"q": "q", "dq": "dq", "tau": "tau"},
+                "dq_sign": [1.0] * 7,
+                "torque_filter_key": "tau",
+                "torque_filter_operations": [],
+                "ddq_source": "unused",
+                "measured_tau_source": "observation.torque",
+                "residual_formula": "tau_other=tau_measured-tau_g",
+            },
         },
         path,
     )
     predictor = SequenceTorquePredictor(
         SequenceCheckpointConfig(checkpoint_path=path),
-        name="tau_f",
+        name="tau_other",
     )
     features = {
-        key: np.zeros(7) for key in ("q", "dq", "delta_q", "tau")
+        key: np.zeros(7) for key in ("q", "dq", "delta_q")
     }
     for _ in range(3):
         assert predictor.append_and_predict(features) is None
     prediction = predictor.append_and_predict(features)
     assert predictor.metadata.architecture == architecture
-    assert predictor.metadata.input_keys == ("q", "dq", "delta_q", "tau")
-    assert predictor.metadata.target_filter_enabled
-    assert predictor.metadata.target_filter_median_window == 1
+    assert predictor.metadata.input_keys == ("q", "dq", "delta_q")
+    assert not predictor.metadata.target_filter_enabled
     assert not predictor.metadata.target_filter_apply_additional_lowpass
     assert prediction is not None
     assert prediction.shape == (7,)

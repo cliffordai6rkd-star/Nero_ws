@@ -11,6 +11,11 @@ dp_checkpoint:
 # eepose: [x,y,z,qx,qy,qz,qw]; joint: absolute q (FK-converted before WM).
 action: eepose
 
+architecture:
+  enabled: false
+  policy_type: legacy_pipeline
+  world_model_type: none
+
 pinn_checkpoint:
   # predictor.enabled=false 时不会加载，也可以删除整个 pinn_checkpoint 配置块。
   # mode=world_model_v3/v4/v5 时填写对应 WM checkpoint；切回 wrench_gru 时换成 V1 checkpoint。
@@ -63,7 +68,7 @@ robot:
   locked_joint_names: [gripper, gripper_joint1, gripper_joint2]
 
 runtime:
-  # 复用机械臂、相机、tau_f checkpoint、逆动力学和 wrench 映射配置。
+  # 复用机械臂、相机、tau_other checkpoint、逆动力学和 wrench 映射配置。
   collection_config: ../../configs/master_slave_can.yaml
   arm_pair: main
   camera: wrist
@@ -77,7 +82,7 @@ runtime:
   command_kd: [0, 0, 0, 0, 0, 0, 0]
 
 observation_protection:
-  # 启动及每次 episode 复位后保持静止，持续采样 tau_f/wrench，满 2 秒才允许策略推理。
+  # 启动及每次 episode 复位后保持静止，持续采样 tau_other/wrench，满 2 秒才允许策略推理。
   enabled: true
   warmup_duration_s: 2.0
   # tau_ext_filter 已启用时不再重复滤波 wrench；下面参数只作为关闭

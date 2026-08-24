@@ -222,7 +222,22 @@ class _MatplotlibPlotWindow:
             pass
         colors = plt.get_cmap("tab10").colors
         line_groups: list[tuple[object, ...]] = []
-        for axis, (title, ylabel, labels) in zip(axes, self._PLOTS):
+        self._threshold_specs = tuple(
+            (value, label)
+            for value, label in (
+                (
+                    getattr(config, "precontact_threshold", None),
+                    "precontact threshold",
+                ),
+                (getattr(config, "contact_threshold", None), "contact threshold"),
+            )
+            if value is not None
+        )
+        self._threshold_values = tuple(value for value, _ in self._threshold_specs)
+        threshold_lines: list[object] = []
+        for plot_index, (axis, (title, ylabel, labels)) in enumerate(
+            zip(axes, self._PLOTS)
+        ):
             lines = tuple(
                 axis.plot(
                     [], [], color=colors[index % len(colors)],
@@ -236,10 +251,22 @@ class _MatplotlibPlotWindow:
             axis.set_xlim(0.0, config.window_s)
             axis.set_ylim(-_MINIMUM_Y_ABS_NM, _MINIMUM_Y_ABS_NM)
             axis.grid(True, alpha=0.25)
+            if plot_index in (1, 3):
+                for threshold, label in self._threshold_specs:
+                    threshold_lines.append(
+                        axis.axhline(
+                            threshold,
+                            color="red",
+                            linestyle="--",
+                            linewidth=1.2,
+                            label=f"{label} ({threshold:g})",
+                        )
+                    )
             axis.legend(loc="upper left", ncol=2, fontsize=8)
             line_groups.append(lines)
         self.axes = tuple(axes)
         self.lines = tuple(line_groups)
+        self.threshold_lines = tuple(threshold_lines)
         self.figure.tight_layout()
         self.figure.show()
         self.process_events()
@@ -256,14 +283,19 @@ class _MatplotlibPlotWindow:
             for index in range(7):
                 self.lines[0][index].set_data(elapsed_time, tau_ext_cal[:, index])
                 self.lines[2][index].set_data(elapsed_time, tau_ext_pred[:, index])
-            tau_ext_cal_l1 = np.sum(np.abs(tau_ext_cal), axis=1)
-            tau_ext_pred_l1 = np.sum(np.abs(tau_ext_pred), axis=1)
-            self.lines[1][0].set_data(elapsed_time, tau_ext_cal_l1)
-            self.lines[3][0].set_data(elapsed_time, tau_ext_pred_l1)
+            norm_mode = getattr(self.config, "norm", "l1")
+            tau_ext_cal_norm = _joint_norm(tau_ext_cal, norm_mode)
+            tau_ext_pred_norm = _joint_norm(tau_ext_pred, norm_mode)
+            self.lines[1][0].set_data(elapsed_time, tau_ext_cal_norm)
+            self.lines[3][0].set_data(elapsed_time, tau_ext_pred_norm)
             _set_dynamic_ylim(self.axes[0], tau_ext_cal)
-            _set_dynamic_ylim(self.axes[1], tau_ext_cal_l1[:, None])
+            _set_dynamic_ylim(
+                self.axes[1], tau_ext_cal_norm[:, None], self._threshold_values
+            )
             _set_dynamic_ylim(self.axes[2], tau_ext_pred)
-            _set_dynamic_ylim(self.axes[3], tau_ext_pred_l1[:, None])
+            _set_dynamic_ylim(
+                self.axes[3], tau_ext_pred_norm[:, None], self._threshold_values
+            )
             time_limit_s = max(self.config.window_s, float(elapsed_time[-1]))
             for axis in self.axes:
                 axis.set_xlim(0.0, time_limit_s)
@@ -364,7 +396,20 @@ def _plot_vector(name: str, value: np.ndarray, size: int) -> np.ndarray:
     return vector.copy()
 
 
-def _set_dynamic_ylim(axis, data: np.ndarray) -> None:
-    peak = float(np.max(np.abs(data)))
+def _joint_norm(values: np.ndarray, mode: str) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64)
+    if mode == "l2":
+        return np.linalg.norm(values, axis=1)
+    return np.sum(np.abs(values), axis=1)
+
+
+def _set_dynamic_ylim(
+    axis,
+    data: np.ndarray,
+    thresholds: tuple[float, ...] = (),
+) -> None:
+    peaks = [float(np.max(np.abs(data)))]
+    peaks.extend(abs(float(threshold)) for threshold in thresholds)
+    peak = max(peaks)
     limit = max(_MINIMUM_Y_ABS_NM, peak * 1.08)
     axis.set_ylim(-limit, limit)

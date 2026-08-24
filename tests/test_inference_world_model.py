@@ -6,7 +6,7 @@ import pytest
 from inference.world_model import WorldModelWrenchAdapter
 
 
-class _TauFPredictor:
+class _TauOtherPredictor:
     metadata = SimpleNamespace(
         horizon=2,
         input_keys=("q", "dq", "delta_q"),
@@ -29,6 +29,9 @@ class _InverseDynamics:
         self.calls.append((q, dq, ddq, tau))
         return SimpleNamespace(tau_id=np.full(7, 2.0))
 
+    def gravity_torque(self, q):
+        return np.full(7, 2.0)
+
 
 class _WrenchMapper:
     def __init__(self) -> None:
@@ -47,12 +50,12 @@ def test_world_model_adapter_matches_nero_contact_chain_without_mutating_state()
             wrench_mapping=object(),
         ),
     )
-    tau_f = _TauFPredictor()
+    tau_other = _TauOtherPredictor()
     inverse_dynamics = _InverseDynamics()
     mapper = _WrenchMapper()
     adapter = WorldModelWrenchAdapter(
         collection,
-        tau_f_predictor=tau_f,
+        tau_other_predictor=tau_other,
         inverse_dynamics=inverse_dynamics,
         wrench_mapper=mapper,
     )
@@ -67,13 +70,13 @@ def test_world_model_adapter_matches_nero_contact_chain_without_mutating_state()
 
     wrench = adapter.states_to_wrenches(history, future)
 
-    assert tau_f.inputs["q"].shape == (4, 7)
-    np.testing.assert_allclose(tau_f.inputs["q"][:2], history["q"][-2:])
-    np.testing.assert_allclose(tau_f.inputs["q"][2:], future["q"])
-    np.testing.assert_allclose(tau_f.inputs["dq"][2:], future["v"])
-    np.testing.assert_allclose(tau_f.inputs["delta_q"], 0.0)
+    assert tau_other.inputs["q"].shape == (4, 7)
+    np.testing.assert_allclose(tau_other.inputs["q"][:2], history["q"][-2:])
+    np.testing.assert_allclose(tau_other.inputs["q"][2:], future["q"])
+    np.testing.assert_allclose(tau_other.inputs["dq"][2:], future["v"])
+    np.testing.assert_allclose(tau_other.inputs["delta_q"], 0.0)
     np.testing.assert_allclose(wrench, np.full((2, 6), 1.5))
-    assert len(inverse_dynamics.calls) == 2
+    assert len(inverse_dynamics.calls) == 0
     assert len(mapper.calls) == 2
 
 

@@ -14,7 +14,7 @@ Requires-Dist: osqp<2,>=1
 Requires-Dist: pin<4,>=3
 Requires-Dist: PyYAML>=6.0
 Requires-Dist: scipy<1.16,>=1.10
-Provides-Extra: tau-f-inference
-Requires-Dist: torch<3,>=2.3; extra == "tau-f-inference"
+Provides-Extra: tau-other-inference
+Requires-Dist: torch<3,>=2.3; extra == "tau-other-inference"
 Provides-Extra: gpu-identification
 Requires-Dist: jax[cuda12]==0.6.2; (platform_system == "Linux" and python_version < "3.11") and extra == "gpu-identification"
