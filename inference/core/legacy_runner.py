@@ -62,6 +62,7 @@ class NeroPipelineRunner:
                 tau=observation.tau,
                 image=image,
                 wrench_ext=observation.wrench_ext,
+                q_cmd=getattr(observation, "q_cmd", None),
                 timestamp_s=observation.timestamp_us * 1.0e-6,
                 wrench_to_control_rotation=observation.wrench_to_control_rotation,
                 image_timestamp_s=image_timestamp_s,
@@ -69,3 +70,42 @@ class NeroPipelineRunner:
         )
         self.controller.send(observation, output)
         return output
+
+
+class ModularInferenceRunner:
+    """Run an :class:`~inference.core.base.InferenceBase` instance.
+
+    ``NeroPipelineRunner`` adapts the old ``pipeline.step(InferenceInput)``
+    signature.  Modular policies (including TAVLA) already own the complete
+    stage graph and expose a zero-argument ``step()`` method, so passing them
+    through the legacy adapter would fail before policy inference.  Keeping a
+    separate, deliberately tiny runner makes the two contracts explicit and
+    lets :class:`NeroInferenceRuntime` share its sensor loop with either one.
+    """
+
+    def __init__(self, inference: Any) -> None:
+        if not callable(getattr(inference, "step", None)):
+            raise TypeError("modular inference must expose step()")
+        self.inference = inference
+
+    def start(self) -> None:
+        starter = getattr(self.inference, "start", None)
+        if callable(starter):
+            starter()
+
+    def step(self):
+        return self.inference.step()
+
+    def reset_episode(self) -> None:
+        reset = getattr(self.inference, "reset_episode", None)
+        if callable(reset):
+            reset()
+
+    def close(self) -> None:
+        closer = getattr(self.inference, "close", None)
+        if callable(closer):
+            closer()
+        else:
+            stopper = getattr(self.inference, "stop", None)
+            if callable(stopper):
+                stopper()

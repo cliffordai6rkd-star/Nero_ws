@@ -1,0 +1,51 @@
+# Native PINN torque state world-model deployment.
+# Replace pinn_checkpoint.path with a real SWM checkpoint before running.
+dp_checkpoint:
+  path: ../../../model/dp/insert_usb/100ep15w/checkpoints/latest.ckpt
+  image_encoder: dino
+  dino_model_path: ../../../model/dinov3-vitb16-pretrain-lvd1689m
+  device: cuda:0
+  use_ema: true
+
+pinn_checkpoint:
+  path: ../../../model/swm/stage_1/epoch_0000250.pt
+  device: cuda:0
+  use_ema: true
+
+# SWM consumes and predicts absolute seven-joint state.
+action: joint
+
+predictor:
+  enabled: false
+  mode: swm
+  inference_mode: open_loop
+# asynchronous
+  # The SWM action condition is an 8-token 25 Hz direct joint chunk.
+  action_chunk_mode: all
+  action_execution_mode: chunk
+  action_step_s: null
+
+dp_sampling:
+  method: ddim
+  num_inference_steps: 100
+  use_tau_ext_observation: false
+
+execution:
+  # q | mit | tau | osc_qp
+  mode: q
+  mit_kp: [3.0, 3.0, 2.0, 3.5, 2.0, 2.0, 3.0]
+  mit_kd: [0.1, 0.1, 0.25, 0.25, 0.1, 0.1, 0.1]
+  mit_velocity_limit: [1.0, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+
+robot:
+  urdf_path: ../../urdf/nero/nero_with_gripper.urdf
+  frame_name: gripper_tcp
+  locked_joint_names: [gripper, gripper_joint1, gripper_joint2]
+
+runtime:
+  collection_config: ../../configs/master_slave_can.yaml
+  arm_pair: main
+  maximum_state_age_s: 0.1
+  maximum_observation_alignment_gap_s: 0.03
+  maximum_inference_steps: 5000
+  command_kd: [0, 0, 0, 0, 0, 0, 0]

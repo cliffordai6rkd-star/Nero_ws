@@ -18,6 +18,9 @@ def observation_from_state_sample(
 ) -> Observation:
     """Convert ``ContinuousInferenceSample`` into the stable observation type."""
 
+    if q_cmd is None:
+        q_cmd = getattr(sample, "q_cmd", None)
+
     tau_result = getattr(sample, "tau_result", None)
     tau_ext = (
         getattr(tau_result, "tau_ext_cal", None)
@@ -45,4 +48,3 @@ def observation_from_state_sample(
         q_cmd=q_cmd,
         metadata=metadata,
     )
-

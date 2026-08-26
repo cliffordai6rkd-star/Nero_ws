@@ -33,6 +33,7 @@ class ContinuousInferenceSample:
     raw_wrench: np.ndarray
     wrench: np.ndarray
     processed_wrench: np.ndarray
+    q_cmd: np.ndarray | None = None
 
 
 class ContinuousInferenceStateStream:
@@ -202,6 +203,11 @@ class ContinuousInferenceStateStream:
             if self.q_cmd_provider is None
             else self.q_cmd_provider(timestamp_us)
         )
+        # Older callers did not provide a command-history callback.  Falling
+        # back to the measured q keeps that contract usable and represents a
+        # zero ``delta_q`` condition for SWM until a held command is available.
+        if q_cmd is None:
+            q_cmd = state.q
         q_cmd = np.asarray(q_cmd, dtype=np.float64).reshape(-1)
         if q_cmd.shape != (7,) or not np.all(np.isfinite(q_cmd)):
             raise RuntimeError(
@@ -220,6 +226,7 @@ class ContinuousInferenceStateStream:
             acquired_timestamp_us,
             tau_result,
             tau_result.ddq_kf_causal,
+            q_cmd=q_cmd,
         )
 
     def _build_sample(
@@ -228,6 +235,8 @@ class ContinuousInferenceStateStream:
         acquired_timestamp_us: int,
         tau_result: OnlineTauExtResult,
         ddq: np.ndarray,
+        *,
+        q_cmd: np.ndarray | None = None,
     ) -> ContinuousInferenceSample:
         wrench_estimate = self.wrench_estimator.map_joint_torque(
             tau_result.q,
@@ -276,15 +285,23 @@ class ContinuousInferenceStateStream:
                 or not np.all(np.isfinite(processed_wrench))
             ):
                 raise RuntimeError("wrench processor must return finite 6-vectors")
+        command = None if q_cmd is None else np.asarray(q_cmd, dtype=np.float64).reshape(-1)
+        if command is not None and (command.shape != (7,) or not np.all(np.isfinite(command))):
+            raise RuntimeError("q_cmd must be a finite seven-joint vector")
         return ContinuousInferenceSample(
             timestamp_us=timestamp_us,
             acquired_timestamp_us=acquired_timestamp_us,
-            q=np.asarray(tau_result.q, dtype=np.float64).copy(),
-            dq=np.asarray(tau_result.dq, dtype=np.float64).copy(),
+            # Keep the canonical state streams in acquisition units.  The
+            # tau-ext estimator may maintain a separate source-filter bank,
+            # but that bank is not part of the SWM input contract; SWM's
+            # checkpoint is responsible for its own preprocessing.
+            q=np.asarray(tau_result.q_raw, dtype=np.float64).copy(),
+            dq=np.asarray(tau_result.dq_raw, dtype=np.float64).copy(),
             ddq=np.asarray(ddq, dtype=np.float64).copy(),
-            tau=np.asarray(tau_result.tau, dtype=np.float64).copy(),
+            tau=np.asarray(tau_result.tau_raw, dtype=np.float64).copy(),
             tau_result=tau_result,
             raw_wrench=raw_wrench.copy(),
             wrench=wrench.copy(),
             processed_wrench=processed_wrench.copy(),
+            q_cmd=(None if command is None else command.copy()),
         )

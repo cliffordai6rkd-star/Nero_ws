@@ -26,6 +26,12 @@ ActionResolver -> SafetyGuard -> RobotController
 
 `InferenceBase` 只编排顺序和生命周期，不应该知道具体模型、相机 SDK、CAN API、IK 或机器人型号。模型差异放到 `inference/policies/`，WM 差异放到 `inference/world_models/`，机器人差异放到 `inference/control/`。
 
+当前旧 Nero 入口正在按这个边界迁移。`inference/stages/` 已提供两个可复用的
+执行阶段：`DPObservationBuffer` 负责图像/CAN 历史和严格的因果时间戳对齐，
+`ActionPlanExecutor` 负责按 observation timestamp 推进 DP chunk 和 open-loop
+计划。`NeroInferencePipeline` 暂时保留同名私有方法作为兼容委托；新增代码应直接
+依赖这些 stage，不要再向 pipeline 添加新的观测缓存或 action 游标字段。
+
 当前仓库仍保留 `NeroInferencePipeline` 和 `NeroInferenceRuntime` 作为旧 DP/WM 入口。它们通过 sampler、runner 和 controller 适配器逐步接入新边界，但还没有完全改成 `class NeroInferenceRuntime(InferenceBase)`。因此不要把 `architecture.enabled` 当作已经完成的切换开关；目前它主要用于声明和日志，真正的 modular builder 仍在迁移中。
 
 ## 2. 公共数据契约
@@ -134,10 +140,15 @@ class HighLevelPolicy(Protocol):
 ### ActionResolver
 
 负责 action 语义、坐标系转换、FK/IK、chunk 选择和轨迹插值。它是 DP/PI0 与 Nero 机械臂之间的唯一动作解释层。
+通用 `DirectActionResolver` 只处理 joint/torque action；末端 pose 必须注入带 IK 或 FK
+知识的 resolver。需要实验性逻辑时使用 `CallableActionResolver`，不要把转换分支加回
+`InferenceBase`。
 
 ### SafetyGuard
 
 负责 stale observation、位移/旋转步长、关节限位、力矩和目标 wrench 等安全约束。模型 adapter 不得自行下发安全裁剪后的机器人命令。
+`BasicSafetyGuard` 提供跨机器人都成立的有限值、关节步长和 torque 限幅；Nero legacy
+pipeline 的完整 pose/wrench 安全策略仍由旧 pipeline 保持，迁移时应逐项替换并补回归。
 
 ### RobotController
 
@@ -162,6 +173,11 @@ policy = DiffusionPolicyAdapter(
     step_s=0.1,
 )
 ```
+
+旧 Nero pipeline 也通过该 adapter 的 `predict_raw()` 调用 DP。joint action 的
+标准 diffusion 采样和 quaternion 旁路位于 `policies/dp/adapter.py` 的
+`predict_diffusion_action()`；pipeline 不再维护这段模型分支，只负责把已经对齐的
+image/wrench batch 放到 checkpoint device，并将原始映射转换为旧输出契约。
 
 DP 特有的 checkpoint 恢复、image/wrench history、normalizer 和 scheduler 逻辑应封装在 DP policy 或 processor 中。不要把这些字段加到 `InferenceBase`。
 

@@ -221,6 +221,22 @@ def build_pipeline(
             pinn_model=pinn_model,
             controller=controller,
         )
+    if config.predictor.enabled and predictor_mode in {
+        "swm",
+        "swm_opd",
+        "torque_world_model",
+        "torque_world_model_opd",
+        "torque_wm",
+        "torque_wm_opd",
+    }:
+        from inference.swm_pipeline import SWMInferencePipeline
+
+        return SWMInferencePipeline(
+            config,
+            dp_model=dp_model,
+            pinn_model=pinn_model,
+            controller=controller,
+        )
     return NeroInferencePipeline(
         config,
         dp_model=dp_model,
@@ -582,6 +598,7 @@ def run_h5_simulation(
                 wrench_ext=np.asarray(tick.wrench_ext, dtype=np.float64).copy(),
                 timestamp_s=float(timestamp_s),
                 image_timestamp_s=float(image_timestamp_s),
+                q_cmd=getattr(tick, "q_cmd", None),
             )
             output = _pipeline_step(pipeline, sample, tick, stream)
             state = backend.step_output(output, mode=mode)

@@ -6,6 +6,7 @@ from inference.core import (
     ControlTarget,
     InferenceBase,
     InferenceCycle,
+    ModularInferenceRunner,
     NeroPipelineRunner,
     Observation,
 )
@@ -26,6 +27,11 @@ from inference.contact_pipeline import (
     ContactInferencePipeline,
     ContactWMInferencePipeline,
 )
+from inference.swm_pipeline import (
+    SWMInferencePipeline,
+    SWMPipeline,
+    TorqueWorldModelInferencePipeline,
+)
 from inference.mujoco_backend import (
     MujocoBackend,
     MujocoBackendConfig,
@@ -41,8 +47,28 @@ from inference.h5_observation_stream import (
     load_h5_observation_stream,
 )
 from inference.runtime import NeroInferenceRuntime
-from inference.model_inference import DiffusionPolicyInference, VLAInference
-from inference.policies import DiffusionPolicy, DPPolicy
+from inference.model_inference import (
+    DiffusionPolicyInference,
+    TAVLAInference,
+    TAVLAInferencePipeline,
+    TAVLAPipeline,
+    VLAInference,
+)
+from inference.policies import (
+    DiffusionPolicy,
+    DPPolicy,
+    TAVLA,
+    TAVLAAdapter,
+    TAVLAInferencePolicy,
+    TAVLAPolicy,
+    TAVLAObservationBuilder,
+)
+from inference.control import (
+    BasicSafetyGuard,
+    CallableActionResolver,
+    DirectActionResolver,
+)
+from inference.stages import ActionPlanExecutor, DPObservationBuffer
 from inference.factory import (
     CONTROLLER_REGISTRY,
     POLICY_REGISTRY,
@@ -69,6 +95,7 @@ __all__ = [
     "InferenceBase",
     "InferenceCycle",
     "NeroPipelineRunner",
+    "ModularInferenceRunner",
     "ExecutionConfig",
     "InferenceInput",
     "InferenceOutput",
@@ -76,6 +103,9 @@ __all__ = [
     "NeroInferencePipeline",
     "ContactWMInferencePipeline",
     "ContactInferencePipeline",
+    "SWMInferencePipeline",
+    "SWMPipeline",
+    "TorqueWorldModelInferencePipeline",
     "MujocoBackendConfig",
     "MujocoBackend",
     "MujocoCommand",
@@ -89,8 +119,21 @@ __all__ = [
     "NeroInferenceRuntime",
     "DiffusionPolicyInference",
     "VLAInference",
+    "TAVLAInference",
+    "TAVLAInferencePipeline",
+    "TAVLAPipeline",
     "DiffusionPolicy",
     "DPPolicy",
+    "TAVLA",
+    "TAVLAAdapter",
+    "TAVLAInferencePolicy",
+    "TAVLAPolicy",
+    "TAVLAObservationBuilder",
+    "DPObservationBuffer",
+    "ActionPlanExecutor",
+    "BasicSafetyGuard",
+    "CallableActionResolver",
+    "DirectActionResolver",
     "Observation",
     "SimulationRunnerConfig",
     "SimulationRunResult",

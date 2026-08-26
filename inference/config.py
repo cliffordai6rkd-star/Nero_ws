@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, Mapping, TypeVar
+from typing import Any, Iterable, Mapping, TypeVar
 
 import numpy as np
 import yaml
@@ -15,6 +15,10 @@ class CheckpointConfig:
     path: Path
     device: str = "cuda:0"
     use_ema: bool = True
+    # Visual backbone family embedded by the checkpoint. ``imagenet`` keeps
+    # the checkpoint's ResNet/ImageNet weights; ``dino`` enables the optional
+    # path override for DINO-based policies.
+    image_encoder: str | None = None
     dino_model_path: Path | None = None
 
 
@@ -126,7 +130,10 @@ class ObservationProtectionConfig:
 class RuntimeConfig:
     collection_config: Path
     arm_pair: str = "main"
-    camera: str = "wrist"
+    # Optional override for the camera used as the temporal/staleness anchor.
+    # The normal deployment path resolves this from the checkpoint image
+    # contract and the enabled cameras in ``collection_config``.
+    camera: str | None = None
     maximum_state_age_s: float = 0.1
     maximum_observation_alignment_gap_s: float = 0.03
     maximum_inference_steps: int | None = None
@@ -176,6 +183,75 @@ class InferenceConfig:
 T = TypeVar("T")
 
 
+def resolve_camera_key(
+    configured: str | None,
+    checkpoint_image_keys: Iterable[str],
+    collection_camera_keys: Iterable[str] | None = None,
+    *,
+    preferred: Iterable[str] = ("wrist",),
+) -> str:
+    """Resolve the temporal camera anchor from model and acquisition contracts.
+
+    ``checkpoint_image_keys`` describes the keys the policy actually consumes;
+    ``collection_camera_keys`` describes enabled acquisition streams.  An
+    explicit ``configured`` value remains a supported override, but is always
+    checked against both contracts.  When no override is supplied, a unique
+    model/acquisition intersection is selected.  Multi-camera datasets use the
+    wrist stream as the conventional anchor because the training converters
+    timestamp/aligned rows against ``cameras/wrist``; any other ambiguous case
+    is rejected instead of silently choosing dictionary order.
+    """
+
+    model_keys = tuple(dict.fromkeys(str(key).strip() for key in checkpoint_image_keys))
+    model_keys = tuple(key for key in model_keys if key)
+    if not model_keys:
+        raise ValueError("checkpoint must expose at least one image key")
+
+    collection_keys: tuple[str, ...] | None
+    if collection_camera_keys is None:
+        collection_keys = None
+        candidates = list(model_keys)
+    else:
+        collection_keys = tuple(
+            dict.fromkeys(str(key).strip() for key in collection_camera_keys)
+        )
+        collection_keys = tuple(key for key in collection_keys if key)
+        candidates = [key for key in model_keys if key in collection_keys]
+        if not candidates:
+            raise ValueError(
+                "no camera satisfies both contracts: checkpoint image keys="
+                f"{list(model_keys)}, enabled collection cameras={list(collection_keys)}"
+            )
+
+    selected = None if configured is None else str(configured).strip()
+    if selected == "":
+        raise ValueError("runtime.camera must be a non-empty camera name or null")
+    if selected is not None:
+        if selected not in model_keys:
+            raise ValueError(
+                f"runtime.camera={selected!r} is not declared by the checkpoint; "
+                f"image keys={list(model_keys)}"
+            )
+        if collection_keys is not None and selected not in collection_keys:
+            raise ValueError(
+                f"runtime.camera={selected!r} is not enabled in the collection "
+                f"config; cameras={list(collection_keys)}"
+            )
+        return selected
+
+    if len(candidates) == 1:
+        return candidates[0]
+    for key in preferred:
+        preferred_key = str(key).strip()
+        if preferred_key in candidates:
+            return preferred_key
+    raise ValueError(
+        "camera anchor is ambiguous; checkpoint/collection intersection="
+        f"{list(candidates)}. Set runtime.camera explicitly or declare a "
+        "primary camera in the acquisition configuration."
+    )
+
+
 def load_inference_config(path: str | Path) -> InferenceConfig:
     """Load runtime settings only; model architecture always comes from checkpoints."""
     config_path = Path(path).expanduser().resolve()
@@ -220,6 +296,10 @@ def load_inference_config(path: str | Path) -> InferenceConfig:
     predictor_mode = predictor.mode.strip().lower()
     if predictor_mode == "world_model":
         predictor_mode = "world_model_v5"
+    if predictor_mode in {"torque_world_model", "torque_wm"}:
+        predictor_mode = "swm"
+    elif predictor_mode in {"torque_world_model_opd", "torque_wm_opd"}:
+        predictor_mode = "swm_opd"
     if predictor_mode not in {
         "wrench_gru",
         "world_model_v3",
@@ -229,11 +309,13 @@ def load_inference_config(path: str | Path) -> InferenceConfig:
         "contact_world_model_opd",
         "contact_wm",
         "contact_wm_opd",
+        "swm",
+        "swm_opd",
     }:
         raise ValueError(
             "predictor.mode must be 'wrench_gru', 'world_model_v3', "
             "'world_model_v4', 'world_model_v5', 'contact_world_model', "
-            "or 'contact_world_model_opd'"
+            "or 'contact_world_model_opd', 'swm', or 'swm_opd'"
         )
     inference_mode = predictor.inference_mode.strip().lower().replace("-", "_")
     if inference_mode == "async":
@@ -400,6 +482,14 @@ def load_inference_config(path: str | Path) -> InferenceConfig:
     )
     runtime_raw = _mapping(raw.get("runtime"), "runtime")
     _reject_unknown(runtime_raw, RuntimeConfig, "runtime")
+    runtime_camera_raw = runtime_raw.get("camera")
+    runtime_camera = (
+        None
+        if runtime_camera_raw is None
+        else str(runtime_camera_raw).strip()
+    )
+    if runtime_camera == "":
+        raise ValueError("runtime.camera must be a non-empty camera name or null")
     runtime = RuntimeConfig(
         collection_config=_required_path(
             runtime_raw.get("collection_config"),
@@ -407,7 +497,7 @@ def load_inference_config(path: str | Path) -> InferenceConfig:
             "runtime.collection_config",
         ),
         arm_pair=str(runtime_raw.get("arm_pair", "main")),
-        camera=str(runtime_raw.get("camera", "wrist")),
+        camera=runtime_camera,
         maximum_state_age_s=float(runtime_raw.get("maximum_state_age_s", 0.1)),
         maximum_observation_alignment_gap_s=float(
             runtime_raw.get("maximum_observation_alignment_gap_s", 0.03)
@@ -570,10 +660,29 @@ def load_inference_config(path: str | Path) -> InferenceConfig:
 def _checkpoint(value: Any, base: Path, name: str) -> CheckpointConfig:
     raw = _mapping(value, name)
     _reject_unknown(raw, CheckpointConfig, name)
+    image_encoder = raw.get("image_encoder")
+    if image_encoder is not None:
+        image_encoder = str(image_encoder).strip().lower().replace("-", "_")
+        aliases = {
+            "imagenet": "imagenet",
+            "imagenet1k": "imagenet",
+            "imagenet1k_v1": "imagenet",
+            "resnet": "imagenet",
+            "dino": "dino",
+            "dinov2": "dino",
+            "dinov3": "dino",
+        }
+        if image_encoder not in aliases:
+            raise ValueError(
+                f"{name}.image_encoder must be 'imagenet' or 'dino', "
+                f"got {image_encoder!r}"
+            )
+        image_encoder = aliases[image_encoder]
     return CheckpointConfig(
         path=_required_path(raw.get("path"), base, f"{name}.path"),
         device=str(raw.get("device", "cuda:0")),
         use_ema=bool(raw.get("use_ema", True)),
+        image_encoder=image_encoder,
         dino_model_path=(
             None
             if raw.get("dino_model_path") is None

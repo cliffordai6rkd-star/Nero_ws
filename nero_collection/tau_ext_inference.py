@@ -95,6 +95,28 @@ class OnlineTauExtResult:
     tau_other_history_ready: bool | None = None
     tau_free_history_ready: bool | None = None
 
+    @property
+    def q_raw(self) -> np.ndarray:
+        """Measured joint position passed to the online estimator.
+
+        ``q``/``dq``/``tau`` are intentionally kept as the raw acquisition
+        streams in the public result.  The optional source Butterworth bank is
+        private to the tau-ext predictors and must not leak into consumers such
+        as the torque world model, whose checkpoint owns its preprocessing
+        contract.
+        """
+        return np.asarray(self.q, dtype=np.float64).copy()
+
+    @property
+    def dq_raw(self) -> np.ndarray:
+        """Measured joint velocity (unfiltered public acquisition stream)."""
+        return np.asarray(self.dq, dtype=np.float64).copy()
+
+    @property
+    def tau_raw(self) -> np.ndarray:
+        """Measured actuator torque (unfiltered public acquisition stream)."""
+        return np.asarray(self.tau, dtype=np.float64).copy()
+
     def force_feedback(self, source: str) -> tuple[np.ndarray, bool]:
         """Return the configured residual and its branch-local readiness."""
         normalized = str(source).strip().lower()
@@ -659,10 +681,14 @@ class OnlineTauExtInference:
                     cutoff_hz=source_filter.cutoff_hz,
                 )
                 for key in (
-                    # "q",
+                    # These filters are private to the tau-ext predictors.
+                    # ``_result_for_source`` still exposes the raw acquisition
+                    # streams to downstream consumers (notably SWM), whose
+                    # checkpoint owns any model-side preprocessing.
+                    "q",
                     "dq",
                     "tau",
-                    # "q_cmd",
+                    "q_cmd",
                 )
             }
             if source_filter.enabled

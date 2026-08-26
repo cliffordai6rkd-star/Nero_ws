@@ -19,6 +19,11 @@ NeroObservationSampler -> ObservationProcessor -> HighLevelPolicy
 `NeroObservationSampler` 和 `NeroPipelineOutputController`，因此 DP、Contact WM
 和 direct-IK 的旧入口仍保持兼容，后续可以逐步替换 `pipeline.py` 内部阶段。
 
+当前迁移已将 DP 的观测历史/时间戳对齐放入 `inference/stages/DPObservationBuffer`，
+action chunk 的时间戳推进放入 `ActionPlanExecutor`，DP forward 通过
+`policies/dp.DiffusionPolicyAdapter` 调用。WM 未确定时继续使用 `NullWorldModel`；
+动作解析和通用限幅可分别注入 `DirectActionResolver`/`BasicSafetyGuard`。
+
 `architecture` 配置块用于选择新的编排层，默认关闭以保持旧 YAML 行为：
 
 ```yaml
@@ -221,6 +226,56 @@ pose）；WM 不读取 `dq` 或 wrench。模型输出 future `q/tau/contact_stat
 `execution.mode: mit` 不会把已经由固件应用的 PD 项再次加入 `t_ff`；
 `InferenceOutput.tau_command` 用于诊断完整 MIT 合成力矩，`torque_target` 才是发送给
 固件的 WM feedforward。
+
+原生 SWM（`predictor.mode: swm` 或 `swm_opd`）使用 PINN checkpoint 中声明的
+`q/dq/delta_q/tau` 四路 100 Hz 状态历史，以及 25 Hz 的 7 维绝对关节 action chunk。
+运行时不会在这四路输入外追加滤波；checkpoint 内的 normalizer 和模型预处理负责训练时
+的变换。`delta_q` 始终按实际下发的 `q_cmd - q` 构造，首个状态样本没有上一条命令时为零。
+SWM 的 `dataloader.expert_fps` 是动作推进时钟，必须与 DP checkpoint 的动作时间步一致；
+不一致会在启动时拒绝，避免动作 chunk 被错误地按另一频率消费。SWM 输出可以通过
+`execution.mode` 选择：
+
+- `q`：下发限幅后的预测 q；
+- `mit`：下发预测 q/dq 和 WM tau feedforward，固件应用配置的 MIT 增益；
+- `tau`：仅下发预测 tau；
+- `osc_qp`：把预测 q/dq/ddq/tau 作为 OSC-QP 的关节软目标。
+
+最小配置形态如下（`pinn_checkpoint.path` 必须替换成真实 SWM checkpoint）：
+
+```yaml
+dp_checkpoint:
+  path: ../../../model/dp/insert_usb/200ep/optimizer_step=00095000.ckpt
+  image_encoder: imagenet
+  device: cuda:0
+  use_ema: true
+
+pinn_checkpoint:
+  path: ../../../PINN/outputs/torque_world_model_v4/checkpoints/epoch_XXXXX.pt
+  device: cuda:0
+  use_ema: true
+
+action: joint
+predictor:
+  enabled: true
+  mode: swm
+  inference_mode: asynchronous
+  action_chunk_mode: all
+  action_execution_mode: chunk
+  action_step_s: null
+
+execution:
+  mode: q  # mit / tau / osc_qp
+```
+
+在线启动时需让当前工作区和 PINN 源码都可导入：
+
+```bash
+conda run -n nero_dp bash -lc '\
+  cd /home/rei/mnt/code/lcx/nero_ws && \
+  PYTHONPATH=.:/home/rei/mnt/code/lcx/PINN python -m inference.cli \
+    --config inference/configs/nero_swm.yaml \
+    --run --backend pyagxarm --enable-command'
+```
 
 例如先只检查 checkpoint 和契约：
 

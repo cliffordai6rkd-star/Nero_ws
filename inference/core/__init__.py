@@ -9,7 +9,7 @@ from inference.core.base import (
     NullWorldModel,
 )
 from inference.core.contracts import ActionChunk, ControlTarget, InferenceCycle, Observation
-from inference.core.legacy_runner import NeroPipelineRunner
+from inference.core.legacy_runner import ModularInferenceRunner, NeroPipelineRunner
 
 __all__ = [
     "ActionChunk",
@@ -22,5 +22,6 @@ __all__ = [
     "NullSafetyGuard",
     "NullWorldModel",
     "NeroPipelineRunner",
+    "ModularInferenceRunner",
     "Observation",
 ]

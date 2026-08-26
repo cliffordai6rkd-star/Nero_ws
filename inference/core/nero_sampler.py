@@ -128,6 +128,7 @@ class NeroObservationSampler:
             tau=sample.tau,
             tau_ext=tau_result.tau_ext_cal,
             wrench_ext=sample.wrench,
+            q_cmd=getattr(sample, "q_cmd", None),
             images=images,
             image_timestamps_us=image_timestamps,
             wrench_to_control_rotation=rotation,

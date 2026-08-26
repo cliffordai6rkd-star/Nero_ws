@@ -12,7 +12,9 @@ import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
 
 from inference.checkpoints import call_pinn, restore_checkpoint_model
-from inference.config import InferenceConfig
+from inference.config import InferenceConfig, resolve_camera_key
+from inference.policies.dp import DiffusionPolicyAdapter, predict_diffusion_action
+from inference.stages import ActionPlanExecutor, DPObservationBuffer
 from inference.torque_filter import CausalTorqueCommandFilter
 from nero_collection.control import (
     OSCQPController,
@@ -42,9 +44,38 @@ _CONTACT_WORLD_MODEL_MODES = frozenset(
         "contact_wm_opd",
     )
 )
+_SWM_MODES = frozenset(
+    (
+        "swm",
+        "swm_opd",
+        "torque_world_model",
+        "torque_world_model_opd",
+        "torque_wm",
+        "torque_wm_opd",
+    )
+)
 _WORLD_MODEL_MODES = frozenset(
     ("world_model_v3", *_Q_TAU_WORLD_MODEL_MODES)
 )
+
+
+def _collection_camera_keys_if_available(path: str | Path) -> tuple[str, ...] | None:
+    """Read enabled acquisition camera names when the collection file exists.
+
+    Unit-level pipeline users often inject a model with a synthetic collection
+    path.  In that case the checkpoint contract still resolves a sensible
+    anchor (the wrist preference for the standard two-camera setup).  A real
+    deployment file is parsed normally so mismatched camera contracts fail at
+    startup rather than after the first observation.
+    """
+
+    collection_path = Path(path).expanduser()
+    if not collection_path.is_file():
+        return None
+    from nero_collection.config import load_config
+
+    collection = load_config(collection_path)
+    return tuple(str(camera.name) for camera in collection.cameras if camera.enabled)
 
 
 @dataclass(frozen=True)
@@ -58,6 +89,10 @@ class InferenceInput:
     timestamp_s: float
     wrench_to_control_rotation: np.ndarray | None = None
     image_timestamp_s: float | Mapping[str, float] | None = None
+    # Command held by the follower at this state sample.  SWM training uses
+    # q_cmd-q as delta_q; legacy callers may omit it and the SWM pipeline
+    # falls back to the currently held DP joint action.
+    q_cmd: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -155,6 +190,11 @@ class NeroInferencePipeline:
             kind="DP",
             model_overrides=_dp_model_overrides(config),
         )
+        self._dp_policy = DiffusionPolicyAdapter(
+            self.dp,
+            semantic=self._dp_action_type,
+            device=config.dp_checkpoint.device,
+        )
         if self._predictor_enabled:
             if pinn_model is not None:
                 self.pinn = pinn_model
@@ -192,6 +232,7 @@ class NeroInferencePipeline:
                 _allow_contact_world_model
                 and self._predictor_mode in _CONTACT_WORLD_MODEL_MODES
             )
+            and self._predictor_mode not in _SWM_MODES
         ):
             raise ValueError(f"unsupported predictor mode: {self._predictor_mode!r}")
         if controller is None:
@@ -258,12 +299,15 @@ class NeroInferencePipeline:
         if not configured_image_keys:
             configured_image_keys = (str(getattr(self.dp, "image_key", "wrist")),)
         self._image_keys = tuple(sorted(dict.fromkeys(configured_image_keys)))
-        self._anchor_image_key = str(config.runtime.camera)
-        if self._anchor_image_key not in self._image_keys:
-            raise ValueError(
-                f"runtime.camera={self._anchor_image_key!r} must be one of the DP "
-                f"image keys {list(self._image_keys)}"
-            )
+        self._anchor_image_key = resolve_camera_key(
+            config.runtime.camera,
+            self._image_keys,
+            _collection_camera_keys_if_available(config.runtime.collection_config),
+        )
+        # Expose the resolved value for the runtime sampler.  ``camera`` in the
+        # user YAML is only an optional override; the checkpoint remains the
+        # source of truth for the actual image-key set.
+        self.resolved_camera = self._anchor_image_key
         self._image_key = self._image_keys[0] if len(self._image_keys) == 1 else None
         self._images_by_key = {
             key: deque(maxlen=self._n_obs_steps) for key in self._image_keys
@@ -282,6 +326,28 @@ class NeroInferencePipeline:
         self._latest_policy_anchor_s: float | None = None
         self._last_submitted_policy_anchor_s: float | None = None
         self._open_loop_observation_start_s: float | None = None
+        # Observation acquisition/alignment is kept in a standalone stage.
+        # The aliases below preserve the private attributes used by legacy
+        # callers and tests while the rest of this class is migrated.
+        self._observation_buffer = DPObservationBuffer(
+            image_keys=self._image_keys,
+            anchor_image_key=self._anchor_image_key,
+            n_obs_steps=self._n_obs_steps,
+            wrench_history_steps=self._wrench_history_steps,
+            uses_wrench_observation=self._uses_wrench_observation,
+            observation_step_s=lambda: self.observation_step_s,
+            inference_mode=config.predictor.inference_mode,
+            maximum_alignment_gap_s=(
+                config.runtime.maximum_observation_alignment_gap_s
+            ),
+            on_continuous_can=self._append_world_model_observation_values,
+        )
+        self._images_by_key = self._observation_buffer._images_by_key
+        self._images = self._observation_buffer._images
+        self._wrenches = self._observation_buffer._wrenches
+        self._timed_images_by_key = self._observation_buffer._timed_images_by_key
+        self._timed_images = self._observation_buffer._timed_images
+        self._timed_wrenches = self._observation_buffer._timed_wrenches
         self._wm_history_horizon = int(
             getattr(self.pinn, "history_horizon", 1)
         )
@@ -303,6 +369,7 @@ class NeroInferencePipeline:
         self._execution_plan_step_s: float | None = None
         self._execution_plan_active = False
         self._pending_dp_prediction: _DPPrediction | None = None
+        self._action_executor = ActionPlanExecutor()
         checkpoint_config = getattr(self.pinn, "_inference_checkpoint_config", {})
         contact_gate_config = (
             checkpoint_config.get("contact_gate", {})
@@ -339,7 +406,11 @@ class NeroInferencePipeline:
         self._pinn_action_condition_mode = str(
             pinn_model_config.get("action_condition_mode", "relative_pose")
         ).lower()
-        if self._pinn_action_condition_mode not in {
+        if self._predictor_mode in _SWM_MODES:
+            # Native SWM consumes direct joint actions; it builds its own
+            # action/mask condition in ``SWMInferencePipeline``.
+            self._pinn_action_condition_mode = "direct"
+        elif self._pinn_action_condition_mode not in {
             "absolute_pose",
             "relative_pose",
         }:
@@ -440,6 +511,7 @@ class NeroInferencePipeline:
         for images in self._timed_images_by_key.values():
             images.clear()
         self._timed_wrenches.clear()
+        self._observation_buffer.clear()
         self._dp_snapshot_pending_reason = None
         self._latest_policy_anchor_s = None
         self._last_submitted_policy_anchor_s = None
@@ -457,6 +529,8 @@ class NeroInferencePipeline:
         self._execution_plan_step_s = None
         self._execution_plan_active = False
         self._pending_dp_prediction = None
+        self._action_executor.reset()
+        self._sync_action_executor_aliases()
         self._target_wrenches[:] = 0.0
         self._last_tau = None
         self._torque_filter.reset()
@@ -803,47 +877,53 @@ class NeroInferencePipeline:
             )[None]
             plan_step_s = self._action_execution_step_s()
             held_action = plan[0]
-        self._execution_plan = np.asarray(plan, dtype=np.float64).copy()
-        self._execution_plan_index = 0
-        self._action = self._execution_plan[0].copy()
-        self._action_chunk = self._execution_plan.copy()
-        self._pinn_held_action = np.asarray(held_action, dtype=np.float64).copy()
-        if scheduled:
-            self._execution_plan_active = True
-            self._execution_plan_step_s = plan_step_s
-            self._execution_next_step_s = float(timestamp_s) + plan_step_s
-        else:
-            self._execution_plan_active = False
-            self._execution_next_step_s = None
-            self._execution_plan_step_s = None
+        self._action_executor.install(
+            plan,
+            held_action=held_action,
+            timestamp_s=timestamp_s,
+            scheduled=scheduled,
+            step_s=plan_step_s,
+        )
+        self._sync_action_executor_aliases()
 
     def _advance_execution_plan(self, timestamp_s: float) -> bool:
-        if (
-            not self._execution_plan_active
-            or self._execution_plan is None
-            or self._execution_next_step_s is None
-            or self._execution_plan_step_s is None
-        ):
-            return False
-        timestamp_s = float(timestamp_s)
-        step_s = self._execution_plan_step_s
-        while timestamp_s + 1.0e-9 >= self._execution_next_step_s:
-            next_index = self._execution_plan_index + 1
-            if next_index >= len(self._execution_plan):
-                self._execution_plan_active = False
-                self._execution_next_step_s = None
-                self._execution_plan_step_s = None
-                self._execution_plan_index = len(self._execution_plan) - 1
-                self._action = self._execution_plan[-1].copy()
-                self._action_chunk = self._execution_plan[-1:].copy()
-                return True
-            self._execution_plan_index = next_index
-            self._action = self._execution_plan[next_index].copy()
-            self._action_chunk = self._execution_plan[next_index:].copy()
-            self._execution_next_step_s += step_s
-        return False
+        completed = self._action_executor.advance(timestamp_s)
+        self._sync_action_executor_aliases()
+        return completed
 
     def _clear_dp_observations(self, *, start_s: float | None = None) -> None:
+        self._observation_buffer.clear(start_s=start_s)
+        self._sync_observation_state_aliases()
+
+    def _sync_observation_state_aliases(self) -> None:
+        """Expose buffer progress to legacy diagnostics and callers."""
+        buffer = self._observation_buffer
+        self._dp_snapshot_pending_reason = buffer.dp_snapshot_pending_reason
+        self._latest_policy_anchor_s = buffer._latest_policy_anchor_s
+        self._last_submitted_policy_anchor_s = buffer._last_submitted_policy_anchor_s
+        self._open_loop_observation_start_s = buffer._open_loop_observation_start_s
+        self._camera_alignment_logged = buffer._camera_alignment_logged
+
+    def _sync_action_executor_aliases(self) -> None:
+        executor = self._action_executor
+        self._execution_plan = executor.plan
+        self._execution_plan_index = executor.index
+        self._execution_next_step_s = executor.next_step_s
+        self._execution_plan_step_s = executor.step_s
+        self._execution_plan_active = executor.active
+        self._action = None if executor.action is None else executor.action.copy()
+        self._action_chunk = (
+            None if executor.action_chunk is None else executor.action_chunk.copy()
+        )
+        self._pinn_held_action = (
+            None if executor.held_action is None else executor.held_action.copy()
+        )
+
+    # The _legacy_* implementations below are retained temporarily for
+    # downstream subclasses that still call them directly.  All normal pipeline
+    # paths use the stage-backed wrappers above; remove these fallbacks after
+    # ContactWMInferencePipeline has migrated.
+    def _legacy_clear_dp_observations(self, *, start_s: float | None = None) -> None:
         for images in self._images_by_key.values():
             images.clear()
         self._wrenches.clear()
@@ -873,17 +953,16 @@ class NeroInferencePipeline:
     def _set_idle_action(
         self, current_action_pose: np.ndarray, current_q: np.ndarray
     ) -> None:
-        self._action = (
+        action = (
             _pose_to_action(current_action_pose)
             if self._dp_action_type == "eepose"
             else _numpy_vector(current_q, 7, "current q").copy()
         )
-        self._pinn_held_action = self._action.copy()
-        self._action_chunk = np.repeat(
-            self._action[None],
-            max(1, self._pinn_future_horizon),
-            axis=0,
+        self._action_executor.set_idle(
+            action,
+            future_horizon=max(1, self._pinn_future_horizon),
         )
+        self._sync_action_executor_aliases()
 
     def step_direct_ik_synchronous(self, sample: InferenceInput) -> InferenceOutput:
         """Run one deterministic DP -> IK step for offline dataset inference.
@@ -1198,6 +1277,24 @@ class NeroInferencePipeline:
         state_timestamp_s: float | None = None,
         allow_backfill: bool = True,
     ) -> None:
+        self._observation_buffer.append(
+            image,
+            wrench,
+            image_timestamp_s=image_timestamp_s,
+            state_timestamp_s=state_timestamp_s,
+            allow_backfill=allow_backfill,
+        )
+        self._sync_observation_state_aliases()
+
+    def _legacy_append_observation(
+        self,
+        image: np.ndarray | Mapping[str, np.ndarray],
+        wrench: np.ndarray,
+        *,
+        image_timestamp_s: float | Mapping[str, float] | None = None,
+        state_timestamp_s: float | None = None,
+        allow_backfill: bool = True,
+    ) -> None:
         if isinstance(image, Mapping):
             image_keys = tuple(sorted(str(key) for key in image))
             if image_keys != self._image_keys:
@@ -1294,6 +1391,13 @@ class NeroInferencePipeline:
     def _observation_snapshot(
         self,
     ) -> tuple[np.ndarray | Mapping[str, np.ndarray], np.ndarray]:
+        result = self._observation_buffer.snapshot()
+        self._sync_observation_state_aliases()
+        return result
+
+    def _legacy_observation_snapshot(
+        self,
+    ) -> tuple[np.ndarray | Mapping[str, np.ndarray], np.ndarray]:
         images: np.ndarray | Mapping[str, np.ndarray]
         if len(self._image_keys) == 1:
             images = np.stack(tuple(self._images), axis=0)
@@ -1310,6 +1414,13 @@ class NeroInferencePipeline:
         )
 
     def _observation_snapshot_for_dp(
+        self,
+    ) -> tuple[np.ndarray | Mapping[str, np.ndarray], np.ndarray] | None:
+        result = self._observation_buffer.snapshot_for_dp()
+        self._sync_observation_state_aliases()
+        return result
+
+    def _legacy_observation_snapshot_for_dp(
         self,
     ) -> tuple[np.ndarray | Mapping[str, np.ndarray], np.ndarray] | None:
         if self._timed_images:
@@ -1382,6 +1493,14 @@ class NeroInferencePipeline:
         return self._observation_snapshot()
 
     def _timed_observation_snapshot(
+        self,
+        anchor_s: float,
+    ) -> tuple[np.ndarray | Mapping[str, np.ndarray], np.ndarray] | None:
+        result = self._observation_buffer.timed_snapshot(anchor_s)
+        self._sync_observation_state_aliases()
+        return result
+
+    def _legacy_timed_observation_snapshot(
         self,
         anchor_s: float,
     ) -> tuple[np.ndarray | Mapping[str, np.ndarray], np.ndarray] | None:
@@ -1476,6 +1595,14 @@ class NeroInferencePipeline:
         wrench: np.ndarray,
         timestamp_s: float,
     ) -> None:
+        self._observation_buffer.append_open_loop_can_observation(wrench, timestamp_s)
+        self._sync_observation_state_aliases()
+
+    def _legacy_append_open_loop_can_observation(
+        self,
+        wrench: np.ndarray,
+        timestamp_s: float,
+    ) -> None:
         """Append one CAN-derived sample without reusing a stale image."""
         if self.config.predictor.inference_mode != "open_loop":
             raise RuntimeError(
@@ -1499,6 +1626,29 @@ class NeroInferencePipeline:
         tau: np.ndarray,
         wrench: np.ndarray,
         timestamp_s: float,
+        q_cmd: np.ndarray | None = None,
+    ) -> None:
+        self._observation_buffer.append_continuous_can_observation(
+            q=q,
+            dq=dq,
+            ddq=ddq,
+            tau=tau,
+            wrench=wrench,
+            timestamp_s=timestamp_s,
+            q_cmd=q_cmd,
+        )
+        self._sync_observation_state_aliases()
+
+    def _legacy_append_continuous_can_observation(
+        self,
+        *,
+        q: np.ndarray,
+        dq: np.ndarray,
+        ddq: np.ndarray,
+        tau: np.ndarray,
+        wrench: np.ndarray,
+        timestamp_s: float,
+        q_cmd: np.ndarray | None = None,
     ) -> None:
         """Backfill one timestamp-consistent record from the runtime CAN ring."""
         timestamp_s = float(timestamp_s)
@@ -1517,10 +1667,19 @@ class NeroInferencePipeline:
                 "a": ddq,
                 "tau": tau,
                 "wrench": wrench_value,
+                **({"q_cmd": q_cmd} if q_cmd is not None else {}),
             },
         )
 
     def _timed_observation_snapshot_if_aligned(
+        self,
+        anchor_s: float,
+    ) -> tuple[np.ndarray | Mapping[str, np.ndarray], np.ndarray] | None:
+        result = self._observation_buffer.timed_snapshot_if_aligned(anchor_s)
+        self._sync_observation_state_aliases()
+        return result
+
+    def _legacy_timed_observation_snapshot_if_aligned(
         self,
         anchor_s: float,
     ) -> tuple[np.ndarray | Mapping[str, np.ndarray], np.ndarray] | None:
@@ -1671,6 +1830,16 @@ class NeroInferencePipeline:
         anchor_times: np.ndarray,
         image_indices_by_key: Mapping[str, np.ndarray],
     ) -> None:
+        self._observation_buffer._log_camera_alignment_once(
+            anchor_times, image_indices_by_key
+        )
+        self._sync_observation_state_aliases()
+
+    def _legacy_log_camera_alignment_once(
+        self,
+        anchor_times: np.ndarray,
+        image_indices_by_key: Mapping[str, np.ndarray],
+    ) -> None:
         if self._camera_alignment_logged:
             return
         age_descriptions = []
@@ -1692,6 +1861,10 @@ class NeroInferencePipeline:
         self._camera_alignment_logged = True
 
     def _note_dp_snapshot_pending(self, reason: str) -> None:
+        self._observation_buffer._note_pending(reason)
+        self._sync_observation_state_aliases()
+
+    def _legacy_note_dp_snapshot_pending(self, reason: str) -> None:
         if reason != self._dp_snapshot_pending_reason:
             log.info("DP observation pending: %s", reason)
         self._dp_snapshot_pending_reason = reason
@@ -1718,10 +1891,18 @@ class NeroInferencePipeline:
             or self._predictor_mode not in _WORLD_MODEL_MODES
         ):
             return
+        # The continuous observation stage exposes both legacy (v/a) and
+        # canonical (dq/ddq) aliases, plus optional q_cmd for SWM.  Select the
+        # exact legacy contract here instead of rejecting harmless metadata.
         values = {
             key: np.asarray(value, dtype=np.float32).copy()
             for key, value in values.items()
         }
+        if "v" not in values and "dq" in values:
+            values["v"] = values["dq"]
+        if "a" not in values and "ddq" in values:
+            values["a"] = values["ddq"]
+        values = {key: values[key] for key in ("q", "v", "a", "tau", "wrench") if key in values}
         expected_shapes = {
             "q": (7,),
             "v": (7,),
@@ -1729,7 +1910,7 @@ class NeroInferencePipeline:
             "tau": (7,),
             "wrench": (6,),
         }
-        if set(values) != set(expected_shapes) or any(
+        if set(expected_shapes) - set(values) or any(
             values[key].shape != shape or not np.all(np.isfinite(values[key]))
             for key, shape in expected_shapes.items()
         ):
@@ -1807,25 +1988,42 @@ class NeroInferencePipeline:
         _synchronize_model(self.dp)
         started_s = perf_counter()
         with torch.inference_mode():
-            output = _predict_dp_action(
-                self.dp,
-                obs,
-                action_type=self._dp_action_type,
-            )
+            output = self._dp_policy.predict_raw(obs)
         _synchronize_model(self.dp)
         elapsed_s = perf_counter() - started_s
         self._record_dp_inference_timing(elapsed_s)
-        if not isinstance(output, Mapping) or "action_target" not in output:
-            raise RuntimeError("DP predict_action must return action_target")
-        action_target = _numpy_vector(
-            output["action_target"],
-            7,
-            "DP action_target",
+        if not isinstance(output, Mapping):
+            raise RuntimeError("DP predict_action must return an action mapping")
+        # Official and wrapped DP policies use several names for the sampled
+        # trajectory.  Prefer the already selected target, otherwise retain the
+        # complete action chunk and derive a target with semantic-aware averaging.
+        target_value = next(
+            (output[key] for key in ("action_target", "action", "action_pred", "action_prediction") if key in output),
+            None,
+        )
+        if target_value is None:
+            raise RuntimeError(
+                "DP predict_action must return one of action_target/action/action_pred"
+            )
+        chunk_value = next(
+            (output[key] for key in ("action", "action_pred", "action_prediction", "trajectory", "action_target") if key in output),
+            target_value,
         )
         raw_action_chunk = _numpy_action_chunk(
-            output.get("action", output["action_target"]),
+            chunk_value,
             require_quaternion=self._dp_action_type == "eepose",
         )
+        target_array = np.asarray(
+            target_value.detach().cpu().numpy() if hasattr(target_value, "detach") else target_value,
+            dtype=np.float64,
+        )
+        if target_array.ndim != 1 or target_array.shape != (7,):
+            target_array = (
+                _mean_pose_chunk(raw_action_chunk)
+                if self._dp_action_type == "eepose"
+                else raw_action_chunk.mean(axis=0)
+            )
+        action_target = _numpy_vector(target_array, 7, "DP action_target")
         action_chunk = _dp_execution_action_chunk(
             raw_action_chunk,
             model_horizon=getattr(self.dp, "horizon", None),
@@ -2356,6 +2554,8 @@ class NeroInferencePipeline:
     def _validate_input(sample: InferenceInput) -> None:
         for name, size in (("q", 7), ("dq", 7), ("ddq", 7), ("tau", 7), ("wrench_ext", 6)):
             _numpy_vector(getattr(sample, name), size, name)
+        if sample.q_cmd is not None:
+            _numpy_vector(sample.q_cmd, 7, "q_cmd")
         if not np.isfinite(sample.timestamp_s):
             raise ValueError("timestamp_s must be finite")
         image_timestamp_s = sample.image_timestamp_s
@@ -2395,6 +2595,11 @@ def _dp_model_overrides(config: InferenceConfig) -> dict[str, Any]:
         "noise_scheduler._target_": scheduler_targets[config.dp_sampling.method],
         "num_inference_steps": config.dp_sampling.num_inference_steps,
     }
+    # ImageNet/ResNet checkpoints carry their visual weights in the embedded
+    # Hydra config. Passing the legacy DINO override to those targets would
+    # fail because they have no DINO path field.
+    if config.dp_checkpoint.image_encoder == "imagenet":
+        return overrides
     path = config.dp_checkpoint.dino_model_path
     if path is None:
         return overrides
@@ -2424,45 +2629,10 @@ def _predict_dp_action(
     ``predict_action`` method unless all of the standard diffusion methods are
     present.
     """
-    if action_type != "joint":
-        return model.predict_action(obs)
-
-    required = (
-        "_encode_observation",
-        "conditional_sample",
-        "normalizer",
-        "horizon",
-        "action_dim",
-        "n_action_steps",
-    )
-    if not all(hasattr(model, name) for name in required):
-        return model.predict_action(obs)
-
-    condition = model._encode_observation(obs)
-    batch_size = int(condition.shape[0])
-    horizon = int(model.horizon)
-    action_dim = int(model.action_dim)
-    if condition.ndim < 2 or horizon < 1 or action_dim != 7:
-        return model.predict_action(obs)
-    trajectory = model.conditional_sample(
-        (batch_size, horizon, action_dim),
-        condition,
-    )
-    action_prediction = model.normalizer["action"].unnormalize(trajectory)
-    start = int(
-        getattr(model, "action_start_index", int(getattr(model, "n_obs_steps", 1)) - 1)
-    )
-    n_action_steps = int(model.n_action_steps)
-    action = action_prediction[:, start : start + n_action_steps]
-    if action.ndim != 3 or action.shape[-1] != 7 or action.shape[1] < 1:
-        return model.predict_action(obs)
-    return {
-        "action": action,
-        "action_pred": action_prediction,
-        "model_action_pred": action_prediction,
-        "action_target": action.mean(dim=1),
-    }
-
+    # Compatibility wrapper: the algorithm-specific implementation now lives
+    # under ``inference.policies.dp``.  Keep this symbol for offline callers
+    # and tests that imported it from the legacy module.
+    return predict_diffusion_action(model, obs, action_type=action_type)
 
 def _uses_link7_target_gripper_tcp_current_contract(
     config: InferenceConfig,

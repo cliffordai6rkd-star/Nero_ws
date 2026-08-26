@@ -10,7 +10,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from inference.config import InferenceConfig
+from inference.config import InferenceConfig, resolve_camera_key
 from inference.pipeline import NeroInferencePipeline
 from inference.state_stream import (
     ContinuousInferenceSample,
@@ -23,7 +23,8 @@ from inference.wrench_mapping import (
 from inference.wrench_visualization import InferenceWrenchPlotter
 from inference.diagnostics.tau_ext import TauExtInferencePlotter
 from inference.core.nero_sampler import NeroObservationSampler
-from inference.core.legacy_runner import NeroPipelineRunner
+from inference.core.base import InferenceBase
+from inference.core.legacy_runner import ModularInferenceRunner, NeroPipelineRunner
 from inference.control.nero import NeroPipelineOutputController
 from nero_collection.arms.factory import build_arm
 from nero_collection.cameras import CameraFrame, CameraManager, CameraVisualizer
@@ -46,6 +47,9 @@ class NeroInferenceRuntime:
         backend: str | None = None,
         command_enabled: bool = False,
         pipeline: NeroInferencePipeline | None = None,
+        modular_inference: InferenceBase | None = None,
+        modular_builder: Callable[["NeroInferenceRuntime"], InferenceBase] | None = None,
+        modular_image_keys: tuple[str, ...] | None = None,
         arm: Any | None = None,
         cameras: CameraManager | None = None,
         online_tau_ext: OnlineTauExtInference | None = None,
@@ -55,6 +59,42 @@ class NeroInferenceRuntime:
         continuous_state_stream: bool | None = None,
     ) -> None:
         self.config = config
+        # ``pipeline`` historically means the legacy Nero model-stage object.
+        # Accepting an ``InferenceBase`` there as well keeps migration callers
+        # source-compatible, while the explicit argument is clearer for new
+        # code.  A builder is evaluated after the runtime sampler is created so
+        # official-model code can inject that exact sampler into TAVLA.
+        if isinstance(pipeline, InferenceBase):
+            if modular_inference is not None:
+                raise ValueError(
+                    "pass a modular inference object either as pipeline or "
+                    "modular_inference, not both"
+                )
+            modular_inference = pipeline
+            pipeline = None
+        if modular_inference is not None and modular_builder is not None:
+            raise ValueError("pass only one of modular_inference/modular_builder")
+        self.modular_inference = modular_inference
+        self._modular_builder = modular_builder
+        self._modular_image_keys = (
+            None
+            if modular_image_keys is None
+            else tuple(str(key) for key in modular_image_keys)
+        )
+        if self._modular_image_keys is not None and not self._modular_image_keys:
+            raise ValueError("modular_image_keys must contain at least one camera key")
+        self._modular_mode = modular_inference is not None or modular_builder is not None
+        requested_policy = str(config.architecture.policy_type).strip().lower()
+        if (
+            config.architecture.enabled
+            and requested_policy in {"tavla", "tavla_inference", "tavla_pipeline"}
+            and not self._modular_mode
+        ):
+            raise ValueError(
+                "architecture.policy_type='tavla' requires an injected "
+                "modular_inference or modular_builder; the official TAVLA "
+                "checkpoint loader is repository-specific"
+            )
         if config.architecture.enabled:
             log.info(
                 "modular inference architecture enabled policy=%s world_model=%s; "
@@ -85,7 +125,12 @@ class NeroInferenceRuntime:
             collection.cameras,
             visualizer=CameraVisualizer.from_config(collection.cameras),
         )
-        if pipeline is not None:
+        if self._modular_mode:
+            # The actual modular object may be produced below, once the shared
+            # observation sampler exists.  Keep ``self.pipeline`` as a public
+            # compatibility alias after construction.
+            self.pipeline = modular_inference
+        elif pipeline is not None:
             self.pipeline = pipeline
         elif config.predictor.enabled and config.predictor.mode in {
             "contact_world_model",
@@ -96,6 +141,17 @@ class NeroInferenceRuntime:
             from inference.contact_pipeline import ContactWMInferencePipeline
 
             self.pipeline = ContactWMInferencePipeline(config)
+        elif config.predictor.enabled and config.predictor.mode in {
+            "swm",
+            "swm_opd",
+            "torque_world_model",
+            "torque_world_model_opd",
+            "torque_wm",
+            "torque_wm_opd",
+        }:
+            from inference.swm_pipeline import SWMInferencePipeline
+
+            self.pipeline = SWMInferencePipeline(config)
         else:
             self.pipeline = NeroInferencePipeline(config)
         self.online_tau_ext = online_tau_ext or OnlineTauExtInference(
@@ -131,8 +187,47 @@ class NeroInferenceRuntime:
         self.robot_controller.bind_q_command_sink(self._set_q_cmd)
         self._latest_frame: CameraFrame | None = None
         configured_image_keys = tuple(getattr(self.pipeline, "_image_keys", ()))
-        self._pipeline_image_keys = configured_image_keys or (
-            str(config.runtime.camera),
+        if self._modular_image_keys is not None:
+            configured_image_keys = self._modular_image_keys
+        elif self._modular_mode:
+            # TAVLA/other modular policies usually consume the complete image
+            # mapping.  Keep the historical single-camera default unless the
+            # caller explicitly opts into additional cameras.
+            configured_image_keys = tuple(
+                getattr(
+                    getattr(self.modular_inference, "policy", None),
+                    "image_keys",
+                    (),
+                )
+            ) or configured_image_keys
+        collection_camera_keys = tuple(
+            str(camera.name) for camera in collection.cameras if camera.enabled
+        )
+        # The policy/checkpoint defines the image keys.  If an injected legacy
+        # pipeline does not expose them, use the enabled acquisition keys as a
+        # compatibility fallback and still resolve one deterministic anchor.
+        resolution_keys = configured_image_keys or collection_camera_keys
+        if not resolution_keys and config.runtime.camera is not None:
+            resolution_keys = (str(config.runtime.camera),)
+        if not resolution_keys:
+            raise ValueError(
+                "cannot resolve a camera anchor: neither the policy checkpoint "
+                "nor the collection config declares an enabled camera"
+            )
+        resolved_camera = resolve_camera_key(
+            config.runtime.camera,
+            resolution_keys,
+            collection_camera_keys,
+        )
+        self.resolved_camera = resolved_camera
+        self._pipeline_image_keys = tuple(
+            str(key) for key in (configured_image_keys or (resolved_camera,))
+        )
+        log.info(
+            "camera contract resolved anchor=%s policy_keys=%s collection_keys=%s",
+            resolved_camera,
+            list(self._pipeline_image_keys),
+            list(collection_camera_keys),
         )
         self._latest_frames: dict[str, CameraFrame] = {}
         self._last_arm_timestamp_us = 0
@@ -179,7 +274,7 @@ class NeroInferenceRuntime:
         self._observation_sampler = NeroObservationSampler(
             cameras=self.cameras,
             camera_keys=self._pipeline_image_keys,
-            primary_camera=config.runtime.camera,
+            primary_camera=resolved_camera,
             maximum_state_age_s=config.runtime.maximum_state_age_s,
             read_state=self._read_inference_sample,
             drain_state=self._drain_state_observations,
@@ -195,13 +290,36 @@ class NeroInferenceRuntime:
         self.observation_sampler = self._observation_sampler
         self.controller = self.robot_controller
         self.diagnostics = (self.tau_ext_plotter, self.wrench_plotter)
-        self.pipeline_runner = NeroPipelineRunner(
-            pipeline=self.pipeline,
-            sampler=self._observation_sampler,
-            controller=self.robot_controller,
-            image_keys=self._pipeline_image_keys,
-            on_observation=self._on_modular_observation,
-        )
+
+        if self._modular_builder is not None:
+            built = self._modular_builder(self)
+            if built is None or not callable(getattr(built, "step", None)):
+                raise TypeError(
+                    "modular_builder must return an inference object exposing step()"
+                )
+            self.modular_inference = built
+            self.pipeline = built
+
+        if self._modular_mode:
+            if self.modular_inference is None:
+                raise RuntimeError("modular inference was not constructed")
+            # Reuse the runtime-owned sampler.  A builder may have created the
+            # policy before runtime construction with a placeholder sampler;
+            # replacing it here prevents duplicate camera/state consumers.
+            if hasattr(self.modular_inference, "sampler"):
+                self.modular_inference.sampler = self._observation_sampler
+            modular_controller = getattr(self.modular_inference, "controller", None)
+            if modular_controller is not None:
+                self.controller = modular_controller
+            self.pipeline_runner = ModularInferenceRunner(self.modular_inference)
+        else:
+            self.pipeline_runner = NeroPipelineRunner(
+                pipeline=self.pipeline,
+                sampler=self._observation_sampler,
+                controller=self.robot_controller,
+                image_keys=self._pipeline_image_keys,
+                on_observation=self._on_modular_observation,
+            )
         self._observation_warmup_started_us: int | None = None
         self._inference_control_mode_ready = False
 
@@ -234,8 +352,28 @@ class NeroInferenceRuntime:
         """Return the wrench-to-control rotation for the modular sampler."""
         if self._wrench_mapping.reference_frame != "local":
             return None
-        model = getattr(self.pipeline, "model", self.pipeline.controller.model)
-        pose = model.snapshot(sample.q, sample.dq).pose
+        # Do not use ``getattr(obj, name, obj.other)`` here: Python evaluates
+        # the default expression before calling ``getattr``.  A modular
+        # pipeline may expose ``model`` without exposing the legacy
+        # ``controller`` attribute, so resolving the fallback eagerly would
+        # raise an unrelated AttributeError.
+        model = getattr(self.pipeline, "model", None)
+        if model is None and self._modular_mode:
+            policy = getattr(self.modular_inference, "policy", None)
+            model = getattr(policy, "model", None)
+        if model is None:
+            legacy_controller = getattr(self.pipeline, "controller", None)
+            model = getattr(legacy_controller, "model", None)
+        snapshot = getattr(model, "snapshot", None)
+        if not callable(snapshot):
+            # A modular policy is allowed to operate without a dynamics model;
+            # in that case its wrench is already expressed in control frame.
+            if self._modular_mode:
+                return None
+            raise RuntimeError(
+                "pipeline must expose a dynamics model for local wrench rotation"
+            )
+        pose = snapshot(sample.q, sample.dq).pose
         return np.asarray(pose[:3, :3], dtype=np.float64).copy()
 
     def _on_modular_observation(self, _observation) -> None:
@@ -306,8 +444,15 @@ class NeroInferenceRuntime:
             self.tau_ext_plotter.start()
             self.online_tau_ext.warm_up()
             self._reset_online_tau_ext_episode()
-            self.pipeline.reset()
-            self._observation_sampler.reset_episode()
+            if self._modular_mode:
+                # InferenceBase owns policy/controller lifecycle and requires
+                # ``start`` before its episode reset.  The shared sampler is
+                # already attached during construction.
+                self.pipeline_runner.start()
+                self.pipeline_runner.reset_episode()
+            else:
+                self.pipeline.reset()
+                self._observation_sampler.reset_episode()
             self._reset_observation_protection()
             self._start_state_stream()
             self._started = True
@@ -333,7 +478,7 @@ class NeroInferenceRuntime:
                 )
             self.arm.disconnect()
             try:
-                self.pipeline.close()
+                self._close_model_pipeline()
             except Exception as exc:
                 log.warning("pipeline close failed after startup exception: %s", exc)
             raise
@@ -466,15 +611,28 @@ class NeroInferenceRuntime:
         self._end_episode_state()
         if self.command_enabled:
             self._reset_arm_to_rest("episode boundary")
+        # SWM's delta_q is relative to the command held in this episode.  Do
+        # not carry a prior episode's q_cmd across the reset; seed the new
+        # history from the post-reset measured state before restarting the
+        # fixed-rate stream.
+        with self._q_cmd_lock:
+            self._q_cmd_history.clear()
         if not self.config.observation_protection.enabled:
             self._prepare_inference_control_mode()
             self._inference_control_mode_ready = True
+        state = self._wait_for_finite_arm_state()
+        self._set_q_cmd(state.q, timestamp_us=now_us())
         self._start_state_stream()
 
     def _end_episode_state(self) -> None:
         self._stop_state_stream(clear=True)
-        self.pipeline.reset()
-        self._observation_sampler.reset_episode()
+        with self._q_cmd_lock:
+            self._q_cmd_history.clear()
+        if self._modular_mode:
+            self.pipeline_runner.reset_episode()
+        else:
+            self.pipeline.reset()
+            self._observation_sampler.reset_episode()
         self._reset_online_tau_ext_episode()
         self.wrench_plotter.clear_history()
         self.tau_ext_plotter.clear_history()
@@ -521,7 +679,21 @@ class NeroInferenceRuntime:
     def _reset_online_tau_ext_episode(self) -> None:
         self.online_tau_ext.reset_episode()
 
+    def _close_model_pipeline(self) -> None:
+        """Close whichever model contract this runtime is hosting."""
+        if self._modular_mode:
+            self.pipeline_runner.close()
+            return
+        closer = getattr(self.pipeline, "close", None)
+        if callable(closer):
+            closer()
+
     def _prepare_inference_control_mode(self) -> None:
+        # A modular controller is responsible for selecting/configuring its
+        # transport.  The legacy predictor mode checks below must not force a
+        # joint-impedance transition for TAVLA or another injected policy.
+        if self._modular_mode:
+            return
         if not self.command_enabled or not self.config.predictor.enabled:
             return
         if (
@@ -531,6 +703,19 @@ class NeroInferenceRuntime:
                 "contact_world_model_opd",
                 "contact_wm",
                 "contact_wm_opd",
+            }
+            and self.config.execution.mode == "q"
+        ):
+            return
+        if (
+            self.config.predictor.mode
+            in {
+                "swm",
+                "swm_opd",
+                "torque_world_model",
+                "torque_world_model_opd",
+                "torque_wm",
+                "torque_wm_opd",
             }
             and self.config.execution.mode == "q"
         ):
@@ -818,8 +1003,16 @@ class NeroInferenceRuntime:
                 self._state_stream.history_size,
             )
             self._last_state_stream_rollover_count = rollover_count
+        # Legacy DP/WM pipelines maintain their own high-rate CAN history.
+        # Modular policies receive the canonical observation directly; only
+        # call an optional history hook when the injected object explicitly
+        # provides one.
+        append_history = getattr(self.pipeline, "append_continuous_can_observation", None)
+        if self._modular_mode and not callable(append_history):
+            self._last_consumed_state_timestamp_us = records[-1].timestamp_us
+            return
         for record in records:
-            self.pipeline.append_continuous_can_observation(
+            values = dict(
                 q=record.q,
                 dq=record.dq,
                 ddq=record.ddq,
@@ -827,6 +1020,17 @@ class NeroInferenceRuntime:
                 wrench=record.wrench,
                 timestamp_s=record.timestamp_us * 1.0e-6,
             )
+            if self.config.predictor.mode in {
+                "swm",
+                "swm_opd",
+                "torque_world_model",
+                "torque_world_model_opd",
+                "torque_wm",
+                "torque_wm_opd",
+            }:
+                values["q_cmd"] = getattr(record, "q_cmd", None)
+            if callable(append_history):
+                append_history(**values)
         self._last_consumed_state_timestamp_us = records[-1].timestamp_us
 
     def step(self):
@@ -873,11 +1077,12 @@ class NeroInferenceRuntime:
 
     def stop(self, *, preserve_arm_enabled: bool = False) -> None:
         if not self._started:
-            self.pipeline.close()
+            self._close_model_pipeline()
             return
         try:
             if (
-                not preserve_arm_enabled
+                not self._modular_mode
+                and not preserve_arm_enabled
                 and self.command_enabled
                 and self.config.predictor.enabled
                 and not (
@@ -887,6 +1092,18 @@ class NeroInferenceRuntime:
                         "contact_world_model_opd",
                         "contact_wm",
                         "contact_wm_opd",
+                    }
+                    and self.config.execution.mode == "q"
+                )
+                and not (
+                    self.config.predictor.mode
+                    in {
+                        "swm",
+                        "swm_opd",
+                        "torque_world_model",
+                        "torque_world_model_opd",
+                        "torque_wm",
+                        "torque_wm_opd",
                     }
                     and self.config.execution.mode == "q"
                 )
@@ -913,7 +1130,7 @@ class NeroInferenceRuntime:
                 except Exception as exc:
                     log.warning("arm disable failed during shutdown: %s", exc)
             self.arm.disconnect()
-            self.pipeline.close()
+            self._close_model_pipeline()
             self._started = False
 
 

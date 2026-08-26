@@ -10,6 +10,7 @@ import pytest
 
 from inference.config import (
     CheckpointConfig,
+    ArchitectureConfig,
     InferenceConfig,
     ObservationProtectionConfig,
     PredictorConfig,
@@ -612,6 +613,134 @@ def test_runtime_computes_wrench_and_requires_explicit_command_enable() -> None:
     assert len(pipeline.inputs) == 1
     assert arm.commands == []
     assert pipeline.closed
+
+
+def test_runtime_uses_injected_modular_inference_without_legacy_input_adapter() -> None:
+    class Modular:
+        def __init__(self):
+            self.sampler = object()
+            self.controller = None
+            self.calls = []
+
+        def start(self):
+            self.calls.append("start")
+
+        def reset_episode(self):
+            self.calls.append("reset")
+
+        def step(self):
+            self.calls.append("step")
+            # The runtime sampler is attached during construction.  Consume it
+            # here to ensure the modular path receives canonical observations.
+            observation = self.sampler.sample()
+            return observation
+
+        def close(self):
+            self.calls.append("close")
+
+    base = _config()
+    config = replace(
+        base,
+        architecture=ArchitectureConfig(
+            enabled=True,
+            policy_type="tavla",
+            world_model_type="none",
+        ),
+    )
+    modular = Modular()
+    runtime = NeroInferenceRuntime(
+        config,
+        backend="mock",
+        command_enabled=False,
+        modular_inference=modular,
+        arm=_Arm(),
+        cameras=_Cameras(),
+        online_tau_ext=_TauExt(),
+        wrench_estimator=_Wrench(),
+    )
+    _use_fast_reset(runtime)
+
+    runtime.start()
+    result = runtime.step()
+    runtime.stop()
+
+    assert result is not None
+    assert modular.sampler is runtime.observation_sampler
+    assert modular.calls == ["start", "reset", "step", "close"]
+
+
+def test_tavla_architecture_requires_explicit_model_builder() -> None:
+    base = _config()
+    config = replace(
+        base,
+        architecture=ArchitectureConfig(
+            enabled=True,
+            policy_type="tavla",
+            world_model_type="none",
+        ),
+    )
+    with pytest.raises(ValueError, match="modular_inference or modular_builder"):
+        NeroInferenceRuntime(
+            config,
+            backend="mock",
+            command_enabled=False,
+            arm=_Arm(),
+            cameras=_Cameras(),
+            online_tau_ext=_TauExt(),
+            wrench_estimator=_Wrench(),
+        )
+
+
+def test_runtime_modular_builder_receives_runtime_owned_sampler() -> None:
+    class Modular:
+        def __init__(self, sampler):
+            self.sampler = sampler
+            self.controller = None
+            self.started = False
+
+        def start(self):
+            self.started = True
+
+        def reset_episode(self):
+            return None
+
+        def step(self):
+            return self.sampler.sample()
+
+        def close(self):
+            self.started = False
+
+    base = _config()
+    config = replace(
+        base,
+        architecture=ArchitectureConfig(
+            enabled=True,
+            policy_type="tavla",
+            world_model_type="none",
+        ),
+    )
+    seen = []
+
+    def builder(runtime):
+        seen.append(runtime)
+        return Modular(runtime.observation_sampler)
+
+    runtime = NeroInferenceRuntime(
+        config,
+        backend="mock",
+        command_enabled=False,
+        modular_builder=builder,
+        arm=_Arm(),
+        cameras=_Cameras(),
+        online_tau_ext=_TauExt(),
+        wrench_estimator=_Wrench(),
+    )
+    _use_fast_reset(runtime)
+
+    assert seen == [runtime]
+    runtime.start()
+    assert runtime.step() is not None
+    runtime.stop()
 
 
 def test_runtime_uses_sdk_dq_and_internal_kalman_acceleration() -> None:

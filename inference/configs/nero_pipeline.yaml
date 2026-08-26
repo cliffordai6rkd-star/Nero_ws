@@ -120,7 +120,7 @@ torque_filter:
 wrench_visualization:
   # 独立进程绘制四张图：原始/处理后的合力和六维分量，不阻塞控制循环。
   # 处理曲线使用 tau_ext_filter 的结果和 DP checkpoint 的接触门控。
-  enabled: true
+  enabled: false
   window_s: 10.0
   update_rate_hz: 20.0
 

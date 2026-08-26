@@ -6,6 +6,7 @@ from inference.core import (
     ActionChunk,
     ActionChunkScheduler,
     InferenceBase,
+    ModularInferenceRunner,
     NeroPipelineRunner,
     Observation,
 )
@@ -142,3 +143,30 @@ def test_legacy_pipeline_runner_keeps_pipeline_and_controller_separate():
     result = runner.step()
     assert result == "pipeline-output"
     assert controller.calls == [(3, "pipeline-output")]
+
+
+def test_modular_inference_runner_uses_zero_argument_step_and_lifecycle():
+    class Modular:
+        def __init__(self):
+            self.calls = []
+
+        def start(self):
+            self.calls.append("start")
+
+        def step(self):
+            self.calls.append("step")
+            return "modular-cycle"
+
+        def reset_episode(self):
+            self.calls.append("reset")
+
+        def close(self):
+            self.calls.append("close")
+
+    modular = Modular()
+    runner = ModularInferenceRunner(modular)
+    runner.start()
+    assert runner.step() == "modular-cycle"
+    runner.reset_episode()
+    runner.close()
+    assert modular.calls == ["start", "step", "reset", "close"]

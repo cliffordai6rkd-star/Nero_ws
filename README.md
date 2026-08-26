@@ -95,24 +95,6 @@ python scripts/replay_h5_hardware.py runs/next_background_dataruns/next_backgrou
 
 ## 推理命令
 
-## LeRobot v3 双相机纯 DP 训练
-
-已提供只使用 `observation.images.wrist`、`observation.images.side` 和
-`action.ee_pose` 的训练配置。训练实现在独立仓库 `/mnt/code/lcx/diffusion_policy`，
-不使用本项目的 `third_party/diffusion_policy`，也不改动 FDP 训练入口：
-
-```bash
-cd /mnt/code/lcx/diffusion_policy
-export PURE_DP_DATASET_PATH=/mnt/code/lcx/PINN/data/train_episode/wipe_board_lbv3
-export DINOV3_MODEL_PATH=/mnt/code/lcx/model/dinov3-vitb16-pretrain-lvd1689m
-
-python train.py --config-dir=diffusion_policy/config \
-  --config-name=train_pure_diffusion_transformer_workspace
-```
-
-数据中的 `action.ee_pose` 是逐帧 `[7]`，DataLoader 将它组装为 `[8,7]` 训练窗口。
-两路相机共享冻结的 DINOv3，Transformer 负责预测 diffusion noise。
-
 ```bash
 python -m inference.cli --config inference/configs/nero_direct_ik.yaml --check
 ```

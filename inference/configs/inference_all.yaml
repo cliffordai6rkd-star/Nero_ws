@@ -1,10 +1,11 @@
-# Push-button pure-visual DP policy.
-# This is the modular policy contract template.  The current legacy
-# NeroInferenceRuntime does not switch policy implementations from this block.
-# The checkpoint embeds the model architecture and normalizer contract.
+# Insert-usb DP + native PINN SWM inference configuration.
+# DP and SWM architectures are restored from their respective checkpoints.
 dp_checkpoint:
-  path: /home/rei/mnt/code/lcx/model/dp/latest.ckpt
-  dino_model_path: /home/rei/mnt/code/lcx/model/dinov3-vitb16-pretrain-lvd1689m
+  # insert_usb
+  # path: ../../../model/dp/insert_usb/200ep/optimizer_step=00095000.ckpt
+  path: ../../../model/dp/insert_usb/100ep15w/checkpoints/latest.ckpt
+  image_encoder: dino
+  dino_model_path: ../../../model/dinov3-vitb16-pretrain-lvd1689m
   device: cuda:0
   use_ema: true
 
@@ -14,17 +15,29 @@ action: joint
 architecture:
   enabled: true
   policy_type: dp
-  world_model_type: none
+  world_model_type: swm
+
+# Native PINN torque state world model (q/dq/delta_q/tau).
+pinn_checkpoint:
+  path: /home/rei/mnt/code/lcx/model/swm/stage_1/epoch_0000250.pt
+  device: cuda:0
+  use_ema: true
 
 predictor:
-  enabled: false
+  enabled: true
+  mode: swm
   inference_mode: open_loop
-  action_chunk_mode: first
+  action_chunk_mode: all
+  action_execution_mode: chunk
   action_step_s: 0.04
+
+execution:
+  # q sends the SWM predicted joint position directly.
+  mode: q
 
 dp_sampling:
   method: ddim
-  num_inference_steps: 8
+  num_inference_steps: 100
   use_tau_ext_observation: false
 
 robot:
@@ -39,7 +52,7 @@ runtime:
   camera: wrist
   maximum_state_age_s: 0.1
   maximum_observation_alignment_gap_s: 0.03
-  maximum_inference_steps: 1000
+  maximum_inference_steps: 5000
   command_kd: [0, 0, 0, 0, 0, 0, 0]
 
 safety:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import operator
+import sys
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -59,6 +60,51 @@ def _register_checkpoint_resolvers(omega_conf: Any) -> None:
     )
 
 
+def _prepare_optional_package_source(target: Any, *, kind: str) -> None:
+    """Make sibling source checkouts visible before Hydra imports a target.
+
+    Some deployments keep only bytecode in ``third_party/diffusion_policy``
+    while the checkpoint embeds a target whose source lives in the sibling
+    checkout ``../diffusion_policy``.  Python caches namespace/package paths,
+    so merely prepending ``sys.path`` is insufficient when an earlier import
+    already loaded the vendored package.  Update the loaded package paths in
+    place and leave the vendored package as the fallback.
+    """
+    if str(kind).upper() != "DP" or not isinstance(target, str):
+        return
+    if not target.startswith("diffusion_policy."):
+        return
+    candidates = (
+        Path(__file__).resolve().parents[2] / "diffusion_policy",
+        Path("/mnt/code/lcx/diffusion_policy"),
+        Path("/home/rei/mnt/code/lcx/diffusion_policy"),
+    )
+    for root in candidates:
+        package_root = root / "diffusion_policy"
+        if not package_root.is_dir():
+            continue
+        root_text = str(root)
+        if root_text not in sys.path:
+            sys.path.insert(0, root_text)
+        # If the package is already imported, prefer the source checkout for
+        # subsequent submodule resolution without deleting live class objects.
+        package = sys.modules.get("diffusion_policy")
+        if package is not None:
+            package_path = getattr(package, "__path__", None)
+            if package_path is not None:
+                source_text = str(package_root)
+                if source_text not in package_path:
+                    try:
+                        package_path.insert(0, source_text)
+                    except (AttributeError, TypeError):
+                        # Namespace packages expose ``_NamespacePath`` rather
+                        # than a mutable list.  Replacing it with an ordered
+                        # list keeps the vendored path as a fallback while
+                        # making the source checkout win resolution.
+                        package.__path__ = [source_text, *list(package_path)]
+        break
+
+
 def restore_checkpoint_model(
     path: str | Path,
     device: str,
@@ -99,6 +145,7 @@ def restore_checkpoint_model(
         model_cfg = cfg.get("model")
     target = model_cfg.get("_target_") if isinstance(model_cfg, Mapping) else None
     if target is not None:
+        _prepare_optional_package_source(target, kind=kind)
         try:
             import hydra
             from omegaconf import OmegaConf, open_dict
@@ -172,11 +219,23 @@ def restore_checkpoint_model(
                 from model.pinn_model.torque_world_model import TorqueWorldModel
 
                 model_type = TorqueWorldModel
+            elif pinn_mode in {
+                "swm",
+                "swm_opd",
+                "torque_world_model",
+                "torque_world_model_opd",
+                "torque_wm",
+                "torque_wm_opd",
+            }:
+                from model.pinn_model.torque_world_model import TorqueWorldModel
+
+                model_type = TorqueWorldModel
             else:
                 raise CheckpointError(
                     "pinn_mode must be 'wrench_gru', 'world_model_v3', "
                     "'world_model_v4', 'world_model_v5', "
-                    "'contact_world_model', or 'contact_world_model_opd', "
+                    "'contact_world_model', 'contact_world_model_opd', "
+                    "'swm', or 'swm_opd', "
                     f"got {pinn_mode!r}"
                 )
         except ImportError as exc:
@@ -206,21 +265,80 @@ def restore_checkpoint_model(
                 "'q_tau_contact'"
             )
 
+    if kind.upper() == "PINN" and pinn_mode in {
+        "swm",
+        "swm_opd",
+        "torque_world_model",
+        "torque_world_model_opd",
+        "torque_wm",
+        "torque_wm_opd",
+    }:
+        state_contract = str(getattr(model, "state_contract", "")).lower()
+        if state_contract != "q_dq_delta_q_tau":
+            raise CheckpointError(
+                "SWM inference requires checkpoint model.state_contract="
+                "'q_dq_delta_q_tau'"
+            )
+        supported = tuple(getattr(model, "SUPPORTED_INPUTS", ()))
+        required = {"q", "dq", "delta_q", "tau"}
+        if supported and not required.issubset(set(supported)):
+            raise CheckpointError(
+                "SWM checkpoint model.SUPPORTED_INPUTS must include q, dq, delta_q, tau"
+            )
+        configured_inputs = tuple(getattr(model, "inputs", ()))
+        if configured_inputs and not required.issubset(
+            {str(value).lower() for value in configured_inputs}
+        ):
+            raise CheckpointError(
+                "SWM checkpoint model.inputs must include q, dq, delta_q, tau"
+            )
+
     state_dicts = payload.get("state_dicts")
     if isinstance(state_dicts, Mapping):
-        candidates = (
-            ("ema_model", "model_ema", "model")
-            if use_ema
-            else ("model", "model_ema", "ema_model")
-        )
-        state = next((state_dicts[key] for key in candidates if key in state_dicts), None)
-    else:
-        state = payload.get(
-            "model_state_dict",
-            payload.get(
-                "state_dict",
-                payload.get("model_ema", payload.get("model")),
+        # The native PINN trainer stores EMA weights under ``model`` and the
+        # non-EMA copy under ``model_raw``.  Other checkpoint families use
+        # explicit ``model_ema``/``ema_model`` names, so keep those aliases as
+        # fallbacks while making ``use_ema=False`` meaningful for PINN files.
+        if kind.upper() == "PINN":
+            candidates = (
+                ("model", "model_ema", "ema_model", "model_raw")
+                if use_ema
+                else ("model_raw", "model", "model_ema", "ema_model")
+            )
+        else:
+            candidates = (
+                ("ema_model", "model_ema", "model")
+                if use_ema
+                else ("model", "model_ema", "ema_model")
+            )
+        state = next(
+            (
+                state_dicts[key]
+                for key in candidates
+                if isinstance(state_dicts.get(key), Mapping)
             ),
+            None,
+        )
+    else:
+        if kind.upper() == "PINN":
+            candidates = (
+                ("model", "model_ema", "ema_model", "model_raw")
+                if use_ema
+                else ("model_raw", "model", "model_ema", "ema_model")
+            )
+        else:
+            candidates = (
+                ("model_ema", "ema_model", "model_state_dict", "state_dict", "model")
+                if use_ema
+                else ("model_state_dict", "state_dict", "model", "model_ema", "ema_model")
+            )
+        state = next(
+            (
+                payload[key]
+                for key in candidates
+                if isinstance(payload.get(key), Mapping)
+            ),
+            None,
         )
     if not isinstance(state, Mapping):
         raise CheckpointError(f"{kind} checkpoint contains no model state dictionary")
