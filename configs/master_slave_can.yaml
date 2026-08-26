@@ -161,6 +161,23 @@ cameras:
     # crop: [0, null, 0, null]
     output_size: [256, 192]
 
+  - name: side_2
+    enabled: true
+    visualize: true
+    backend: v4l2
+    serial_number: CC1N16202KT
+    pixel_format: MJPG
+    buffer_size: 1
+    startup_timeout_s: 2.0
+    frame_timeout_s: 0.5
+    width: 640
+    height: 480
+    fps: 25
+    exposure: 200
+    exposure_dynamic_framerate: false
+    depth: false
+    output_size: [256, 192]
+
 gripper:
   enabled: true
   effector: AGX_GRIPPER
