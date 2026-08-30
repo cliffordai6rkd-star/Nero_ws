@@ -1,2 +1,15 @@
 # Runtime data collected by Nero.
 /runs/
+/configs/runs/
+/calibration/data/
+
+# Local datasets and model artifacts.
+*.h5
+*.hdf5
+*.npz
+*.npy
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.safetensors
