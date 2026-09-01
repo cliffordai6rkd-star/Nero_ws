@@ -104,14 +104,13 @@ def apply_execution_mode_override(
     """Keep the policy contract and MuJoCo routing on the same mode.
 
     The runner can route an output explicitly, but doing the override on the
-    config as well is important for contact WM: ``tau`` must expose the WM
-    feed-forward torque, while ``mit`` must synthesize its q/dq feedback.
+    config as well keeps contact-WM ``q``, ``mtc`` and ``tau`` contracts aligned.
     """
 
     if mode is None:
         return config
     normalized = str(mode).strip().lower().replace("-", "_")
-    if normalized not in {"mit", "osc_qp", "q", "tau"}:
+    if normalized not in {"mtc", "q", "tau"}:
         raise ValueError(f"unsupported execution mode override: {mode!r}")
     return replace(
         config,
@@ -145,7 +144,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Run Nero DP/contact-WM inference on recorded H5 observations and "
-            "execute q, MIT, tau, or OSC-QP commands in MuJoCo."
+            "execute q, MTC, or tau commands in MuJoCo."
         )
     )
     parser.add_argument(

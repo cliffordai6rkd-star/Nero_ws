@@ -21,7 +21,6 @@ CORE_DEPENDENCIES = [
     "PyYAML>=6.0",
     "matplotlib>=3.7",
     "mujoco>=3.3,<4",
-    "osqp>=1,<2",
     "pin>=3,<4; platform_system == 'Linux'",
     "rerun-sdk>=0.26,<0.27",
     "cmeel-tinyxml2>=10,<11; platform_system == 'Linux'",

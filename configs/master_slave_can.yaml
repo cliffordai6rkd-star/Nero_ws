@@ -219,9 +219,6 @@ robot_states:
 
 
 
-
-
-
 # q/dq/ddq/tau 均按对齐后的原始值保存；训练滤波只由 checkpoint 配置定义。
 dynamics_processing:
   enabled: false

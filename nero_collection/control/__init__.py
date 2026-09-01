@@ -1,23 +1,15 @@
-"""Model-based controllers for Nero arms."""
+"""Robot dynamics helpers shared by collection and inference."""
 
-from nero_collection.control.osc_qp import (
+from nero_collection.control.dynamics import (
+    DynamicsError,
     DynamicsSnapshot,
-    OSCQPConfig,
-    OSCQPController,
-    OSCQPError,
-    OSCQPResult,
-    OSCTargetTrajectory,
     PinocchioDynamicsModel,
     RobotDynamicsModel,
 )
 
 __all__ = [
+    "DynamicsError",
     "DynamicsSnapshot",
-    "OSCQPConfig",
-    "OSCQPController",
-    "OSCQPError",
-    "OSCQPResult",
-    "OSCTargetTrajectory",
     "PinocchioDynamicsModel",
     "RobotDynamicsModel",
 ]

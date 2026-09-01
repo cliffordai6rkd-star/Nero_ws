@@ -70,15 +70,15 @@ class ArmRobotController:
                 q=q,
                 v_des=np.zeros(7, dtype=np.float64),
                 kp=np.zeros(7, dtype=np.float64),
-                kd=self.default_kd,
+                kd=np.zeros(7, dtype=np.float64),
                 t_ff=torque,
             )
-        if mode == "mit":
-            if target.q is None or target.dq is None or target.torque is None:
-                raise ValueError("MIT target requires q, dq and torque")
+        if mode == "mtc":
+            if target.q is None or target.torque is None:
+                raise ValueError("MTC target requires q and torque")
             return self.arm.command_joint_impedance(
                 q=target.q,
-                v_des=target.dq,
+                v_des=np.zeros(7, dtype=np.float64),
                 kp=np.asarray(target.metadata.get("kp", np.zeros(7)), dtype=np.float64),
                 kd=np.asarray(target.metadata.get("kd", self.default_kd), dtype=np.float64),
                 t_ff=target.torque,
@@ -87,4 +87,3 @@ class ArmRobotController:
 
 
 __all__ = ["ArmRobotController", "CallableRobotController"]
-

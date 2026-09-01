@@ -44,7 +44,7 @@ nero_collection/arms/kinematics.py
 nero_collection/arms/mock.py
 nero_collection/arms/pyagx.py
 nero_collection/control/__init__.py
-nero_collection/control/osc_qp.py
+nero_collection/control/dynamics.py
 nero_collection/teleop/__init__.py
 nero_collection/teleop/master_slave.py
 tests/test_acceleration_filter.py
@@ -56,7 +56,6 @@ tests/test_h5_dynamics.py
 tests/test_h5_follower_schema.py
 tests/test_keyboard.py
 tests/test_mit_control.py
-tests/test_osc_qp.py
 tests/test_post_save_reset.py
 tests/test_realtime_plot.py
 tests/test_startup_sequence.py

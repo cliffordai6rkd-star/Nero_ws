@@ -91,10 +91,28 @@ class DiffusionPolicy:
         """
 
         checkpoint = Path(checkpoint_path).expanduser().resolve()
-        if not checkpoint.is_file():
-            raise FileNotFoundError(f"DP checkpoint not found: {checkpoint}")
         if int(num_inference_steps) < 1:
             raise ValueError("num_inference_steps must be positive")
+        # LeRobot exports a directory checkpoint with config/processor state
+        # alongside ``model.safetensors``.  Keep this detection in the generic
+        # factory so callers can use the same high-level policy entry point for
+        # both legacy Hydra files and native LeRobot artifacts.
+        from inference.policies.lerobotdp import is_lerobot_checkpoint
+
+        if is_lerobot_checkpoint(checkpoint):
+            from inference.policies.lerobotdp import LeRobotDiffusionPolicy
+
+            return LeRobotDiffusionPolicy.from_pretrained(
+                checkpoint,
+                device=device,
+                num_inference_steps=num_inference_steps,
+                action_steps=action_steps,
+                step_s=step_s,
+                action_semantic=action_semantic,
+                action_frame_name=action_frame_name,
+            )
+        if not checkpoint.is_file():
+            raise FileNotFoundError(f"DP checkpoint not found: {checkpoint}")
         sampling_method = str(sampling_method).strip().lower()
         scheduler_targets = {
             "ddim": "diffusers.schedulers.scheduling_ddim.DDIMScheduler",

@@ -54,8 +54,7 @@ cameras:
 
 `predictor.enabled` 是执行链路开关：
 
-- `true`：加载 predictor；旧模型走 OSC-QP，contact WM 按 `execution.mode` 选择 MIT、
-  OSC-QP、q 或 tau；
+- `true`：加载 contact/SWM predictor，并按 `execution.mode` 选择 MTC、q 或 tau；
 - `false`：不加载 `pinn_checkpoint`，DP action -> IK -> `q`，runtime 通过
   `command_joint_positions()` 下发关节位置。
 
@@ -76,10 +75,9 @@ future action chunk -> first/mean/all or linear-target pose plan -> frame transf
 IK q -> joint-limit + per-cycle joint-step safety -> follower arm
 ```
 
-`predictor.action_chunk_mode` 同时作用于纯 IK 与 predictor/OSC-QP 链路：`first` 使用
+`predictor.action_chunk_mode` 同时作用于纯 IK 与 predictor 链路：`first` 使用
 chunk 第一帧；`mean` 对位置求均值，并在统一四元数半球后对姿态求均值；`all` 按时间
-顺序执行完整 chunk。`all` 推进时，QP pose horizon 会同步裁成当前尚未执行的剩余
-chunk；PINN condition 是否同步裁剪由 `action_condition_fill` 决定。
+顺序执行完整 chunk。PINN condition 是否同步裁剪由 `action_condition_fill` 决定。
 
 `predictor.inference_mode: open_loop` 使用严格的“采样 -> 同步推理 -> 执行”状态机：先采满
 checkpoint 声明的 `n_obs_steps` 个 image/wrench 观测，冻结该窗口并同步执行一次 DP，然后
@@ -95,7 +93,7 @@ CAN 派生样本；例如 checkpoint 声明为 8 时，模型输入严格为每�
 重复最近邻样本补成 8 帧。完整批次的 CAN 数量为 `n_obs_steps * wrench_history_steps`。
 `predictor.action_step_s: null` 默认读取 checkpoint 的 `task.dataset.timestamp_step_sec`
 （当前 checkpoint 为 0.1 秒）；显式正数可以覆盖它。该间隔只控制高层 action waypoint
-推进，低层 IK 或 PINN/OSC-QP 仍在每个有效机械臂状态周期运行。
+推进，低层 IK 或 PINN/control transport 仍在每个有效机械臂状态周期运行。
 
 `predictor.action_execution_mode: minimum_jerk_target` 提供单目标平滑轨迹接口。目标仍由
 `action_chunk_mode` 决定：`first` 取 chunk 第一帧，`mean` 取聚合位姿，`last` 取最后一帧；
@@ -204,28 +202,26 @@ python scripts/infer_h5_direct_ik.py \
 - `world_model_v5`：V5 从历史末段 `[q,tau,0]` 出发，用条件 Flow ODE 联合生成
   future `q/tau/contact logit`，再因果重建 `v/a` 并经过同一 Nero 接触力链。
 
-contact WM 使用独立的 `ContactWMInferencePipeline`，不会进入上面的 wrench 适配链。它
-严格按 `contact_world_model.yaml`/`contact_world_model_opd.yaml` 的契约输入 50 个 100 Hz
-的 `q/tau` 历史和 8 个 25 Hz、每个 21 维的 composite action token（absolute/current/relative
-pose）；WM 不读取 `dq` 或 wrench。模型输出 future `q/tau/contact_state`，MIT 需要的
-`dq_target` 由同一 checkpoint 的因果 q 状态估计器在输出侧重建。使用
-`inference/configs/nero_contact_wm.yaml`，并通过 `execution.mode` 选择四种执行方式：
+当前 `inference/configs/nero_contact_wm.yaml` 和 `nero_swm.yaml` 均收束到
+`model/carswm/epoch_0001200.pt`，统一使用原生 `SWMInferencePipeline`。该 checkpoint
+的输入是 50 个 100 Hz 的 `q/dq/delta_q/tau` 历史和 8 个 25 Hz、7 维绝对关节 action
+token；输出 future `q/dq/delta_q/tau` 及三阶段 contact state。`delta_q` 始终按实际下发的
+`q_cmd - q` 构造，输入归一化和 flow 推理步数直接读取 checkpoint 元数据。
 
-- `mit`：输出 q/dq 参考和 WM tau feedforward；固件按 `mit_kp/mit_kd` 加位置/速度反馈。
-  `mit_velocity_limit` 限制重建速度；`mit_feedback_torque_limit` 和
-  `safety.maximum_command_torque_nm` 超限时按比例缩小本周期实际下发的 `kp/kd`，
-  因而限幅作用于真实 `move_mit` 命令而不改变 WM 的 q/dq 参考。该限制按主机采样时
-  的 q/dq 计算；CAN 延迟和采样间状态变化意味着它不是替代固件/驱动器总力矩保护的
-  硬件安全保证。
-- `osc_qp`：把重建的 `ddq_target` 和 `tau_target` 作为 QP 的软目标，动力学、关节、速度、
-  力矩和接触约束保持硬约束；权重由 `osc_qp.joint_acceleration_tracking_weight` 与
-  `osc_qp.torque_tracking_weight` 设置。
+旧 `ContactWMInferencePipeline` 仍保留用于历史 `q_tau_contact` checkpoint，但不再用于
+上述 `carswm` 文件。使用这两个配置时，通过 `execution.mode` 选择三种执行方式：
+
+- `mtc`：计算 `tau_qv = Kp(q_cmd-q)-Kd*dq+g(q)`，再与 WM 第一帧
+  `tau_pred` 按 `mtc_alpha` 融合。`mtc_q_cmd_source: wm_state` 使用 `q_hat`；
+  `wm_delta` 使用 `q_hat + delta_q_hat`。固件继续使用配置的 `mit_kp/mit_kd`、
+  零速度目标，`torque_target` 只发送 `tau_cmd - tau_pd` 的残差，避免重复叠加
+  固件已经计算的位置/速度反馈。
 - `q`：对预测 q 做关节限位/单周期步长保护后调用 `command_joint_positions()`。
-- `tau`：仅下发限幅/滤波后的 WM tau feedforward，通过纯力矩 MIT 传输。
+- `tau`：仅下发限幅/滤波后的 WM `tau_pred`。硬件使用 MIT 报文作为传输
+  envelope，但 `q/dq` 反馈增益固定为零，因此不会叠加 `kp/kd`、重力或其它控制项。
 
-`execution.mode: mit` 不会把已经由固件应用的 PD 项再次加入 `t_ff`；
-`InferenceOutput.tau_command` 用于诊断完整 MIT 合成力矩，`torque_target` 才是发送给
-固件的 WM feedforward。
+`execution.mode: mtc` 只发送残差 `torque_target`；
+`tau_command` 是按当前采样的 q/dq 计算出的融合总力矩（触发发送限幅时记录限幅后的值）。
 
 原生 SWM（`predictor.mode: swm` 或 `swm_opd`）使用 PINN checkpoint 中声明的
 `q/dq/delta_q/tau` 四路 100 Hz 状态历史，以及 25 Hz 的 7 维绝对关节 action chunk。
@@ -236,11 +232,10 @@ SWM 的 `dataloader.expert_fps` 是动作推进时钟，必须与 DP checkpoint 
 `execution.mode` 选择：
 
 - `q`：下发限幅后的预测 q；
-- `mit`：下发预测 q/dq 和 WM tau feedforward，固件应用配置的 MIT 增益；
-- `tau`：仅下发预测 tau；
-- `osc_qp`：把预测 q/dq/ddq/tau 作为 OSC-QP 的关节软目标。
+- `mtc`：按 `mtc_alpha` 融合 q/v/gravity 候选与预测 tau，并通过固定 MIT 增益发送残差 feedforward；
+- `tau`：仅下发经过限幅/滤波的预测 `tau_pred`，硬件传输时 `kp=kd=0`；
 
-最小配置形态如下（`pinn_checkpoint.path` 必须替换成真实 SWM checkpoint）：
+最小配置形态如下：
 
 ```yaml
 dp_checkpoint:
@@ -250,21 +245,21 @@ dp_checkpoint:
   use_ema: true
 
 pinn_checkpoint:
-  path: ../../../PINN/outputs/torque_world_model_v4/checkpoints/epoch_XXXXX.pt
+  path: ../../model/carswm/epoch_0001200.pt
   device: cuda:0
   use_ema: true
 
 action: joint
 predictor:
   enabled: true
-  mode: swm
+  mode: swm_opd
   inference_mode: asynchronous
   action_chunk_mode: all
   action_execution_mode: chunk
   action_step_s: null
 
 execution:
-  mode: q  # mit / tau / osc_qp
+  mode: q  # mtc / tau
 ```
 
 在线启动时需让当前工作区和 PINN 源码都可导入：
@@ -287,11 +282,11 @@ python -m inference.cli --config inference/configs/nero_contact_wm.yaml --check
 
 仿真分支不会初始化 CAN、相机或真机 runtime。它读取一条 H5 episode，在状态时钟上运行
 同一个 DP/contact-WM pipeline，并把输出交给带七个 torque motor 的 MuJoCo 模型动态积分。
-`q` 是软件 PD 位置伺服，`mit` 是 `tau_WM + Kp(q_ref-q)+Kd(dq_ref-dq)`，`tau` 和
-`osc_qp` 直接使用 `tau_command`；四种模式都不会直接写 `data.qpos`。
+`q` 是软件 PD 位置伺服，`mtc` 是固定固件增益下的融合总力矩，`tau` 直接使用
+`tau_command`；三种模式都不会直接写 `data.qpos`。
 
-默认每 10 ms 调一次策略、每 1 ms 做 MuJoCo 子步。contact WM 仍接收 50 个 100 Hz 的
-q/tau 历史和 DP 的 8 个 action token。默认 `recorded` 观测模式用 H5 的 q/dq/ddq/tau
+默认每 10 ms 调一次策略、每 1 ms 做 MuJoCo 子步。SWM 接收 50 个 100 Hz 的
+q/dq/delta_q/tau 历史和 DP 的 8 个 7 维绝对关节 action token。默认 `recorded` 观测模式用 H5 的 q/dq/ddq/tau
 作为策略输入，同时记录仿真状态；要检查闭环漂移可使用 `hybrid_closed_loop`，此时图像和
 wrench 仍来自 H5，而 q/dq/tau 改用仿真上一周期状态。
 
@@ -304,18 +299,19 @@ python scripts/infer_h5_mujoco.py \
   --simulation-config calibration/config.yaml \
   --dp-checkpoint /path/to/dp.ckpt \
   --pinn-checkpoint /path/to/contact_wm_student.pt \
-  --mode mit --max-steps 200 --output /tmp/nero_mujoco_mit.npz
+  --mode mtc --max-steps 200 --output /tmp/nero_mujoco_mtc.npz
 ```
 
 `--dp-checkpoint` and `--pinn-checkpoint` are optional overrides.  The checked-in
-contact-WM YAML keeps portable relative placeholders; pass the actual OPD
-student (or edit those two YAML paths) before running.  The CLI validates both
-checkpoint files and the local DINO directory before allocating the models, so
-a stale path fails with a short actionable message.  For a pure DP -> IK replay,
+contact/SWM YAML uses paths relative to the repository config directory (for
+example `../../model/carswm/epoch_0001200.pt`); replace only the DP path when
+using a different policy checkpoint.  The CLI validates both checkpoint files
+and the local DINO directory before allocating the models, so a stale path fails
+with a short actionable message.  For a pure DP -> IK replay,
 use `inference/configs/nero_direct_ik.yaml`; the runner automatically selects
 the `q` MuJoCo servo when `predictor.enabled: false`.
 
-其余模式只需替换 `--mode` 为 `q`、`tau` 或 `osc_qp`。需要图形窗口时加 `--viewer`；在
+其余模式只需替换 `--mode` 为 `q` 或 `tau`。需要图形窗口时加 `--viewer`；在
 无显示服务器的机器上保持默认的 headless 模式。输出 NPZ 包含 recorded/simulated q、dq、
 ddq、command/applied torque、q/dq/tau target、DP/PINN 更新标记和 MuJoCo 接触计数，生成的
 执行器 MJCF 可用 `--scene-output` 保存。
@@ -339,7 +335,7 @@ image + wrench history -> DP checkpoint -> action_target (xyz + xyzw)
 q/v/a/tau/wrench history + future action -> world_model_v3 -> future q/v/a/tau
 future q/v/a/tau -> RNEA tau_g + frozen tau_other - tau -> tau_ext_cal
 tau_ext -> damped J(q)^T inverse -> future target wrench_ext
-latest action pose + target f_ext + measured f_ext -> OSC-QP -> tau_command
+legacy wrench reference (no longer executable; migrate to contact/SWM q, mtc or tau)
 ```
 
 V4 运行时数据流为：
@@ -352,7 +348,7 @@ q/tau history + normalized future action -> world_model_v4 -> future q/tau
   -> causal q mean/LPF -> difference -> dq LPF -> difference -> ddq LPF
 future q/dq/ddq/tau -> RNEA tau_g + frozen tau_other - tau -> tau_ext_cal
 tau_ext -> damped J(q)^T inverse -> future target wrench_ext
-latest action pose + target f_ext + measured f_ext -> OSC-QP -> tau_command
+legacy wrench reference (no longer executable; migrate to contact/SWM q, mtc or tau)
 ```
 
 V5 运行时数据流为：
@@ -365,7 +361,7 @@ Flow -> future q/tau/contact logit
 future q -> checkpoint causal estimator -> future v/a
 future q/v/a/tau -> Nero physical chain -> raw future wrench_ext
 sigmoid(contact logit) >= probability_threshold -> hard-gated target wrench_ext
-latest action pose + target f_ext + measured f_ext -> OSC-QP -> tau_command
+legacy wrench reference (no longer executable; migrate to contact/SWM q, mtc or tau)
 ```
 
 V1 运行时仍为：
@@ -374,8 +370,8 @@ V1 运行时仍为：
 current q/v/a/tau + future action -> wrench_gru -> future target wrench_ext
 ```
 
-`configs/nero_pipeline.yaml` 包含执行开关、DP/PINN checkpoint 路径、安全限制、IK、OSC-QP 参数，
-以及 `runtime.collection_config`。后者指向 `configs/master_slave_can.yaml`，复用其中的：
+历史 `configs/nero_pipeline.yaml` 已随旧控制链删除。当前配置仍通过
+`runtime.collection_config` 指向 `configs/master_slave_can.yaml`，复用其中的：
 
 - 从臂 CAN、固件和 rest pose；
 - 腕部相机；
@@ -482,21 +478,20 @@ normalizer 之前。
   状态估计配置中的 `sampling_dt`（旧 V3 回退到 `loss.sampling_dt`）对低维状态做固定
   时间网格插值。归一化输出先恢复为物理量；V3 直接送入接触力链，V4 先从物理 q
   因果重建 v/a。
-- 每次 PINN 完成后立即更新完整的 future wrench 目标，随后 OSC-QP 求解一次。
-- DP 尚未完成新推理时，OSC-QP 持续跟踪上一次 action；不会等待 DP。
+- 每次 PINN 完成后立即更新 world-model 参考；q、MTC 或 tau 控制链直接消费最新参考。
+- DP 尚未完成新推理时，控制链持续执行上一次 action；不会等待 DP。
 
-因此实际控制更新速度由 PINN 推理与 OSC-QP 求解的真实耗时自然决定，不由 YAML 中的
-名义 100 Hz 决定。第一周期使用 `osc_qp.dt_s` 作为启动值；之后 QP 的预测离散步长会用
-相邻 `InferenceInput.timestamp_s` 的实测周期更新。
+因此实际控制更新速度由 PINN 推理与传输耗时自然决定，不由额外的 QP 离散步长决定。
+力矩滤波器使用相邻 `InferenceInput.timestamp_s` 的实测周期更新。
 
 `timing.enabled: true` 时使用 `time.perf_counter()` 统计并按
-`timing.report_interval_s` 汇总打印实际控制频率、完整周期最新耗时、PINN/OSC-QP/DP
+`timing.report_interval_s` 汇总打印实际控制频率、完整周期最新耗时、PINN/DP
 平均推理耗时。汇总打印不会在每个控制周期执行，减少终端 I/O 对实时性的影响。
 
-OSC-QP 的第一步输出不会直接下发。`torque_filter` 在最终力矩限幅内执行：
+`tau` 链的第一帧预测不会绕过滤波直接下发。`torque_filter` 在最终力矩限幅内执行：
 
 ```text
-QP first_tau
+WM tau_pred
   -> torque clip
   -> causal median spike rejection
   -> first-order low-pass
@@ -508,13 +503,13 @@ QP first_tau
 `median_window` 必须为正奇数；窗口越大会抑制更长尖峰，但也增加相位延迟。
 `lowpass_cutoff_hz: null` 可关闭低通，`rate_limit_nm_s: null` 可关闭硬变化率限制。
 滤波器以当前实测关节力矩作为首周期状态，并在每次 `reset()` 时清空历史。
-`InferenceOutput.tau_unfiltered` 保留限幅后的 QP 原始输出，
+`InferenceOutput.tau_unfiltered` 保留限幅后的 WM 原始输出，
 `InferenceOutput.tau_command` 是实际准备下发的滤波后输出。
 
 DP checkpoint 需遵循 diffusion-policy workspace 格式，并提供
 `policy.predict_action(obs)["action"]` future chunk 和 `action_target`。
-每个 action 固定为 `[x,y,z,qx,qy,qz,qw]`。OSC-QP 跟踪 future chunk；
-若 chunk 短于 PINN/QP horizon，尾部用最后一个目标保持，长于 horizon 则截断。
+每个 action 固定为 `[x,y,z,qx,qy,qz,qw]`。若 chunk 短于 PINN horizon，尾部用最后一个
+目标保持，长于 horizon 则截断。
 
 PINN 的 action condition 完全由 checkpoint 内的 `model` 配置恢复：
 
@@ -524,8 +519,8 @@ PINN 的 action condition 完全由 checkpoint 内的 `model` 配置恢复：
   并在 PINN 所在 GPU 上批量计算
   `[p_future-p_current, q_current⁻¹⊗q_future]`；相对四元数统一为 `qw >= 0`。
 - `action_current_frame_name` 指定 DP/PINN action 所属 frame。当前数据对应 `link7`；
-  OSC-QP 仍控制 `robot.frame_name: gripper_base`。推理启动时缓存固定的
-  `T_link7_gripper_base`，将每个 action pose 转成 OSC 控制 frame 后再优化。
+  控制链使用 `robot.frame_name: gripper_base`。推理启动时缓存固定的
+  `T_link7_gripper_base`，将每个 action pose 转成控制 frame。
 
 这些选项不会出现在 `inference/configs/nero_pipeline.yaml`；修改 PINN 训练逻辑后必须
 使用包含相应配置和权重的新 checkpoint。旧 checkpoint 未声明
@@ -542,7 +537,7 @@ PINN checkpoint 支持 `/mnt/code/lcx/PINN` 的原生格式：
 输出为 6D wrench，或包含 `f_ext/wrench/force/force_target/target_wrench` 之一的字典。
 wrench 统一采用“环境作用于工具”的 `[Fx,Fy,Fz,Mx,My,Mz]`。DP/PINN 使用
 collection checkpoint 训练时的 wrench 坐标系；如果 collection 配置为 `local`，
-runtime 会在送入 OSC-QP 前将 measured/target wrench 旋转至
+runtime 会在进入控制链前将 measured/target wrench 旋转至
 `LOCAL_WORLD_ALIGNED`。
 
 `predictor.mode: world_model_v3` 对应原生 `DeterministicWorldModelV3.predict()`。
@@ -597,7 +592,7 @@ python scripts/nero_inference.py \
   --run --backend mock --duration 10
 ```
 
-真机只读运行会连接并使能从臂、启动相机和执行完整推理，但不发送 OSC-QP 命令：
+真机只读运行会连接并使能从臂、启动相机和执行完整推理，但不发送控制命令：
 
 ```bash
 python scripts/nero_inference.py \
@@ -606,7 +601,7 @@ python scripts/nero_inference.py \
 ```
 
 确认急停、关节范围、wrench 符号和控制限制后，必须显式添加下列参数才会下发命令。
-predictor 开启时通过 MIT 下发 `tau_command`，关闭时通过位置接口下发 IK `q`：
+predictor 开启时按 `execution.mode` 下发（`tau` 模式使用零增益 MIT 传输），关闭时通过位置接口下发 IK `q`：
 
 ```bash
 python scripts/nero_inference.py \
@@ -628,7 +623,7 @@ python scripts/nero_inference.py \
   然后断开进程并退出；
 - `--duration` 到期执行与退出相同的最终复位流程。
 
-推理、PINN 或 OSC-QP 抛出 exception 时，runtime 会优先停止控制循环并立即执行同一套
+推理、PINN 或控制传输抛出 exception 时，runtime 会优先停止控制循环并立即执行同一套
 `follower.rest_q` 复位和使能确认，再清理模型 worker 并退出。只有硬件复位本身失败时，
 会尽最大努力切回 follower、读取当前关节位置并发送当前位置保持、再次确认 enable；
 异常路径不会主动调用 `disable()`，原始 exception 仍会继续抛出以保留报错堆栈。

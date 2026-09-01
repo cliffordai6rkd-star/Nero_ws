@@ -19,6 +19,7 @@ from inference.config import (
     load_inference_config,
 )
 from inference.runtime import NeroInferenceRuntime
+from inference.control.nero import NeroPipelineOutputController
 from nero_collection.arms.base import ArmState
 from nero_collection.cameras import CameraFrame
 from nero_collection.tau_ext_inference import OnlineTauExtResult
@@ -200,6 +201,36 @@ class _Pipeline:
 
     def close(self):
         self.closed = True
+
+
+def test_wm_tau_output_uses_zero_firmware_gains() -> None:
+    """Direct WM torque mode must not add runtime damping or PD feedback."""
+
+    arm = _Arm()
+    config = SimpleNamespace(
+        predictor=SimpleNamespace(enabled=True),
+        execution=SimpleNamespace(mit_kp=np.full(7, 3.0), mit_kd=np.full(7, 0.5)),
+        runtime=SimpleNamespace(command_kd=np.full(7, 9.0)),
+    )
+    controller = NeroPipelineOutputController(
+        arm=arm,
+        config=config,
+        command_enabled=True,
+    )
+    observation = SimpleNamespace(q=np.full(7, 0.2))
+    output = SimpleNamespace(
+        control_mode="tau",
+        tau_command=np.linspace(-0.3, 0.3, 7),
+    )
+
+    controller.send(observation, output)
+
+    command = arm.commands[-1]
+    np.testing.assert_allclose(command["q"], observation.q)
+    np.testing.assert_allclose(command["v_des"], np.zeros(7))
+    np.testing.assert_allclose(command["kp"], np.zeros(7))
+    np.testing.assert_allclose(command["kd"], np.zeros(7))
+    np.testing.assert_allclose(command["t_ff"], output.tau_command)
 
 
 def _config() -> InferenceConfig:

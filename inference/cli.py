@@ -13,7 +13,7 @@ from nero_collection.keyboard import TerminalKeys
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Nero DP inference with optional predictor/OSC-QP control"
+        description="Nero DP inference with direct-q/tau and MTC control"
     )
     parser.add_argument("--config", required=True)
     mode = parser.add_mutually_exclusive_group(required=True)

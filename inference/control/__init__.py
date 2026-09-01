@@ -1,6 +1,7 @@
 """Robot control adapters."""
 
 from inference.control.base import ArmRobotController, CallableRobotController
+from inference.control.mtc import MTCController, MTCResult
 from inference.control.nero import NeroPipelineOutputController
 from inference.control.resolver import CallableActionResolver, DirectActionResolver
 from inference.control.safety import BasicSafetyGuard
@@ -13,6 +14,8 @@ CONTROLLER_REGISTRY.register("legacy_pipeline", NeroPipelineOutputController)
 __all__ = [
     "ArmRobotController",
     "CallableRobotController",
+    "MTCController",
+    "MTCResult",
     "NeroPipelineOutputController",
     "CallableActionResolver",
     "DirectActionResolver",

@@ -7,12 +7,12 @@ model using commands produced by either the legacy or contact-WM inference
 pipeline.
 
 The backend never writes ``data.qpos`` during a control step.  Position targets
-are converted to torque (software PD), so all four supported execution modes
+are converted to torque (software PD), so all three supported execution modes
 are exercised through the same MuJoCo dynamics path:
 
 ``q`` -> position servo -> torque motor
-``mit`` -> feed-forward torque + q/dq feedback -> torque motor
-``tau``/``osc_qp`` -> direct torque motor command
+``mtc`` -> blended MTC residual + q/dq feedback -> torque motor
+``tau`` -> direct torque motor command
 
 MuJoCo is imported lazily.  Importing this module therefore remains possible in
 environments that only run data processing or unit tests without MuJoCo.
@@ -138,18 +138,18 @@ class MujocoState:
 
 def _normalize_mode(mode: str) -> str:
     value = str(mode).strip().lower().replace("-", "_")
-    if value not in {"q", "mit", "tau", "osc_qp"}:
-        raise ValueError("MuJoCo execution mode must be q, mit, tau, or osc_qp")
+    if value not in {"q", "mtc", "tau"}:
+        raise ValueError("MuJoCo execution mode must be q, mtc, or tau")
     return value
 
 
 def _extract_output_command(output: Any, mode: str | None = None) -> MujocoCommand:
     """Map an ``InferenceOutput``-like object to a simulation command.
 
-    The contact pipeline's MIT ``tau_command`` already includes feedback
+    The contact/SWM pipeline's MTC ``tau_command`` already includes feedback
     evaluated at the recorded hardware state.  For a closed-loop simulation we
-    intentionally use its ``torque_target`` feed-forward component and
-    recompute feedback from MuJoCo's current q/dq.
+    intentionally use its ``torque_target`` feed-forward/residual component
+    and recompute feedback from MuJoCo's current q/dq.
     """
 
     selected = mode
@@ -173,16 +173,18 @@ def _extract_output_command(output: Any, mode: str | None = None) -> MujocoComma
         if target is None:
             target = getattr(output, "joint_position_command", None)
         return MujocoCommand(mode=selected, q_target=target)
-    if selected == "mit":
+    if selected == "mtc":
         return MujocoCommand(
-            mode=selected,
+            # MTC uses the MIT transport with its effective q/v gains and the
+            # residual feed-forward produced by the inference pipeline.
+            mode="mtc",
             q_target=getattr(output, "joint_position_target", None),
             dq_target=getattr(output, "joint_velocity_target", None),
             tau_target=getattr(output, "torque_target", None),
             kp=getattr(output, "mit_kp", None),
             kd=getattr(output, "mit_kd", None),
         )
-    # QP and direct-torque modes expose the actual command under tau_command.
+    # Direct-torque mode exposes the actual command under tau_command.
     return MujocoCommand(
         mode=selected,
         tau_command=getattr(output, "tau_command", None),
@@ -489,7 +491,7 @@ class MujocoDynamicsBackend:
                 else _first_joint_vector(command.dq_target, name="dq_target")
             )
             return self._clip_torque(self.q_kp * (q_target - q) + self.q_kd * (dq_target - dq))
-        if mode == "mit":
+        if mode == "mtc":
             q_target = _first_joint_vector(command.q_target, name="q_target")
             dq_target = (
                 np.zeros(DOF, dtype=np.float64)

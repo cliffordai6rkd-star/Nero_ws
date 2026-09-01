@@ -16,7 +16,6 @@ dependencies = [
     "mujoco>=3.3,<4",
     "numpy>=2.2,<2.3",
     "opencv-python>=4.9,<4.13",
-    "osqp>=1,<2",
     "pin>=3,<4",
     "PyYAML>=6.0",
     "rerun-sdk>=0.26,<0.27",
@@ -31,6 +30,9 @@ nero-inference = "inference.cli:main"
 [project.optional-dependencies]
 tau-ext-inference = [
     "torch>=2.3,<3",
+]
+lerobot-dp = [
+    "lerobot==0.4.0",
 ]
 gpu-identification = [
     "jax[cuda12]==0.6.2; platform_system == 'Linux' and python_version < '3.11'",

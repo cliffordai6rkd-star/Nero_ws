@@ -1,32 +1,33 @@
-# Dedicated q/tau contact world-model inference configuration.
-# Change execution.mode to mit, osc_qp, q, or tau.
+# Contact-aware state world-model inference configuration.
+# The checkpoint below uses the canonical q/dq/delta_q/tau + direct-joint-action
+# contract implemented by SWMInferencePipeline. Change execution.mode to mtc,
+# q, or tau as needed.
 dp_checkpoint:
-  # Shared wrist+wrench DP checkpoint for offline and deployed inference.
-  path: ../../../model/dp_baseline/wipeborad/checkpoints/latest.ckpt
+  # Shared joint-action DP checkpoint for offline and deployed inference.
+  path: ../../../model/dp/insert_usb/100ep15w/checkpoints/latest.ckpt
   dino_model_path: ../../../model/dinov3-vitb16-pretrain-lvd1689m
   device: cuda:0
   use_ema: true
 
-# DP outputs absolute joint q. Before entering the WM, each action is converted
-# by URDF FK to [x,y,z,qx,qy,qz,qw] in robot.action_frame_name.
+# DP outputs absolute seven-joint q, matching the WM action condition directly.
 action: joint
 
 architecture:
   enabled: false
   policy_type: legacy_pipeline
-  world_model_type: contact_world_model
+  world_model_type: swm
 
 pinn_checkpoint:
-  # Use a checkpoint trained from contact_world_model.yaml or its OPD student.
-  path: ../../../PINN/outputs/contact_world_model_opd_sweep/20260819_113728/teacher/checkpoints/step_00100000.pt
+  # Checkpoint contract: q/dq/delta_q/tau history + direct 7-joint action.
+  path: ../../model/carswm/epoch_0001200.pt
   device: cuda:0
   use_ema: true
 
 predictor:
   enabled: true
-  mode: contact_world_model_opd
-  # DP samples a fresh image window, then holds its 8-token plan while the
-  # contact WM continues to run at the CAN/state rate.
+  mode: swm_opd
+  # DP samples a fresh image window, then holds its 8-token direct-joint plan
+  # while the WM continues to run at the 100 Hz CAN/state rate.
   inference_mode: open_loop
   action_chunk_mode: all
   action_condition_fill: chunk
@@ -34,27 +35,28 @@ predictor:
   action_step_s: null
 
 execution:
-  # mit | osc_qp | q | tau
-  mode: q
-  # Used only by mit. The WM torque is sent as feedforward; firmware applies
-  # these gains to q_target/dq_target.
+  # mtc | q | tau
+  mode: mtc
+  # MTC blends the data-style q/v/gravity torque with the SWM torque output.
+  mtc_alpha: 0.5
+  # wm_state=q_hat; wm_delta=q_hat+delta_q_hat.
+  mtc_q_cmd_source: wm_delta
+  # MTC keeps these data-side gains in the firmware MIT
+  # command and sends a residual feed-forward completing the blended torque.
   mit_kp: [3.0, 3.0, 2.0, 3.5, 2.0, 2.0, 3.0]
   mit_kd:  [0.1, 0.1, 0.25, 0.25, 0.1, 0.1, 0.1]
   mit_velocity_limit: [1, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
   mit_feedback_torque_limit: [10, 10, 10, 8, 6, 5, 5]
 
 dp_sampling:
-  method: ddpm
-  num_inference_steps: 100
+  method: ddim
+  num_inference_steps: 10
   # false makes DP camera-only; force-aware checkpoints require true.
   use_tau_ext_observation: false
 
 robot:
   urdf_path: ../../urdf/nero/nero_with_gripper.urdf
   frame_name: gripper_tcp
-  # The selected teacher checkpoint has a temporary compatibility override:
-  # target action uses link7 while current_ee_pose uses gripper_tcp.
-  action_frame_name: link7
   locked_joint_names: [gripper, gripper_joint1, gripper_joint2]
 
 runtime:
@@ -63,9 +65,9 @@ runtime:
   camera: wrist
   maximum_state_age_s: 0.1
   maximum_observation_alignment_gap_s: 0.03
-  maximum_inference_steps: 2000
-  # Additional damping for pure-torque tau/OSC-QP modes.
+  maximum_inference_steps: 3000
   command_kd: [0, 0, 0, 0, 0, 0, 0]
+
 
 observation_protection:
   enabled: true
@@ -105,32 +107,3 @@ wrench_visualization:
 timing:
   enabled: true
   report_interval_s: 1.0
-
-osc_qp:
-  horizon_steps: 10
-  dt_s: 0.01
-  # Contact WM mode tracks joint acceleration and torque references. Pose and
-  # wrench costs are retained at zero so this config is a pure joint-space QP.
-  pose_kp: [0, 0, 0, 0, 0, 0]
-  pose_kd: [0, 0, 0, 0, 0, 0]
-  pose_weight: [0, 0, 0, 0, 0, 0]
-  wrench_weight: [0, 0, 0, 0, 0, 0]
-  acceleration_weight: 0.0001
-  torque_weight: 0.0001
-  joint_acceleration_tracking_weight: 1.0
-  torque_tracking_weight: 1.0
-  torque_rate_weight: 0.002
-  wrench_rate_weight: 0.001
-  force_feedback_gain: [0, 0, 0, 0, 0, 0]
-  acceleration_limit: 20.0
-  torque_limit: [16, 16, 16, 16, 15, 10, 10]
-  wrench_lower: [-10, -10, -10, -10, -10, -10]
-  wrench_upper: [10, 10, 10, 10, 10, 10]
-  joint_position_margin_rad: 0.02
-  friction_coefficient: null
-  contact_normal_axis: 2
-  osqp_max_iter: 4000
-  osqp_eps_abs: 0.00001
-  osqp_eps_rel: 0.00001
-  osqp_polish: false
-  maximum_constraint_violation: 0.005

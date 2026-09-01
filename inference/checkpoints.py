@@ -121,6 +121,27 @@ def restore_checkpoint_model(
         raise CheckpointError("checkpoint inference requires torch") from exc
 
     checkpoint_path = Path(path).expanduser().resolve()
+    # Native LeRobot policies are exported as a directory rather than a
+    # torch-pickled file.  Keep the optional dependency isolated in the
+    # high-level adapter and return that adapter as the self-describing model
+    # object expected by the existing pipeline/check command.
+    if str(kind).upper() == "DP":
+        from inference.policies.lerobotdp import (
+            LeRobotDiffusionPolicy,
+            is_lerobot_checkpoint,
+        )
+
+        if is_lerobot_checkpoint(checkpoint_path):
+            inference_steps = None
+            if model_overrides is not None:
+                raw_steps = model_overrides.get("num_inference_steps")
+                if raw_steps is not None:
+                    inference_steps = int(raw_steps)
+            return LeRobotDiffusionPolicy.from_pretrained(
+                checkpoint_path,
+                device=device,
+                num_inference_steps=inference_steps,
+            )
     if not checkpoint_path.is_file():
         raise CheckpointError(f"{kind} checkpoint does not exist: {checkpoint_path}")
     with checkpoint_path.open("rb") as stream:

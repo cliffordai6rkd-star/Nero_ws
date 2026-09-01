@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +13,8 @@ from inference.config import (
     PredictorConfig,
     RobotConfig,
     RuntimeConfig,
+    SafetyConfig,
+    TorqueFilterConfig,
     load_inference_config,
 )
 from inference.pipeline import InferenceInput
@@ -87,6 +90,10 @@ class _Model:
             np.eye(7), np.zeros(7), np.zeros((6, 7)), np.zeros(6), np.eye(4)
         )
 
+    def gravity_torque(self, q):
+        del q
+        return np.full(7, 0.3)
+
 
 class _Controller:
     def __init__(self):
@@ -139,10 +146,98 @@ def test_swm_config_aliases_are_canonicalized(tmp_path: Path):
 dp_checkpoint: {path: dp.ckpt, device: cpu}
 pinn_checkpoint: {path: swm.ckpt, device: cpu}
 predictor: {mode: torque_world_model_opd}
+execution: {mode: mtc, mtc_alpha: 0.25, mtc_q_cmd_source: q_hat}
 action: joint
 robot: {urdf_path: robot.urdf}
 runtime: {collection_config: collection.yaml}
 """,
         encoding="utf-8",
     )
-    assert load_inference_config(path).predictor.mode == "swm_opd"
+    config = load_inference_config(path)
+    assert config.predictor.mode == "swm_opd"
+    assert config.execution.mode == "mtc"
+    assert config.execution.mtc_alpha == 0.25
+    assert config.execution.mtc_q_cmd_source == "wm_state"
+
+
+def test_swm_mtc_preserves_firmware_gains_and_sends_residual(tmp_path: Path):
+    config = InferenceConfig(
+        dp_checkpoint=CheckpointConfig(tmp_path / "dp.pt", device="cpu"),
+        pinn_checkpoint=CheckpointConfig(tmp_path / "swm.pt", device="cpu"),
+        robot=RobotConfig(tmp_path / "robot.urdf"),
+        runtime=RuntimeConfig(tmp_path / "collection.yaml"),
+        action="joint",
+        predictor=PredictorConfig(mode="swm", inference_mode="open_loop"),
+        execution=ExecutionConfig(
+            mode="mtc",
+            mit_kp=(1.5,) * 7,
+            mit_kd=(0.5,) * 7,
+            mtc_alpha=0.5,
+            mtc_q_cmd_source="wm_delta",
+        ),
+        safety=SafetyConfig(maximum_joint_position_step_rad=(1.0,) * 7),
+        torque_filter=TorqueFilterConfig(enabled=False),
+        osc_qp=OSCQPConfig(horizon_steps=2, dt_s=0.01),
+    )
+    controller = _Controller()
+    controller.model.velocity_limit = np.full(7, 100.0)
+    pipeline = SWMInferencePipeline(
+        config,
+        dp_model=_DP(),
+        pinn_model=_SWM(),
+        controller=controller,
+    )
+    sample = replace(_sample(0.0, np.zeros(7)), dq=np.full(7, 0.1))
+    output = pipeline.step(sample)
+
+    # q_hat=0.1 and delta_q_hat=0.1 reconstruct q_cmd=0.2.  The MTC q/v
+    # candidate is 1.5*0.2 - 0.5*0.1 + gravity(0.3) = 0.55; blending with
+    # tau_pred=0.1 at alpha=0.5 gives 0.325.  Firmware contributes the PD
+    # term (0.25), so only the residual 0.075 is transported as t_ff.
+    assert output.control_mode == "mtc"
+    np.testing.assert_allclose(output.q_target, 0.2, atol=1.0e-6)
+    np.testing.assert_allclose(output.dq_target, 0.0, atol=1.0e-6)
+    np.testing.assert_allclose(output.mtc_tau_qv, 0.55, atol=1.0e-6)
+    np.testing.assert_allclose(output.mtc_tau_pred, 0.1, atol=1.0e-6)
+    np.testing.assert_allclose(output.tau_command, 0.325, atol=1.0e-6)
+    np.testing.assert_allclose(output.tau_target, 0.075, atol=1.0e-6)
+    np.testing.assert_allclose(output.mit_kp, 1.5, atol=1.0e-6)
+    np.testing.assert_allclose(output.mit_kd, 0.5, atol=1.0e-6)
+    np.testing.assert_allclose(
+        output.tau_command,
+        output.tau_target + output.mit_kp * (output.q_target - sample.q)
+        + output.mit_kd * (output.dq_target - sample.dq),
+        atol=1.0e-6,
+    )
+    pipeline.close()
+
+
+def test_swm_tau_mode_keeps_predicted_torque_semantics(tmp_path: Path):
+    config = InferenceConfig(
+        dp_checkpoint=CheckpointConfig(tmp_path / "dp.pt", device="cpu"),
+        pinn_checkpoint=CheckpointConfig(tmp_path / "swm.pt", device="cpu"),
+        robot=RobotConfig(tmp_path / "robot.urdf"),
+        runtime=RuntimeConfig(tmp_path / "collection.yaml", command_kd=(9.0,) * 7),
+        action="joint",
+        predictor=PredictorConfig(mode="swm", inference_mode="open_loop"),
+        execution=ExecutionConfig(mode="tau"),
+        safety=SafetyConfig(maximum_joint_position_step_rad=(1.0,) * 7),
+        torque_filter=TorqueFilterConfig(enabled=False),
+        osc_qp=OSCQPConfig(horizon_steps=2, dt_s=0.01),
+    )
+    pipeline = SWMInferencePipeline(
+        config,
+        dp_model=_DP(),
+        pinn_model=_SWM(),
+        controller=_Controller(),
+    )
+
+    output = pipeline.step(_sample(0.0, np.zeros(7)))
+
+    # The injected dynamics model has gravity=0.3, but direct WM-tau mode
+    # must not add it (or runtime command damping) to the predicted 0.1 Nm.
+    assert output.control_mode == "tau"
+    np.testing.assert_allclose(output.tau_command, np.full(7, 0.1), atol=1.0e-6)
+    np.testing.assert_allclose(output.tau_unfiltered, np.full(7, 0.1), atol=1.0e-6)
+    np.testing.assert_allclose(output.torque_target, np.full(7, 0.1), atol=1.0e-6)
+    pipeline.close()

@@ -1,4 +1,4 @@
-"""Nero DP inference with predictor/OSC-QP and direct-IK execution."""
+"""Nero DP inference with direct-q/tau and MTC execution."""
 
 from inference.core import (
     ActionChunk,
@@ -17,6 +17,7 @@ from inference.config import (
     InferenceConfig,
     load_inference_config,
 )
+from inference.control.mtc import MTCController, MTCResult
 from inference.pipeline import (
     InferenceInput,
     InferenceOutput,
@@ -57,6 +58,9 @@ from inference.model_inference import (
 from inference.policies import (
     DiffusionPolicy,
     DPPolicy,
+    LeRobotDP,
+    LeRobotDiffusionPolicy,
+    is_lerobot_checkpoint,
     TAVLA,
     TAVLAAdapter,
     TAVLAInferencePolicy,
@@ -97,6 +101,8 @@ __all__ = [
     "NeroPipelineRunner",
     "ModularInferenceRunner",
     "ExecutionConfig",
+    "MTCController",
+    "MTCResult",
     "InferenceInput",
     "InferenceOutput",
     "IKResult",
@@ -124,6 +130,9 @@ __all__ = [
     "TAVLAPipeline",
     "DiffusionPolicy",
     "DPPolicy",
+    "LeRobotDP",
+    "LeRobotDiffusionPolicy",
+    "is_lerobot_checkpoint",
     "TAVLA",
     "TAVLAAdapter",
     "TAVLAInferencePolicy",

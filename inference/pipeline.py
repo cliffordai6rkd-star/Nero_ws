@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Mapping
@@ -16,12 +16,7 @@ from inference.config import InferenceConfig, resolve_camera_key
 from inference.policies.dp import DiffusionPolicyAdapter, predict_diffusion_action
 from inference.stages import ActionPlanExecutor, DPObservationBuffer
 from inference.torque_filter import CausalTorqueCommandFilter
-from nero_collection.control import (
-    OSCQPController,
-    OSCQPResult,
-    OSCTargetTrajectory,
-    PinocchioDynamicsModel,
-)
+from nero_collection.control import PinocchioDynamicsModel
 
 
 log = logging.getLogger(__name__)
@@ -57,6 +52,22 @@ _SWM_MODES = frozenset(
 _WORLD_MODEL_MODES = frozenset(
     ("world_model_v3", *_Q_TAU_WORLD_MODEL_MODES)
 )
+
+
+@dataclass
+class _DynamicsControllerAdapter:
+    """Compatibility shell exposing the historical ``controller.model`` API."""
+
+    model: Any
+    horizon_steps: int = 1
+    dt_s: float = 0.01
+
+    @property
+    def config(self) -> "_DynamicsControllerAdapter":
+        return self
+
+    def reset(self) -> None:
+        return None
 
 
 def _collection_camera_keys_if_available(path: str | Path) -> tuple[str, ...] | None:
@@ -104,7 +115,9 @@ class InferenceOutput:
     # kept separate from action_target, which may be safety-clipped/selected.
     dp_action_chunk: np.ndarray | None
     target_wrench: np.ndarray
-    qp_result: OSCQPResult | None
+    # Retained as a compatibility field; inference no longer produces QP
+    # results and always leaves this as ``None``.
+    qp_result: Any | None
     joint_position_command: np.ndarray | None
     ik_result: IKResult | None
     dp_updated: bool
@@ -113,7 +126,11 @@ class InferenceOutput:
     joint_position_target: np.ndarray | None = None
     joint_velocity_target: np.ndarray | None = None
     torque_target: np.ndarray | None = None
-    # Effective gains sent to the firmware for a contact-WM MIT cycle.  They
+    # Auditable terms for the multi-target controller (MTC) branch.
+    mtc_tau_qv: np.ndarray | None = None
+    mtc_tau_pred: np.ndarray | None = None
+    mtc_alpha: float | None = None
+    # Effective gains sent to the firmware for a contact-WM MIT/MTC cycle.  They
     # may be lower than the configured nominal gains when the feedback or
     # total-torque limit is active.
     mit_kp: np.ndarray | None = None
@@ -176,7 +193,7 @@ class NeroInferencePipeline:
         *,
         dp_model: Any | None = None,
         pinn_model: Any | None = None,
-        controller: OSCQPController | None = None,
+        controller: Any | None = None,
         world_model_wrench_adapter: Any | None = None,
         _allow_contact_world_model: bool = False,
     ) -> None:
@@ -235,15 +252,36 @@ class NeroInferencePipeline:
             and self._predictor_mode not in _SWM_MODES
         ):
             raise ValueError(f"unsupported predictor mode: {self._predictor_mode!r}")
+        if self._predictor_enabled and (
+            self._predictor_mode == "wrench_gru"
+            or self._predictor_mode in _WORLD_MODEL_MODES
+        ):
+            raise ValueError(
+                "the legacy wrench_gru torque-control path was removed with its "
+                "optimizer; use a contact/SWM world model with "
+                "execution.mode=q, mtc, or tau"
+            )
         if controller is None:
             dynamics = PinocchioDynamicsModel(
                 config.robot.urdf_path,
                 frame_name=config.robot.frame_name,
                 locked_joint_names=config.robot.locked_joint_names,
             )
-            controller = OSCQPController(dynamics, config.osc_qp)
+            # Keep the small adapter shape used by legacy callers while the
+            # optimization layer itself is gone.  A one-step horizon is only
+            # used for wrench-array compatibility in the legacy output.
+            controller = _DynamicsControllerAdapter(dynamics)
         self.controller = controller
-        self.model = controller.model
+        self.model = getattr(controller, "model", controller)
+        controller_config = getattr(controller, "config", None)
+        self._control_horizon_steps = int(
+            getattr(controller_config, "horizon_steps", 1)
+            or 1
+        )
+        self._control_dt_s = float(
+            getattr(controller_config, "dt_s", getattr(self, "_wm_sampling_dt_s", None) or 0.01)
+            or 0.01
+        )
 
         self._n_obs_steps = int(getattr(self.dp, "n_obs_steps", 1))
         self._dp_tau_ext_observation_enabled = bool(
@@ -474,9 +512,7 @@ class NeroInferencePipeline:
                 config.pinn_checkpoint.path,
             )
         self._action_to_control_transform: np.ndarray | None = None
-        self._target_wrenches = np.zeros(
-            (self.controller.config.horizon_steps, 6), dtype=np.float64
-        )
+        self._target_wrenches = np.zeros((self._control_horizon_steps, 6), dtype=np.float64)
         self._last_tau: np.ndarray | None = None
         self._torque_filter = CausalTorqueCommandFilter(config.torque_filter)
         self._last_control_timestamp_s: float | None = None
@@ -486,7 +522,6 @@ class NeroInferencePipeline:
         self._timing_started_s = perf_counter()
         self._timing_cycles = 0
         self._timing_pinn_s = 0.0
-        self._timing_qp_s = 0.0
         self._timing_ik_s = 0.0
         self._timing_dp_s: list[float] = []
         self._timing_wm_s: list[float] = []
@@ -605,7 +640,7 @@ class NeroInferencePipeline:
                 allow_backfill=not open_loop,
             )
         self._append_world_model_observation(sample)
-        current_control_pose = self.controller.model.snapshot(sample.q, sample.dq).pose
+        current_control_pose = self.model.snapshot(sample.q, sample.dq).pose
         current_action_pose = self._current_action_pose(
             sample.q,
             current_control_pose,
@@ -640,73 +675,10 @@ class NeroInferencePipeline:
             current_wm_pose,
         )
         self._timing_pinn_s += perf_counter() - pinn_started_s
-        self._update_qp_timestep(sample.timestamp_s)
-
-        assert self._action_chunk is not None
-        action_poses = np.stack(
-            [_action_to_pose(action) for action in self._actions_for_wm(self._action_chunk)],
-            axis=0,
+        raise RuntimeError(
+            "the legacy wrench/world-model torque path was removed; use the "
+            "contact-WM or SWM pipeline with execution.mode=q, mtc, or tau"
         )
-        control_poses = self._action_poses_to_control(
-            action_poses,
-            sample.q,
-            current_action_pose,
-            current_control_pose,
-        )
-        control_poses = _fit_pose_horizon(
-            control_poses,
-            self.controller.config.horizon_steps,
-        )
-        target = OSCTargetTrajectory(
-            poses=control_poses,
-            wrenches=_rotate_wrenches(
-                self._target_wrenches,
-                sample.wrench_to_control_rotation,
-            ),
-        )
-        measured_wrench = _rotate_wrenches(
-            sample.wrench_ext[None],
-            sample.wrench_to_control_rotation,
-        )[0]
-        qp_started_s = perf_counter()
-        result = self.controller.optimize_mpc(
-            sample.q,
-            sample.dq,
-            target,
-            measured_wrench=measured_wrench,
-            previous_tau=self._last_tau,
-        )
-        self._timing_qp_s += perf_counter() - qp_started_s
-        tau_unfiltered = self._clip_tau(result.first_tau)
-        initial_tau = self._clip_tau(sample.tau)
-        tau = self._torque_filter.apply(
-            tau_unfiltered,
-            dt_s=self.controller.config.dt_s,
-            initial_tau=initial_tau,
-        )
-        tau = self._clip_tau(tau)
-        self._last_tau = tau
-        output = InferenceOutput(
-            tau_command=tau,
-            tau_unfiltered=tau_unfiltered,
-            action_target=self._action.copy(),
-            dp_action_chunk=(
-                None
-                if self._dp_action_chunk is None
-                else self._dp_action_chunk.copy()
-            ),
-            target_wrench=target.wrenches[0].copy(),
-            qp_result=result,
-            joint_position_command=None,
-            ik_result=None,
-            dp_updated=dp_updated,
-            pinn_updated=True,
-            dp_inference_time_s=self._last_dp_inference_time_s,
-            wm_inference_time_s=self._last_wm_inference_time_s,
-        )
-        self._timing_cycles += 1
-        self._report_timing(perf_counter() - cycle_started_s)
-        return output
 
     def _update_dp_execution(
         self,
@@ -1257,8 +1229,8 @@ class NeroInferencePipeline:
         physical_lower, physical_upper = self._joint_position_bounds(0.0)
         return np.clip(command, physical_lower, physical_upper)
 
-    def _update_qp_timestep(self, timestamp_s: float) -> None:
-        """Use measured loop time for QP rollout instead of a configured nominal Hz."""
+    def _update_control_timestep(self, timestamp_s: float) -> None:
+        """Track the measured control period for causal output filtering."""
         previous = self._last_control_timestamp_s
         self._last_control_timestamp_s = float(timestamp_s)
         if previous is None:
@@ -1266,7 +1238,10 @@ class NeroInferencePipeline:
         measured_dt = float(timestamp_s) - previous
         if measured_dt <= 0.0:
             raise ValueError("InferenceInput.timestamp_s must increase every control step")
-        self.controller.config = replace(self.controller.config, dt_s=measured_dt)
+        self._control_dt_s = measured_dt
+
+    # Kept as a private compatibility alias for external pipeline subclasses.
+    _update_qp_timestep = _update_control_timestep
 
     def _append_observation(
         self,
@@ -2070,7 +2045,6 @@ class NeroInferencePipeline:
         cycles = max(self._timing_cycles, 1)
         control_hz = self._timing_cycles / interval_s
         pinn_ms = 1.0e3 * self._timing_pinn_s / cycles
-        qp_ms = 1.0e3 * self._timing_qp_s / cycles
         ik_ms = 1.0e3 * self._timing_ik_s / cycles
         if self._timing_dp_s:
             dp_text = f"{1.0e3 * np.mean(self._timing_dp_s):.2f} ms"
@@ -2087,8 +2061,7 @@ class NeroInferencePipeline:
         backend_text = (
             f"IK_avg={ik_ms:.2f} ms"
             if not self._predictor_enabled
-            else f"WM_avg={wm_text} PINN_stage_avg={pinn_ms:.2f} ms "
-            f"OSC-QP_avg={qp_ms:.2f} ms"
+            else f"WM_avg={wm_text} PINN_stage_avg={pinn_ms:.2f} ms"
         )
         print(
             "[inference timing] "
@@ -2104,7 +2077,6 @@ class NeroInferencePipeline:
         self._timing_started_s = perf_counter() if now_s is None else now_s
         self._timing_cycles = 0
         self._timing_pinn_s = 0.0
-        self._timing_qp_s = 0.0
         self._timing_ik_s = 0.0
         self._timing_dp_s = []
         self._timing_wm_s = []
@@ -2128,7 +2100,7 @@ class NeroInferencePipeline:
             + [self.config.safety.maximum_target_moment_nm] * 3
         )
         wrench = np.clip(wrench, -limits, limits)
-        return _fit_horizon(wrench, self.controller.config.horizon_steps)
+        return _fit_horizon(wrench, self._control_horizon_steps)
 
     def _predict_gru_wrenches(
         self,
@@ -2430,7 +2402,7 @@ class NeroInferencePipeline:
     ) -> np.ndarray:
         if self._action_frame_name == self._control_frame_name:
             return current_control_pose.copy()
-        frame_pose = getattr(self.controller.model, "frame_pose", None)
+        frame_pose = getattr(self.model, "frame_pose", None)
         if not callable(frame_pose):
             raise RuntimeError(
                 "PINN action frame differs from OSC control frame, but the dynamics "
@@ -2448,13 +2420,13 @@ class NeroInferencePipeline:
         )
         if self._dp_action_type == "eepose":
             return values.copy()
-        frame_pose = getattr(self.controller.model, "frame_pose", None)
+        frame_pose = getattr(self.model, "frame_pose", None)
         poses = []
         for q in values:
             if callable(frame_pose):
                 pose = frame_pose(q, self._action_frame_name)
             elif self._action_frame_name == self._control_frame_name:
-                pose = self.controller.model.snapshot(q, np.zeros(7)).pose
+                pose = self.model.snapshot(q, np.zeros(7)).pose
             else:
                 raise RuntimeError(
                     "joint DP action requires dynamics model.frame_pose() when the "
@@ -2474,7 +2446,7 @@ class NeroInferencePipeline:
             return current_action_pose.copy()
         if self._wm_current_frame_name == self._control_frame_name:
             return current_control_pose.copy()
-        frame_pose = getattr(self.controller.model, "frame_pose", None)
+        frame_pose = getattr(self.model, "frame_pose", None)
         if not callable(frame_pose):
             raise RuntimeError(
                 "WM current EE frame differs from action/control frames, but the "

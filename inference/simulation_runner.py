@@ -43,7 +43,7 @@ from inference.pipeline import InferenceInput, InferenceOutput, NeroInferencePip
 log = logging.getLogger(__name__)
 
 ObservationMode = Literal["recorded", "hybrid_closed_loop"]
-EXECUTION_MODES = ("mit", "osc_qp", "q", "tau")
+EXECUTION_MODES = ("mtc", "q", "tau")
 OBSERVATION_MODES = ("recorded", "hybrid_closed_loop")
 
 
@@ -79,7 +79,7 @@ class SimulationRunnerConfig:
             mode = str(self.execution_mode).strip().lower().replace("-", "_")
             if mode not in EXECUTION_MODES:
                 raise ValueError(
-                    "execution_mode must be one of 'mit', 'osc_qp', 'q', or 'tau'"
+                    "execution_mode must be one of 'mtc', 'q', or 'tau'"
                 )
             object.__setattr__(self, "execution_mode", mode)
         for name in ("state_rate_hz", "camera_rate_hz"):
@@ -478,8 +478,7 @@ def run_h5_simulation(
         predictor_config = getattr(pipeline_config, "predictor", None)
         if not bool(getattr(predictor_config, "enabled", True)):
             # The predictor-disabled contract is DP -> IK -> q.  Older direct
-            # IK YAML files predate ``execution.mode`` and therefore inherit
-            # the global osc_qp default; do not accidentally turn their zero
+            # IK YAML files may omit ``execution.mode``; do not accidentally turn their zero
             # tau placeholder into a torque simulation.
             mode = "q"
         else:

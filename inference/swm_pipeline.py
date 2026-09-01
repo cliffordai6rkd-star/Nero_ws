@@ -21,13 +21,11 @@ from inference.pipeline import (
     NeroInferencePipeline,
     _SWM_MODES,
     _fit_horizon,
-    _fit_pose_horizon,
     _model_device,
     _numpy_vector,
-    _rotate_wrenches,
     _synchronize_model,
 )
-from nero_collection.control import OSCTargetTrajectory
+from inference.control.mtc import MTCController
 
 
 class SWMInferencePipeline(NeroInferencePipeline):
@@ -159,8 +157,19 @@ class SWMInferencePipeline(NeroInferencePipeline):
         if self._swm_flow_solver not in {"euler", "heun"}:
             raise ValueError("SWM flow solver must be 'euler' or 'heun'")
         self._swm_execution_mode = str(config.execution.mode).strip().lower().replace("-", "_")
-        if self._swm_execution_mode not in {"q", "mit", "tau", "osc_qp"}:
-            raise ValueError("SWM execution.mode must be q, mit, tau, or osc_qp")
+        if self._swm_execution_mode not in {"q", "mtc", "tau"}:
+            raise ValueError("SWM execution.mode must be q, mtc, or tau")
+        self.mtc_controller = (
+            MTCController(
+                model=self.model,
+                kp=config.execution.mit_kp,
+                kd=config.execution.mit_kd,
+                alpha=config.execution.mtc_alpha,
+                q_cmd_source=config.execution.mtc_q_cmd_source,
+            )
+            if self._swm_execution_mode == "mtc"
+            else None
+        )
         self._validate_action_cadence()
         dp_action_start = getattr(self.dp, "action_start_index", None)
         if dp_action_start is not None and int(dp_action_start) != self._swm_action_start_offset:
@@ -321,7 +330,8 @@ class SWMInferencePipeline(NeroInferencePipeline):
                 allow_backfill=not open_loop,
             )
         self._append_world_model_observation(sample)
-        current_control_pose = self.controller.model.snapshot(sample.q, sample.dq).pose
+        current_control_pose = self.model.snapshot(sample.q, sample.dq).pose
+        self._update_control_timestep(sample.timestamp_s)
         # SWM actions are joint-space values; no FK frame conversion is needed
         # (and a test/controller model need not expose frame_pose()).
         current_action_pose = current_control_pose
@@ -354,10 +364,10 @@ class SWMInferencePipeline(NeroInferencePipeline):
 
         if self._swm_execution_mode == "q":
             command = output.joint_position_command
-        elif self._swm_execution_mode == "mit":
+        elif self._swm_execution_mode == "mtc":
             command = output.joint_position_target
         else:
-            # Pure torque and OSC-QP transports hold q at the measured state;
+            # Pure torque transport holds q at the measured state;
             # their torque target is not a commanded joint position.
             command = sample.q
         if command is None:
@@ -493,7 +503,7 @@ class SWMInferencePipeline(NeroInferencePipeline):
 
     def _idle_swm_output(self, sample: InferenceInput, dp_updated: bool) -> InferenceOutput:
         """Hold the measured state while waiting for the first DP action."""
-        horizon = self.controller.config.horizon_steps
+        horizon = self._swm_future_horizon
         q = _numpy_vector(sample.q, 7, "sample q")
         dq = np.zeros(7, dtype=np.float64)
         tau = np.zeros(7, dtype=np.float64)
@@ -527,7 +537,7 @@ class SWMInferencePipeline(NeroInferencePipeline):
                 joint_position_command=q.copy(),
                 **common,
             )
-        if self._swm_execution_mode == "mit":
+        if self._swm_execution_mode == "mtc":
             kp = np.asarray(self.config.execution.mit_kp, dtype=np.float64)
             kd = np.asarray(self.config.execution.mit_kd, dtype=np.float64)
             return InferenceOutput(
@@ -536,6 +546,9 @@ class SWMInferencePipeline(NeroInferencePipeline):
                 joint_position_command=None,
                 mit_kp=kp,
                 mit_kd=kd,
+                mtc_tau_qv=tau.copy(),
+                mtc_tau_pred=tau.copy(),
+                mtc_alpha=float(self.config.execution.mtc_alpha),
                 **common,
             )
         return InferenceOutput(
@@ -552,23 +565,20 @@ class SWMInferencePipeline(NeroInferencePipeline):
         reference: Mapping[str, Any],
         dp_updated: bool,
     ) -> InferenceOutput:
-        horizon = self.controller.config.horizon_steps
+        horizon = self._swm_future_horizon
         q_future = _fit_horizon(reference["q"], horizon)
-        # Bound the complete trajectory before it reaches either the direct-q
-        # transport or OSC-QP.  Clipping only token 0 leaves later references
-        # free to cross a hard joint limit or make an implausible jump in the
-        # same control cycle.
+        # Bound the complete trajectory before it reaches direct-q transport;
+        # later tokens must not cross hard limits or jump implausibly.
         q_future = self._safe_joint_position_trajectory(
             sample.q,
             q_future,
             dt_s=self._swm_sampling_dt_s,
         )
-        dq_future = self._limit_mit_velocity(_fit_horizon(reference["dq"], horizon))
+        dq_future = self._limit_predicted_velocity(_fit_horizon(reference["dq"], horizon))
         dq_future = self._limit_model_velocity_trajectory(dq_future)
         tau_future = _fit_horizon(reference["tau"], horizon)
-        # SWM predicts dq but not ddq.  OSC-QP's joint tracking interface uses
-        # acceleration references, so reconstruct a causal finite difference
-        # from the measured dq to the first future token and between tokens.
+        # SWM predicts dq but not ddq; keep a finite-difference trajectory for
+        # diagnostics and downstream consumers.
         dt = self._swm_sampling_dt_s
         ddq_future = np.empty_like(dq_future)
         ddq_future[0] = (dq_future[0] - np.asarray(sample.dq, dtype=np.float64)) / dt
@@ -576,7 +586,10 @@ class SWMInferencePipeline(NeroInferencePipeline):
             ddq_future[1:] = np.diff(dq_future, axis=0) / dt
         q_trajectory = q_future.copy()
         q_command = q_trajectory[0].copy()
-        tau_ff = self._filtered_tau(tau_future[0], sample.tau)
+        # Keep the raw WM prediction for diagnostics; only ``tau_command`` is
+        # passed through the causal safety filter before transport.
+        tau_pred = self._clip_tau(tau_future[0])
+        tau_ff = self._filtered_tau(tau_pred, sample.tau)
         contact = reference.get("contact_state")
         contact0 = None if contact is None else np.asarray(contact[0]).copy()
         common = dict(
@@ -605,61 +618,65 @@ class SWMInferencePipeline(NeroInferencePipeline):
                 tau_command=zeros.copy(), tau_unfiltered=zeros.copy(),
                 joint_position_command=q_command, **common
             )
-        if self._swm_execution_mode == "mit":
+        if self._swm_execution_mode == "mtc":
+            assert self.mtc_controller is not None
+            delta_future = _fit_horizon(reference["delta_q"], horizon)
+            raw_q_cmd = self.mtc_controller.resolve_q_cmd(
+                q_command, delta_future[0]
+            )
+            safe_q_cmd = self._safe_joint_position_trajectory(
+                sample.q,
+                raw_q_cmd[None],
+                dt_s=self._swm_sampling_dt_s,
+            )[0]
+            delta_for_control = (
+                safe_q_cmd - q_command
+                if self.mtc_controller.q_cmd_source == "wm_delta"
+                else None
+            )
+            mtc = self.mtc_controller.compute(
+                q=sample.q,
+                dq=sample.dq,
+                tau_pred=tau_ff,
+                q_hat=q_command,
+                delta_q_hat=delta_for_control,
+            )
+            # Preserve the data-side firmware gains.  The feed-forward is the
+            # residual required so firmware's own PD term completes tau_cmd.
             kp = np.asarray(self.config.execution.mit_kp, dtype=np.float64)
             kd = np.asarray(self.config.execution.mit_kd, dtype=np.float64)
-            raw_feedback = kp * (q_command - sample.q) + kd * (dq_future[0] - sample.dq)
-            feedback = raw_feedback.copy()
-            if self.config.execution.mit_feedback_torque_limit is not None:
-                limit = np.asarray(self.config.execution.mit_feedback_torque_limit, dtype=np.float64)
-                if limit.ndim == 0:
-                    limit = np.repeat(limit, 7)
-                feedback = np.clip(feedback, -limit, limit)
-            total = self._clip_tau(tau_ff + feedback)
-            scale = np.ones(7, dtype=np.float64)
-            nonzero = np.abs(raw_feedback) > 1.0e-12
-            scale[nonzero] = np.clip((total - tau_ff)[nonzero] / raw_feedback[nonzero], 0.0, 1.0)
+            # ``maximum_command_torque_nm`` is also the transport limit for
+            # ``t_ff``.  Recompute the effective total after clipping the
+            # residual so diagnostics describe the torque the fixed-gain MIT
+            # command can actually request at this sampled q/dq.
+            requested_total = self._clip_tau(mtc.tau_command)
+            t_ff = self._clip_tau(requested_total - mtc.tau_pd)
+            effective_total = self._clip_tau(mtc.tau_pd + t_ff)
             return InferenceOutput(
-                tau_command=total, tau_unfiltered=total.copy(),
+                tau_command=effective_total,
+                tau_unfiltered=effective_total.copy(),
                 joint_position_command=None,
-                mit_kp=kp * scale, mit_kd=kd * scale, **common
+                mit_kp=kp,
+                mit_kd=kd,
+                **{
+                    **common,
+                    "joint_position_target": mtc.q_cmd.copy(),
+                    "joint_velocity_target": np.zeros(7, dtype=np.float64),
+                    "torque_target": t_ff,
+                    "mtc_tau_qv": mtc.tau_qv.copy(),
+                    "mtc_tau_pred": mtc.tau_pred.copy(),
+                    "mtc_alpha": mtc.alpha,
+                },
             )
         if self._swm_execution_mode == "tau":
             return InferenceOutput(
-                tau_command=tau_ff.copy(), tau_unfiltered=tau_ff.copy(),
+                tau_command=tau_ff.copy(), tau_unfiltered=tau_pred.copy(),
                 joint_position_command=None, **common
             )
 
-        # OSC-QP receives joint references directly; the pose field is held at
-        # the measured pose because SWM predicts joint state, not EE pose.
-        poses = _fit_pose_horizon(
-            np.repeat(np.asarray(current_control_pose, dtype=np.float64)[None], horizon, axis=0),
-            horizon,
-        )
-        target = OSCTargetTrajectory(
-            poses=poses,
-            wrenches=np.zeros((horizon, 6), dtype=np.float64),
-            joint_positions=q_trajectory,
-            joint_velocities=dq_future,
-            joint_accelerations=ddq_future,
-            joint_torques=tau_future,
-        )
-        self._update_qp_timestep(sample.timestamp_s)
-        measured = _rotate_wrenches(sample.wrench_ext[None], sample.wrench_to_control_rotation)[0]
-        result = self.controller.optimize_mpc(
-            sample.q, sample.dq, target, measured_wrench=measured, previous_tau=self._last_tau
-        )
-        tau_unfiltered = self._clip_tau(result.first_tau)
-        tau_command = self._filtered_tau(tau_unfiltered, sample.tau)
-        self._last_tau = tau_command.copy()
-        return InferenceOutput(
-            tau_command=tau_command,
-            tau_unfiltered=tau_unfiltered,
-            joint_position_command=None,
-            **{**common, "qp_result": result, "target_wrench": target.wrenches[0].copy()},
-        )
+        raise RuntimeError(f"unsupported SWM execution mode {self._swm_execution_mode!r}")
 
-    def _limit_mit_velocity(self, values: np.ndarray) -> np.ndarray:
+    def _limit_predicted_velocity(self, values: np.ndarray) -> np.ndarray:
         limit = np.asarray(self.config.execution.mit_velocity_limit, dtype=np.float64)
         if limit.ndim == 0:
             limit = np.repeat(limit, 7)
@@ -674,7 +691,7 @@ class SWMInferencePipeline(NeroInferencePipeline):
         result = np.asarray(values, dtype=np.float64)
         if result.ndim != 2 or result.shape[1] != 7 or not np.all(np.isfinite(result)):
             raise ValueError("SWM joint velocity trajectory must be finite [H,7]")
-        model_limit = getattr(self.controller.model, "velocity_limit", None)
+        model_limit = getattr(self.model, "velocity_limit", None)
         if model_limit is None:
             return result.copy()
         limit = np.asarray(model_limit, dtype=np.float64).reshape(-1)
@@ -684,7 +701,7 @@ class SWMInferencePipeline(NeroInferencePipeline):
             # valid checkpoint solely because the optional model metadata is
             # unbounded.
             if limit.shape != (7,) or np.any(limit <= 0.0) or np.any(np.isnan(limit)):
-                raise ValueError("controller.model.velocity_limit must be positive [7]")
+                raise ValueError("dynamics model.velocity_limit must be positive [7]")
             finite = np.isfinite(limit)
             clipped = result.copy()
             clipped[:, finite] = np.clip(
@@ -733,11 +750,11 @@ class SWMInferencePipeline(NeroInferencePipeline):
             self.config.ik.joint_position_margin_rad
         )
         step_limit = configured_step.copy()
-        model_velocity = getattr(self.controller.model, "velocity_limit", None)
+        model_velocity = getattr(self.model, "velocity_limit", None)
         if model_velocity is not None:
             velocity = np.asarray(model_velocity, dtype=np.float64).reshape(-1)
             if velocity.shape != (7,) or np.any(np.isnan(velocity)) or np.any(velocity <= 0.0):
-                raise ValueError("controller.model.velocity_limit must be positive [7]")
+                raise ValueError("dynamics model.velocity_limit must be positive [7]")
             finite = np.isfinite(velocity)
             step_limit[finite] = np.minimum(step_limit[finite], velocity[finite] * dt_s)
 
@@ -754,7 +771,7 @@ class SWMInferencePipeline(NeroInferencePipeline):
     def _filtered_tau(self, value: np.ndarray, initial: np.ndarray) -> np.ndarray:
         clipped = self._clip_tau(value)
         filtered = self._torque_filter.apply(
-            clipped, dt_s=self.controller.config.dt_s, initial_tau=self._clip_tau(initial)
+            clipped, dt_s=self._control_dt_s, initial_tau=self._clip_tau(initial)
         )
         return self._clip_tau(filtered)
 

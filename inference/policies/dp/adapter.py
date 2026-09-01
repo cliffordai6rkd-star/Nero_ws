@@ -120,6 +120,14 @@ class DiffusionPolicyAdapter:
             reset()
 
     def predict(self, observation: Observation) -> ActionChunk | None:
+        # Native LeRobot policies own image preprocessing and temporal action
+        # queues.  Bypass the legacy bare-key builder so the checkpoint sees
+        # its exact ``observation.state``/``observation.images.*`` contract.
+        native_predict = getattr(self.model, "predict", None)
+        if getattr(self.model, "expects_lerobot_contract", False) and callable(
+            native_predict
+        ):
+            return native_predict(observation)
         model_input = self.input_builder(observation)
         output = self.predict_raw(model_input)
         if isinstance(output, Mapping):

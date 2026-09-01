@@ -160,6 +160,23 @@ pipeline 的完整 pose/wrench 安全策略仍由旧 pipeline 保持，迁移时
 
 ## 5. 新增 DP action expert
 
+LeRobot 0.4 导出的目录 checkpoint（`config.json` + `model.safetensors`）使用
+[`policies/lerobotdp.py`](policies/lerobotdp.py) 单文件接口。它读取 checkpoint
+声明的 `observation.state`、`observation.images.wrist` 和
+`observation.images.side`，并将 LeRobot 的逐步 `select_action()` 结果整理为
+`ActionChunk([8,7], semantic="joint", step_s=0.04)`。环境需要安装可选依赖
+`lerobot==0.4.0`；旧 Hydra `.pt/.ckpt` 仍由 `policies/dp/` 兼容层处理。
+
+```python
+from inference.policies.lerobotdp import LeRobotDiffusionPolicy
+
+policy = LeRobotDiffusionPolicy.from_pretrained(
+    "/home/rei/mnt/code/lcx/nero_ws/model/dp/"
+    "pretrained_model-20260901T082955Z-1-001/pretrained_model",
+    device="cuda:0",
+)
+```
+
 DP 包中的 [`policies/dp/adapter.py`](policies/dp/adapter.py) 提供轻量
 `DiffusionPolicyAdapter`，适用于暴露 `predict_action(model_input)` 的 diffusion-policy 模型：
 
@@ -306,7 +323,7 @@ architecture:
 3. 至少一个示例 YAML；
 4. `--check` 输出和对应测试。
 
-注意：当前 `NeroInferenceRuntime` 对 `architecture.policy_type` 仍是兼容声明，不能仅靠 YAML 切换旧 pipeline。接入新 policy 前，需要在 modular builder 中创建 sampler、processor、policy、WM、resolver、guard 和 controller，并明确保留旧入口的兼容行为。
+`NeroInferenceRuntime` 对 `policy_type: dp`/`lerobotdp` 已提供内置模块化 builder，会自动创建 sampler、policy、joint resolver、安全 guard 和 controller；TAVLA 等仍需通过 `modular_builder` 注入官方模型与处理器。旧入口在 `architecture.enabled: false` 时保持兼容。
 
 ## 8. 测试要求
 

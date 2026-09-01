@@ -3,7 +3,6 @@ matplotlib>=3.7
 mujoco<4,>=3.3
 numpy<2.3,>=2.2
 opencv-python-headless<4.13,>=4.9
-osqp<2,>=1
 pin<4,>=3
 PyYAML>=6.0
 scipy<1.16,>=1.10

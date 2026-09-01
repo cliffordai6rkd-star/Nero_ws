@@ -7,8 +7,6 @@ from typing import Any, Iterable, Mapping, TypeVar
 import numpy as np
 import yaml
 
-from nero_collection.control import OSCQPConfig
-
 
 @dataclass(frozen=True)
 class CheckpointConfig:
@@ -43,14 +41,21 @@ class PredictorConfig:
 class ExecutionConfig:
     """How a q/tau world-model prediction is sent to the arm."""
 
-    # ``osc_qp`` preserves the historical predictor -> OSC-QP path.
-    mode: str = "osc_qp"
+    # Inference exposes only direct q/tau and the MTC blend.  MIT remains a
+    # firmware transport primitive used by MTC, not a standalone mode.
+    mode: str = "tau"
     mit_kp: float | tuple[float, ...] = (0.0,) * 7
     mit_kd: float | tuple[float, ...] = (0.0,) * 7
     # Optional clamps applied only to the reconstructed MIT velocity target
     # and the feedback contribution.  A scalar broadcasts to all joints.
     mit_velocity_limit: float | tuple[float, ...] = 5.0
     mit_feedback_torque_limit: float | tuple[float, ...] | None = None
+    # Multi-target controller (MTC) blends a data-style q/v/gravity torque
+    # candidate with the WM-predicted total torque.
+    mtc_alpha: float = 0.5
+    # ``wm_state`` uses q_hat; ``wm_delta`` reconstructs q_cmd_hat as
+    # q_hat + delta_q_hat.  ``q_hat`` and ``q_cmd_hat`` are accepted aliases.
+    mtc_q_cmd_source: str = "wm_delta"
 
 
 @dataclass(frozen=True)
@@ -175,7 +180,6 @@ class InferenceConfig:
     wrench_visualization: WrenchVisualizationConfig = field(
         default_factory=WrenchVisualizationConfig
     )
-    osc_qp: OSCQPConfig = field(default_factory=OSCQPConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     architecture: ArchitectureConfig = field(default_factory=ArchitectureConfig)
 
@@ -395,8 +399,10 @@ def load_inference_config(path: str | Path) -> InferenceConfig:
         "execution",
     )
     execution_mode = execution.mode.strip().lower().replace("-", "_")
-    if execution_mode not in {"mit", "osc_qp", "q", "tau"}:
-        raise ValueError("execution.mode must be one of 'mit', 'osc_qp', 'q', or 'tau'")
+    if execution_mode not in {"mtc", "q", "tau"}:
+        raise ValueError(
+            "execution.mode must be one of 'mtc', 'q', or 'tau'"
+        )
     kp_array = np.asarray(execution.mit_kp, dtype=np.float64)
     kd_array = np.asarray(execution.mit_kd, dtype=np.float64)
     if kp_array.ndim == 0:
@@ -445,12 +451,36 @@ def load_inference_config(path: str | Path) -> InferenceConfig:
         or np.any(kd_array < 0.0)
     ):
         raise ValueError("execution.mit_kp and execution.mit_kd must be finite and non-negative")
+    try:
+        mtc_alpha = float(execution.mtc_alpha)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("execution.mtc_alpha must be a finite value in [0, 1]") from exc
+    if not np.isfinite(mtc_alpha) or not 0.0 <= mtc_alpha <= 1.0:
+        raise ValueError("execution.mtc_alpha must be a finite value in [0, 1]")
+    mtc_q_cmd_source = (
+        str(execution.mtc_q_cmd_source).strip().lower().replace("-", "_")
+    )
+    mtc_q_cmd_source = {
+        "q_hat": "wm_state",
+        "qhat": "wm_state",
+        "wm_q": "wm_state",
+        "q_cmd_hat": "wm_delta",
+        "qcmd_hat": "wm_delta",
+        "wm_q_cmd": "wm_delta",
+    }.get(mtc_q_cmd_source, mtc_q_cmd_source)
+    if mtc_q_cmd_source not in {"wm_state", "wm_delta"}:
+        raise ValueError(
+            "execution.mtc_q_cmd_source must be 'wm_state'/'q_hat' or "
+            "'wm_delta'/'q_cmd_hat'"
+        )
     execution = ExecutionConfig(
         mode=execution_mode,
         mit_kp=mit_kp,
         mit_kd=mit_kd,
         mit_velocity_limit=tuple(float(value) for value in velocity_limit),
         mit_feedback_torque_limit=feedback_limit,
+        mtc_alpha=mtc_alpha,
+        mtc_q_cmd_source=mtc_q_cmd_source,
     )
     pinn_raw = raw.get("pinn_checkpoint")
     if pinn_raw is None:
@@ -618,7 +648,6 @@ def load_inference_config(path: str | Path) -> InferenceConfig:
         value = getattr(wrench_visualization, name)
         if not np.isfinite(value) or value <= 0:
             raise ValueError(f"wrench_visualization.{name} must be positive and finite")
-    osc_qp = _dataclass_from_mapping(OSCQPConfig, raw.get("osc_qp", {}), "osc_qp")
     architecture = _dataclass_from_mapping(
         ArchitectureConfig,
         raw.get("architecture", {}),
@@ -652,7 +681,6 @@ def load_inference_config(path: str | Path) -> InferenceConfig:
         observation_protection=observation_protection,
         timing=timing,
         wrench_visualization=wrench_visualization,
-        osc_qp=osc_qp,
         architecture=architecture,
     )
 

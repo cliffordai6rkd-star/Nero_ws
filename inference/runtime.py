@@ -6,6 +6,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
@@ -26,6 +27,10 @@ from inference.core.nero_sampler import NeroObservationSampler
 from inference.core.base import InferenceBase
 from inference.core.legacy_runner import ModularInferenceRunner, NeroPipelineRunner
 from inference.control.nero import NeroPipelineOutputController
+from inference.control.base import ArmRobotController
+from inference.control.resolver import DirectActionResolver
+from inference.control.safety import BasicSafetyGuard
+from inference.policies.dp import DiffusionPolicy
 from nero_collection.arms.factory import build_arm
 from nero_collection.cameras import CameraFrame, CameraManager, CameraVisualizer
 from nero_collection.config import CollectionConfig, load_config
@@ -35,6 +40,34 @@ from nero_collection.time_utils import now_us
 
 
 log = logging.getLogger(__name__)
+
+
+def _checkpoint_image_keys_if_available(path: str | Path) -> tuple[str, ...] | None:
+    """Read image feature names without importing an optional model package."""
+
+    checkpoint = Path(path).expanduser()
+    config_path = checkpoint / "config.json"
+    if not config_path.is_file():
+        return None
+    try:
+        import json
+
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    features = payload.get("input_features", {})
+    if not isinstance(features, dict):
+        return None
+    keys = [
+        str(key).removeprefix("observation.images.")
+        for key, feature in features.items()
+        if str(key).startswith("observation.images.")
+        or (
+            isinstance(feature, dict)
+            and str(feature.get("type", "")).upper() == "VISUAL"
+        )
+    ]
+    return tuple(sorted(dict.fromkeys(key for key in keys if key))) or None
 
 
 class NeroInferenceRuntime:
@@ -83,8 +116,19 @@ class NeroInferenceRuntime:
         )
         if self._modular_image_keys is not None and not self._modular_image_keys:
             raise ValueError("modular_image_keys must contain at least one camera key")
-        self._modular_mode = modular_inference is not None or modular_builder is not None
         requested_policy = str(config.architecture.policy_type).strip().lower()
+        self._auto_modular_policy = (
+            config.architecture.enabled
+            and requested_policy
+            in {"dp", "diffusion_policy", "lerobotdp", "lerobot_diffusion_policy"}
+            and modular_inference is None
+            and modular_builder is None
+        )
+        self._modular_mode = (
+            modular_inference is not None
+            or modular_builder is not None
+            or self._auto_modular_policy
+        )
         if (
             config.architecture.enabled
             and requested_policy in {"tavla", "tavla_inference", "tavla_pipeline"}
@@ -189,6 +233,10 @@ class NeroInferenceRuntime:
         configured_image_keys = tuple(getattr(self.pipeline, "_image_keys", ()))
         if self._modular_image_keys is not None:
             configured_image_keys = self._modular_image_keys
+        elif self._auto_modular_policy:
+            configured_image_keys = (
+                _checkpoint_image_keys_if_available(config.dp_checkpoint.path) or ()
+            )
         elif self._modular_mode:
             # TAVLA/other modular policies usually consume the complete image
             # mapping.  Keep the historical single-camera default unless the
@@ -291,6 +339,10 @@ class NeroInferenceRuntime:
         self.controller = self.robot_controller
         self.diagnostics = (self.tau_ext_plotter, self.wrench_plotter)
 
+        if self._auto_modular_policy:
+            self.modular_inference = self._build_builtin_dp_inference()
+            self.pipeline = self.modular_inference
+
         if self._modular_builder is not None:
             built = self._modular_builder(self)
             if built is None or not callable(getattr(built, "step", None)):
@@ -322,6 +374,47 @@ class NeroInferenceRuntime:
             )
         self._observation_warmup_started_us: int | None = None
         self._inference_control_mode_ready = False
+
+    def _build_builtin_dp_inference(self) -> InferenceBase:
+        """Build the first-party DP action-expert graph from runtime config."""
+
+        from inference.core.base import InferenceBase
+
+        policy = DiffusionPolicy.from_checkpoint(
+            self.config.dp_checkpoint.path,
+            device=self.config.dp_checkpoint.device,
+            dino_model_path=self.config.dp_checkpoint.dino_model_path,
+            use_ema=self.config.dp_checkpoint.use_ema,
+            sampling_method=self.config.dp_sampling.method,
+            num_inference_steps=self.config.dp_sampling.num_inference_steps,
+            action_semantic=self.config.action,
+            action_frame_name=self.config.robot.action_frame_name,
+            step_s=self.config.predictor.action_step_s,
+        )
+        maximum_joint_step = np.asarray(
+            self.config.safety.maximum_joint_position_step_rad,
+            dtype=np.float64,
+        )
+        maximum_torque = np.asarray(
+            self.config.safety.maximum_command_torque_nm,
+            dtype=np.float64,
+        )
+        return InferenceBase(
+            sampler=self._observation_sampler,
+            policy=policy,
+            action_resolver=DirectActionResolver(),
+            safety_guard=BasicSafetyGuard(
+                maximum_joint_step=maximum_joint_step,
+                maximum_torque=maximum_torque,
+            ),
+            controller=ArmRobotController(
+                self.arm,
+                command_enabled=self.command_enabled,
+                default_kd=np.zeros(7, dtype=np.float64),
+            ),
+            diagnostics=(),
+            policy_update_every_cycle=False,
+        )
 
     def _process_stream_wrench(
         self,
@@ -1145,7 +1238,7 @@ def _rotate_wrench_to_control(
     wrench: np.ndarray,
     rotation: np.ndarray | None,
 ) -> np.ndarray:
-    """Match the frame conversion used by the OSC-QP pipeline."""
+    """Rotate a six-axis wrench into the configured control frame."""
     value = np.asarray(wrench, dtype=np.float64).reshape(-1)
     if value.shape != (6,) or not np.all(np.isfinite(value)):
         raise RuntimeError(f"inference wrench must be a finite 6-vector; got {value}")

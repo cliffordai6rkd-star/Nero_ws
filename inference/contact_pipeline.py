@@ -22,18 +22,15 @@ from inference.pipeline import (
     NeroInferencePipeline,
     _fit_action_horizon,
     _fit_horizon,
-    _fit_pose_horizon,
     _numpy_action_chunk,
     _pose_to_action,
-    _rotate_wrenches,
     _synchronize_model,
     _CONTACT_WORLD_MODEL_MODES,
 )
-from nero_collection.control import OSCTargetTrajectory
 
 
 class ContactWMInferencePipeline(NeroInferencePipeline):
-    """Run a q/tau contact WM with MIT, OSC-QP, q, or tau execution."""
+    """Run a q/tau contact WM with direct q or tau execution."""
 
     def __init__(self, config, **kwargs) -> None:
         # if not config.predictor.enabled:
@@ -101,8 +98,8 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
             for value in (configured_features or ("relative_pose",))
         )
         mode = str(config.execution.mode).strip().lower().replace("-", "_")
-        if mode not in {"mit", "osc_qp", "q", "tau"}:
-            raise ValueError("contact execution mode must be mit, osc_qp, q, or tau")
+        if mode not in {"q", "tau"}:
+            raise ValueError("contact execution mode must be q or tau")
         self._contact_execution_mode = mode
 
     def reset(self) -> None:
@@ -201,7 +198,8 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
             )
         self._append_world_model_observation(sample)
 
-        current_control_pose = self.controller.model.snapshot(sample.q, sample.dq).pose
+        current_control_pose = self.model.snapshot(sample.q, sample.dq).pose
+        self._update_control_timestep(sample.timestamp_s)
         current_action_pose = self._current_action_pose(
             sample.q, current_control_pose
         )
@@ -543,12 +541,16 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
         dp_updated: bool,
     ) -> InferenceOutput:
         mode = self._contact_execution_mode
-        horizon = self.controller.config.horizon_steps
+        horizon = max(
+            int(np.asarray(reference.q).shape[0]),
+            int(np.asarray(reference.tau).shape[0]),
+            1,
+        )
         q_future = np.asarray(reference.q, dtype=np.float64)
         dq_future = np.asarray(reference.dq, dtype=np.float64)
         ddq_future = np.asarray(reference.ddq, dtype=np.float64)
         tau_future = np.asarray(reference.tau, dtype=np.float64)
-        dq_future = self._limit_mit_velocity(dq_future)
+        dq_future = self._limit_predicted_velocity(dq_future)
         q_ref = self._fit_joint(q_future, horizon)
         dq_ref = self._fit_joint(dq_future, horizon)
         ddq_ref = self._fit_joint(ddq_future, horizon)
@@ -556,10 +558,11 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
         q_command = self._safe_joint_position_command(sample.q, q_ref[0])
         q_command_trajectory = q_ref.copy()
         q_command_trajectory[0] = q_command
+        tau_pred = self._clip_tau(tau_ref[0])
         tau_ff = (
-            self._filtered_tau(tau_ref[0], sample.tau)
-            if mode in {"mit", "tau"}
-            else self._clip_tau(tau_ref[0])
+            self._filtered_tau(tau_pred, sample.tau)
+            if mode == "tau"
+            else tau_pred.copy()
         )
         contact_state = (
             None
@@ -600,91 +603,20 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
                 joint_position_command=q_command,
                 **common,
             )
-        if mode == "mit":
-            kp = np.asarray(self.config.execution.mit_kp, dtype=np.float64)
-            kd = np.asarray(self.config.execution.mit_kd, dtype=np.float64)
-            raw_feedback = kp * (q_command - sample.q) + kd * (
-                dq_ref[0] - sample.dq
-            )
-            feedback = raw_feedback.copy()
-            feedback_limit = self.config.execution.mit_feedback_torque_limit
-            if feedback_limit is not None:
-                limit = np.asarray(feedback_limit, dtype=np.float64)
-                if limit.ndim == 0:
-                    limit = np.repeat(limit, 7)
-                feedback = np.clip(feedback, -limit, limit)
-            total = self._clip_tau(tau_ff + feedback)
-            # The arm firmware evaluates kp*(q_des-q)+kd*(dq_des-dq).  Scale
-            # both gains together so the physical feedback it computes at the
-            # current sample equals the bounded software result.  This keeps
-            # q/dq targets intact while making the configured limits effective
-            # on the actual move_mit command.
-            bounded_feedback = total - tau_ff
-            gain_scale = np.ones(7, dtype=np.float64)
-            nonzero = np.abs(raw_feedback) > 1.0e-12
-            gain_scale[nonzero] = bounded_feedback[nonzero] / raw_feedback[nonzero]
-            gain_scale = np.clip(gain_scale, 0.0, 1.0)
-            effective_kp = kp * gain_scale
-            effective_kd = kd * gain_scale
-            return InferenceOutput(
-                tau_command=total,
-                tau_unfiltered=total.copy(),
-                joint_position_command=None,
-                **{
-                    **common,
-                    "mit_kp": effective_kp,
-                    "mit_kd": effective_kd,
-                },
-            )
         if mode == "tau":
             return InferenceOutput(
                 tau_command=tau_ff.copy(),
-                tau_unfiltered=tau_ff.copy(),
+                tau_unfiltered=tau_pred.copy(),
                 joint_position_command=None,
                 **common,
             )
 
-        self._update_qp_timestep(sample.timestamp_s)
-        poses = _fit_pose_horizon(
-            np.repeat(current_control_pose[None], horizon, axis=0), horizon
-        )
-        target = OSCTargetTrajectory(
-            poses=poses,
-            wrenches=np.zeros((horizon, 6), dtype=np.float64),
-            joint_positions=q_command_trajectory,
-            joint_velocities=dq_ref,
-            joint_accelerations=ddq_ref,
-            joint_torques=tau_ref,
-        )
-        measured_wrench = _rotate_wrenches(
-            np.asarray(sample.wrench_ext, dtype=np.float64)[None],
-            sample.wrench_to_control_rotation,
-        )[0]
-        result = self.controller.optimize_mpc(
-            sample.q,
-            sample.dq,
-            target,
-            measured_wrench=measured_wrench,
-            previous_tau=self._last_tau,
-        )
-        tau_unfiltered = self._clip_tau(result.first_tau)
-        tau_command = self._filtered_tau(tau_unfiltered, sample.tau)
-        self._last_tau = tau_command.copy()
-        return InferenceOutput(
-            tau_command=tau_command,
-            tau_unfiltered=tau_unfiltered,
-            **{
-                **common,
-                "joint_position_command": None,
-                "qp_result": result,
-                "target_wrench": target.wrenches[0].copy(),
-            },
-        )
+        raise RuntimeError(f"unsupported contact execution mode {mode!r}")
 
     def _fit_joint(self, values: np.ndarray, horizon: int) -> np.ndarray:
         return _fit_horizon(np.asarray(values, dtype=np.float64), horizon)
 
-    def _limit_mit_velocity(self, values: np.ndarray) -> np.ndarray:
+    def _limit_predicted_velocity(self, values: np.ndarray) -> np.ndarray:
         limit = np.asarray(self.config.execution.mit_velocity_limit, dtype=np.float64)
         if limit.ndim == 0:
             limit = np.repeat(limit, 7)
@@ -697,7 +629,7 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
         clipped = self._clip_tau(value)
         filtered = self._torque_filter.apply(
             clipped,
-            dt_s=self.controller.config.dt_s,
+            dt_s=self._control_dt_s,
             initial_tau=self._clip_tau(initial),
         )
         return self._clip_tau(filtered)
