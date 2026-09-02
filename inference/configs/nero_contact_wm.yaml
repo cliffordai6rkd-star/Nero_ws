@@ -1,6 +1,6 @@
 # Contact-aware state world-model inference configuration.
 # The checkpoint below uses PINN's canonical ContactWorldModel v2 contract:
-# q/dq/delta_q/tau history plus a direct-joint action condition. Change
+# q/dq/delta_q/tau history plus an absolute ee_pose action condition. Change
 # execution.mode to mtc, q, or tau as needed.
 dp_checkpoint:
   # Shared joint-action DP checkpoint for offline and deployed inference.
@@ -9,7 +9,8 @@ dp_checkpoint:
   device: cuda:0
   use_ema: true
 
-# DP outputs absolute seven-joint q, matching the WM action condition directly.
+# DP outputs absolute seven-joint q. Contact WM converts each action token to
+# absolute ee_pose with FK before applying the checkpoint action normalizer.
 action: joint
 
 architecture:
@@ -27,8 +28,9 @@ predictor:
   # false disables only the WM worker; DP action chunks are still executed.
   enabled: true
   mode: contact_world_model
-  # DP samples a fresh image window, then holds its 8-token direct-joint plan
-  # while the WM continues to run at the 100 Hz CAN/state rate.
+  # DP samples a fresh image window, then holds its 8-token action plan while
+  # the WM continues to run at the 100 Hz CAN/state rate. Joint actions are
+  # converted to ee_pose with FK before entering the WM.
   inference_mode: asynchronous
   action_chunk_mode: all
   action_condition_fill: chunk
@@ -59,7 +61,11 @@ dp_sampling:
 
 robot:
   urdf_path: ../../urdf/nero/nero_with_gripper.urdf
+  # The recorded teleop/ee_pose_follower signal is the robot SDK's ``tcp``;
+  # in this URDF that frame is link7. Keep gripper_tcp as the control frame,
+  # and convert joint DP actions to the data frame before Contact WM.
   frame_name: gripper_tcp
+  action_frame_name: link7
   locked_joint_names: [gripper, gripper_joint1, gripper_joint2]
 
 runtime:

@@ -60,29 +60,20 @@ def test_tau_mode_advances_dynamics_and_reports_applied_torque(tmp_path: Path) -
     assert not np.allclose(result.q, initial.q)
 
 
-def test_q_and_mit_modes_use_current_simulation_state(tmp_path: Path) -> None:
+def test_q_and_mtc_modes_use_current_simulation_state(tmp_path: Path) -> None:
     backend = _backend(tmp_path)
     q_target = backend.q + np.array([0.1, 0, 0, 0, 0, 0, 0])
 
     q_result = backend.step(MujocoCommand(mode="q", q_target=q_target))
     assert q_result.command_torque[0] > 0.0
 
-    mit_result = backend.step(
-        "mit",
+    mtc_result = backend.step(
+        "mtc",
         q_target=q_target,
         dq_target=np.zeros(7),
         tau_target=np.zeros(7),
     )
-    assert mit_result.command_torque[0] > 0.0
-
-
-def test_osc_qp_alias_accepts_direct_torque(tmp_path: Path) -> None:
-    backend = _backend(tmp_path)
-
-    result = backend.step("osc-qp", tau_command=np.full(7, 0.5))
-
-    assert np.allclose(result.command_torque, 0.5)
-    assert np.allclose(result.applied_torque, 0.5, atol=1e-12)
+    assert mtc_result.command_torque[0] > 0.0
 
 
 def test_legacy_position_output_without_control_mode_is_inferred_as_q(tmp_path: Path) -> None:

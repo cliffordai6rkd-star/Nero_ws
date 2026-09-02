@@ -78,7 +78,7 @@ class _FakePipeline:
                 joint_position_target=sample.q + 0.01,
                 tau_command=np.zeros(7),
             )
-        if self.mode == "mit":
+        if self.mode == "mtc":
             return SimpleNamespace(
                 **common,
                 joint_position_target=sample.q + 0.01,
@@ -108,8 +108,8 @@ def _backend(q0: np.ndarray) -> MujocoDynamicsBackend:
     )
 
 
-@pytest.mark.parametrize("mode", ["q", "mit", "tau", "osc_qp"])
-def test_runner_routes_all_four_modes_through_dynamic_backend(mode: str) -> None:
+@pytest.mark.parametrize("mode", ["q", "mtc", "tau"])
+def test_runner_routes_all_three_modes_through_dynamic_backend(mode: str) -> None:
     stream, q0 = _stream()
     pipeline = _FakePipeline(mode)
     backend = _backend(q0)
@@ -132,7 +132,7 @@ def test_runner_routes_all_four_modes_through_dynamic_backend(mode: str) -> None
     assert np.isfinite(result.simulated_q).all()
     assert np.isfinite(result.command_torque).all()
     assert np.any(np.abs(result.simulated_q[-1] - result.simulated_q[0]) > 1.0e-12)
-    if mode in {"tau", "osc_qp"}:
+    if mode == "tau":
         np.testing.assert_allclose(result.command_torque, 0.1, atol=1.0e-12)
 
 
@@ -216,7 +216,7 @@ def test_runner_uses_explicit_history_for_direct_ik_contract() -> None:
     assert pipeline.history_shapes == [((1, 3, 4, 3), (1, 1, 6))] * len(stream)
 
 
-def test_predictor_disabled_defaults_to_q_even_when_legacy_execution_default_is_osc_qp() -> None:
+def test_predictor_disabled_defaults_to_q_when_execution_mode_is_omitted() -> None:
     stream, q0 = _stream()
 
     class LegacyDirectPipeline(_FakePipeline):
@@ -224,7 +224,7 @@ def test_predictor_disabled_defaults_to_q_even_when_legacy_execution_default_is_
             super().__init__("q")
             self.config = SimpleNamespace(
                 predictor=SimpleNamespace(enabled=False),
-                execution=SimpleNamespace(mode="osc_qp"),
+                execution=SimpleNamespace(mode="tau"),
             )
 
         def step_direct_ik_observation_history(self, sample, images, wrenches):

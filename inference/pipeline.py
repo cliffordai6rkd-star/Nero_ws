@@ -2390,7 +2390,7 @@ class NeroInferencePipeline:
         frame_pose = getattr(self.model, "frame_pose", None)
         if not callable(frame_pose):
             raise RuntimeError(
-                "PINN action frame differs from OSC control frame, but the dynamics "
+                "PINN action frame differs from the control frame, but the dynamics "
                 "model does not expose frame_pose()"
             )
         return np.asarray(
@@ -2597,7 +2597,7 @@ def _uses_link7_target_gripper_tcp_current_contract(
 ) -> bool:
     """Deprecated compatibility probe for the removed legacy frame split.
 
-    Contact WM v2 uses direct seven-joint action tokens, so no checkpoint gets
+    Contact WM v2 uses absolute ee_pose action conditions; no checkpoint gets
     the historical ``link7``/``gripper_tcp`` override anymore.  Keep the
     symbol importable for downstream diagnostics while making the old special
     case permanently inactive.

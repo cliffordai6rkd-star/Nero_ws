@@ -7,7 +7,7 @@
 - 当前 `wrench_ext` 用于帮助高层策略判断接触状态，并生成接触敏感的末端位姿参考。
 - 未来接触力由后续动力学模型预测，作为底层控制器需要显式跟踪的物理目标。
 
-当前仓库已经完成高层 force-aware Diffusion Transformer、LeRobot v3 数据接入和训练工作区。PINN 未来力预测及 OSC-QP 硬件闭环仍属于后续开发阶段。
+当前仓库已经完成高层 force-aware Diffusion Transformer、LeRobot v3 数据接入和训练工作区。PINN 未来力预测及 Contact WM/MTC 硬件闭环仍属于后续开发阶段。
 
 ## 快速训练
 
@@ -56,7 +56,7 @@ Nero 数据采集
                              |
           future force predictor / PINN (planned)
                              |
-                  OSC-QP controller (planned)
+                  Contact WM/MTC controller (planned)
 ```
 
 高层策略严格只使用 wrist image 和 `wrench_ext`。关节位置、速度、加速度和力矩不输入高层 Diffusion Policy，而是保留给后续接触动力学预测模块。
@@ -354,6 +354,6 @@ setup.py                      package metadata and dependencies
 | 一般图像增强 | 接口存在，当前未启用 |
 | Nero 硬件在线 env runner | 未接入 |
 | PINN 未来高频接触力预测 | 开发中 |
-| OSC-QP 力矩闭环 | 规划中 |
+| Contact WM/MTC 力矩闭环 | 规划中 |
 
 第一阶段的目标是先验证：在相同 demonstration 数据上，force-aware cross-attention 和接触课程 mask 是否相对纯视觉策略改善接触阶段的动作稳定性。确认高层策略有效后，再接入未来力预测和底层控制闭环。

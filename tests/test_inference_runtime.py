@@ -1133,7 +1133,7 @@ def test_runtime_exception_immediately_resets_and_preserves_enabled_arm() -> Non
     arm, pipeline = _Arm(), _Pipeline()
 
     def fail_step(_value):
-        raise RuntimeError("synthetic OSC-QP failure")
+        raise RuntimeError("synthetic pipeline failure")
 
     pipeline.step = fail_step
     runtime = NeroInferenceRuntime(
@@ -1148,7 +1148,7 @@ def test_runtime_exception_immediately_resets_and_preserves_enabled_arm() -> Non
     )
     _use_fast_reset(runtime)
 
-    with pytest.raises(RuntimeError, match="synthetic OSC-QP failure"):
+    with pytest.raises(RuntimeError, match="synthetic pipeline failure"):
         runtime.run()
 
     assert len(arm.reset_commands) == 2  # startup and exception recovery

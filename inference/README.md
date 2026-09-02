@@ -90,7 +90,7 @@ cameras:
 
 - `action: eepose`（默认）：`[x,y,z,qx,qy,qz,qw]`，纯 DP 分支通过 IK 执行；
 - `action: joint`：绝对七轴 `q`，纯 DP 分支直接执行，不调用 IK。启用 Contact WM 时，
-  action token 也直接以 7 维绝对关节位置传入，不经过末端位姿 FK 或旧的 frame 特例。
+  每个 action token 先通过机器人 FK 转成绝对 `ee_pose=[x,y,z,qx,qy,qz,qw]`，再传入 WM。
 
 关闭 predictor 时的数据流为：
 
@@ -337,8 +337,9 @@ Python 环境，代码会明确报告该依赖错误。
 Contact WM v2 运行时数据流为：
 
 ```text
-image + wrench history -> DP checkpoint -> 8-token absolute joint action
-q/dq/delta_q/tau history + action/action_mask -> ContactWorldModel v2
+image + wrench history -> DP checkpoint -> 8-token action (joint or ee_pose)
+joint action -> FK -> 8-token absolute ee_pose
+q/dq/delta_q/tau history + ee_pose action/action_mask -> ContactWorldModel v2
   -> future q/dq/delta_q/tau/contact_state
 future q -> q command (mode=q) or MTC q_cmd
 future tau -> causal torque filter (mode=tau or MTC feed-forward)
@@ -485,8 +486,12 @@ WM tau_pred
 
 DP checkpoint 需遵循 diffusion-policy workspace 格式，并提供
 `policy.predict_action(obs)["action"]` future chunk 和 `action_target`。Contact WM v2
-要求每个 action 是绝对七轴关节位置 `[q1,...,q7]`；若 chunk 短于 8 个 token，尾部重复
-最后一帧补齐，长于 8 则截断。
+最终接收绝对 `ee_pose=[x,y,z,qx,qy,qz,qw]` action；`action: joint` 时由运行时对每个
+token 做 FK，`action: eepose` 时直接传入。FK 使用 `robot.action_frame_name`；Nero
+采集数据的 `teleop/ee_pose_follower` 标记为 `tcp`，对应当前 URDF 的 `link7`，所以
+Contact WM 配置应显式设置 `action_frame_name: link7`。`robot.frame_name` 仍可保持
+`gripper_tcp` 作为控制 frame，运行时会用固定的 link7 到 gripper_tcp 变换下发控制。
+chunk 短于 8 个 token 时尾部重复最后一帧补齐，长于 8 则截断。
 
 PINN checkpoint 支持 `/mnt/code/lcx/PINN` 原生格式
 `checkpoint["config"] + checkpoint["model"] + checkpoint["normalizer"]`。恢复出的

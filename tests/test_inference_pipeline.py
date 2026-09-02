@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -29,7 +30,7 @@ from inference.pipeline import (
     _select_action_chunk,
     _uses_link7_target_gripper_tcp_current_contract,
 )
-from nero_collection.control import DynamicsSnapshot, OSCQPConfig, OSCQPResult
+from nero_collection.control import DynamicsSnapshot
 
 
 torch = pytest.importorskip("torch")
@@ -342,13 +343,13 @@ class _FrameModel(_Model):
 class _Controller:
     def __init__(self) -> None:
         self.model = _Model()
-        self.config = OSCQPConfig(horizon_steps=2, dt_s=0.01)
+        self.config = SimpleNamespace(horizon_steps=2, dt_s=0.01)
         self.targets = []
 
     def optimize_mpc(self, q, dq, target, measured_wrench=None, previous_tau=None):
         self.targets.append(target)
         tau = np.full((2, 7), 50.0)
-        return OSCQPResult(
+        return SimpleNamespace(
             tau=tau,
             joint_accelerations=np.zeros((2, 7)),
             predicted_q=np.zeros((3, 7)),
@@ -376,7 +377,6 @@ def _config(tmp_path: Path) -> InferenceConfig:
             maximum_command_torque_nm=20.0,
         ),
         torque_filter=TorqueFilterConfig(enabled=False),
-        osc_qp=OSCQPConfig(horizon_steps=2, dt_s=0.01),
     )
 
 
@@ -848,7 +848,6 @@ dp_checkpoint: {path: dp.ckpt, device: cpu}
 pinn_checkpoint: {path: pinn.ckpt, device: cpu}
 robot: {urdf_path: robot.urdf}
 runtime: {collection_config: collection.yaml}
-osc_qp: {dt_s: 0.01}
 """,
         encoding="utf-8",
     )
@@ -1413,7 +1412,7 @@ def test_open_loop_collects_a_fresh_checkpoint_window_after_execution(
     pipeline.close()
 
 
-def test_open_loop_all_shifts_predictor_and_qp_to_remaining_chunk(
+def test_open_loop_all_shifts_predictor_to_remaining_chunk(
     tmp_path: Path,
 ) -> None:
     config = replace(
@@ -1495,7 +1494,7 @@ def test_minimum_jerk_target_interpolates_selected_action_before_direct_ik(
     pipeline.close()
 
 
-def test_minimum_jerk_plan_drives_predictor_and_qp_horizon(tmp_path: Path) -> None:
+def test_minimum_jerk_plan_drives_predictor_horizon(tmp_path: Path) -> None:
     config = replace(
         _config(tmp_path),
         predictor=PredictorConfig(

@@ -1,7 +1,7 @@
 """Inference pipeline for the native PINN Contact World Model v2.
 
 The model condition is ``q``, ``dq``, ``delta_q``, ``tau`` plus an 8-token
-direct joint action and mask.  The implementation reuses the mature DP
+absolute ee-pose action and mask.  The implementation reuses the mature DP
 observation/action scheduling in ``NeroInferencePipeline`` while keeping the
 Contact WM state contract explicit at the boundary.
 """
@@ -34,10 +34,11 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
     def __init__(self, config, **kwargs) -> None:
         if not bool(config.predictor.enabled):
             raise ValueError("ContactWMInferencePipeline requires predictor.enabled=true")
-        if str(config.action).strip().lower() != "joint":
+        action_semantic = str(config.action).strip().lower().replace("-", "_")
+        if action_semantic not in {"joint", "eepose"}:
             raise ValueError(
-                "Contact WM inference requires action: joint (the checkpoint action is "
-                "direct absolute joint position)"
+                "Contact WM inference requires action: joint or eepose; "
+                "the WM action condition is always absolute ee_pose"
             )
         mode = str(config.predictor.mode).strip().lower().replace("-", "_")
         if mode in {
@@ -91,6 +92,21 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
         checkpoint = getattr(model, "_inference_checkpoint_config", {})
         data_cfg = checkpoint.get("dataloader", {}) if isinstance(checkpoint, Mapping) else {}
         model_cfg = checkpoint.get("model", {}) if isinstance(checkpoint, Mapping) else {}
+        # Contact WM v2 is trained with an absolute end-effector pose action
+        # condition.  The high-level DP action may still be joint-space; it is
+        # converted with FK at the boundary below.
+        configured_action_key = None
+        if isinstance(data_cfg, Mapping):
+            configured_action_key = data_cfg.get("action_key")
+        if configured_action_key is None and isinstance(model_cfg, Mapping):
+            configured_action_key = model_cfg.get("action_key")
+        if configured_action_key is not None:
+            normalized_action_key = str(configured_action_key).strip().lower()
+            if normalized_action_key not in {"action.ee_pose", "ee_pose"}:
+                raise ValueError(
+                    "Contact WM action condition must use an ee_pose checkpoint key; "
+                    f"got {configured_action_key!r}"
+                )
         configured_inputs = tuple(getattr(model, "inputs", ()) or ())
         if not configured_inputs and isinstance(model_cfg, Mapping):
             configured_inputs = tuple(model_cfg.get("inputs", ()) or ())
@@ -112,7 +128,7 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
         )
         if action_dim != 7:
             raise ValueError(
-                "Contact WM direct joint action_dim must be 7; "
+                "Contact WM ee_pose action_dim must be 7; "
                 f"checkpoint declares {action_dim}"
             )
         self._contact_history_horizon = int(
@@ -363,9 +379,13 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
         self._append_world_model_observation(sample)
         current_control_pose = self.model.snapshot(sample.q, sample.dq).pose
         self._update_control_timestep(sample.timestamp_s)
-        # Contact WM actions are joint-space values; no FK frame conversion is needed
-        # (and a test/controller model need not expose frame_pose()).
-        current_action_pose = current_control_pose
+        # Keep the current pose in the same frame as DP/WM action tokens.  For
+        # the Nero dataset this is link7 (the SDK's ``tcp``), while the
+        # dynamics/control snapshot may use gripper_tcp.
+        current_action_pose = self._current_action_pose(
+            sample.q,
+            current_control_pose,
+        )
         dp_updated = self._update_dp_execution(
             sample.timestamp_s, current_action_pose, sample.q
         )
@@ -531,6 +551,9 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
                 )
             arrays[key] = value
 
+        # ``action`` is supplied in the DP semantic space (joint or ee_pose).
+        # Convert only after selecting the checkpoint-rate tokens so FK is
+        # evaluated on the exact action samples consumed by the WM.
         action_values = getattr(action, "values", action)
         action_values = np.asarray(action_values, dtype=np.float32)
         if action_values.ndim == 3 and action_values.shape[0] == 1:
@@ -548,6 +571,11 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
         else:
             action_condition = np.repeat(action_values[-1:, :], token_count, axis=0)
             action_condition[: action_values.shape[0]] = action_values
+
+        # The Contact WM checkpoint consumes absolute ee_pose actions.  Keep
+        # eepose DP actions unchanged, while converting joint DP actions with
+        # the shared dynamics model's FK implementation.
+        action_condition = self._actions_for_contact_wm(action_condition)
 
         device = _model_device(self.pinn)
         inputs = {
@@ -619,7 +647,7 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
         if source.ndim == 1:
             source = source[None]
         if source.ndim != 2 or source.shape[1] != 7:
-            raise RuntimeError(f"Contact WM direct action must be [H,7], got {source.shape}")
+            raise RuntimeError(f"Contact WM DP action must be [H,7], got {source.shape}")
         valid = min(source.shape[0], self._contact_action_horizon)
         values = np.repeat(source[-1:, :], self._contact_action_horizon, axis=0)
         values[:valid] = source[:valid]
@@ -627,10 +655,29 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
         # valid.  Keep that contract even during startup when only one DP
         # action is available.
         mask = np.ones(self._contact_action_horizon, dtype=np.float32)
+        values = self._actions_for_contact_wm(values)
         return (
             torch.as_tensor(values, dtype=torch.float32, device=device)[None],
             torch.as_tensor(mask, dtype=torch.float32, device=device)[None],
         )
+
+    def _actions_for_contact_wm(self, actions: np.ndarray) -> np.ndarray:
+        """Normalize DP actions to the Contact WM's absolute ``ee_pose`` contract."""
+
+        values = np.asarray(actions, dtype=np.float64)
+        if values.ndim != 2 or values.shape[1] != 7 or not np.all(np.isfinite(values)):
+            raise ValueError(
+                "Contact WM DP action condition must be finite with shape [T,7], "
+                f"got {values.shape}"
+            )
+        # ``_actions_for_wm`` already preserves eepose actions and performs
+        # frame-aware FK for joint actions.
+        converted = self._actions_for_wm(values)
+        if converted.shape != values.shape or not np.all(np.isfinite(converted)):
+            raise RuntimeError(
+                "Contact WM ee_pose action conversion returned an invalid [T,7] array"
+            )
+        return converted
 
     def _idle_contact_output(self, sample: InferenceInput, dp_updated: bool) -> InferenceOutput:
         """Hold the measured state while waiting for the first DP action."""

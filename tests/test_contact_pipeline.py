@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -22,8 +23,6 @@ from inference.contact_pipeline import ContactWMInferencePipeline  # noqa: E402
 from inference.pipeline import InferenceInput  # noqa: E402
 from nero_collection.control import (  # noqa: E402
     DynamicsSnapshot,
-    OSCQPConfig,
-    OSCQPResult,
 )
 
 
@@ -69,34 +68,48 @@ class _ContactWM(torch.nn.Module):
         self.inputs = []
         self._inference_checkpoint_config = {
             "dataloader": {
-                "action_condition_features": [
-                    "absolute_pose",
-                    "current_ee_pose",
-                    "relative_pose",
-                ],
-                "action_condition_mode": "composite",
+                "action_key": "action.ee_pose",
+                "action_condition_mode": "direct",
+                "action_condition_horizon": 8,
             },
             "model": {
-                "state_contract": "q_tau_contact",
+                "inputs": ["q", "dq", "delta_q", "tau"],
+                "action_dim": 7,
                 "state_estimator": {"sampling_dt": 0.01},
             },
         }
         self._inference_normalizer = None
 
-    def predict(self, inputs):
+    def predict(self, inputs, **_kwargs):
         self.inputs.append(inputs)
         assert set(inputs) == {
             "q",
+            "dq",
+            "delta_q",
             "tau",
-            "target_relative_pose",
+            "action",
+            "action_mask",
         }
         assert inputs["q"].shape == (1, 5, 7)
+        assert inputs["dq"].shape == (1, 5, 7)
+        assert inputs["delta_q"].shape == (1, 5, 7)
         assert inputs["tau"].shape == (1, 5, 7)
-        assert inputs["target_relative_pose"].shape == (1, 8, 21)
+        assert inputs["action"].shape == (1, 8, 7)
+        assert inputs["action_mask"].shape == (1, 8)
         q = torch.full((1, 4, 7), 0.1)
+        dq = torch.zeros((1, 4, 7))
+        delta_q = torch.zeros((1, 4, 7))
         tau = torch.full((1, 4, 7), 0.2)
         contact = torch.ones((1, 4, 1))
-        return {"state_pred": {"q": q, "tau": tau, "contact_state": contact}}
+        return {
+            "state_pred": {
+                "q": q,
+                "dq": dq,
+                "delta_q": delta_q,
+                "tau": tau,
+                "contact_state": contact,
+            }
+        }
 
 
 class _Model:
@@ -112,6 +125,10 @@ class _Model:
             np.eye(7), np.zeros(7), np.zeros((6, 7)), np.zeros(6), np.eye(4)
         )
 
+    def gravity_torque(self, q):
+        del q
+        return np.zeros(7)
+
 
 class _FKModel(_Model):
     def frame_pose(self, q, frame_name):
@@ -124,24 +141,7 @@ class _FKModel(_Model):
 class _Controller:
     def __init__(self):
         self.model = _Model()
-        self.config = OSCQPConfig(horizon_steps=2, dt_s=0.01)
-        self.targets = []
-
-    def optimize_mpc(self, q, dq, target, **_kwargs):
-        del q, dq
-        self.targets.append(target)
-        return OSCQPResult(
-            tau=np.ones((2, 7)),
-            joint_accelerations=np.zeros((2, 7)),
-            predicted_q=np.zeros((2, 7)),
-            predicted_dq=np.zeros((2, 7)),
-            predicted_wrenches=np.zeros((2, 6)),
-            status="solved",
-            iterations=1,
-            solve_time_s=0.0,
-            objective=0.0,
-            max_constraint_violation=0.0,
-        )
+        self.config = SimpleNamespace(horizon_steps=2, dt_s=0.01)
 
 
 def _config(tmp_path: Path, mode: str) -> InferenceConfig:
@@ -154,6 +154,7 @@ def _config(tmp_path: Path, mode: str) -> InferenceConfig:
         predictor=PredictorConfig(
             enabled=True,
             mode="contact_world_model_opd",
+            inference_mode="open_loop",
         ),
         execution=ExecutionConfig(
             mode=mode,
@@ -163,7 +164,6 @@ def _config(tmp_path: Path, mode: str) -> InferenceConfig:
             mit_feedback_torque_limit=(5.0,) * 7,
         ),
         torque_filter=TorqueFilterConfig(enabled=False),
-        osc_qp=OSCQPConfig(horizon_steps=2, dt_s=0.01),
     )
 
 
@@ -179,27 +179,27 @@ def _sample(timestamp=0.0):
     )
 
 
-def test_contact_config_exposes_four_execution_modes(tmp_path: Path):
+def test_contact_config_exposes_three_execution_modes(tmp_path: Path):
     config_file = tmp_path / "inference.yaml"
     config_file.write_text(
         """
 dp_checkpoint: {path: dp.pt, device: cpu}
 pinn_checkpoint: {path: wm.pt, device: cpu}
 predictor: {enabled: true, mode: contact_world_model_opd}
-execution: {mode: osc-qp, mit_kp: 10, mit_kd: 1, mit_velocity_limit: 2}
+execution: {mode: mtc, mit_kp: 10, mit_kd: 1, mit_velocity_limit: 2}
 robot: {urdf_path: robot.urdf}
 runtime: {collection_config: collection.yaml}
 """,
         encoding="utf-8",
     )
     config = load_inference_config(config_file)
-    assert config.execution.mode == "osc_qp"
+    assert config.execution.mode == "mtc"
     assert config.execution.mit_kp == (10.0,) * 7
     assert config.execution.mit_velocity_limit == (2.0,) * 7
 
 
-@pytest.mark.parametrize("mode", ["mit", "q", "tau", "osc_qp"])
-def test_contact_pipeline_has_four_execution_modes(tmp_path: Path, mode: str):
+@pytest.mark.parametrize("mode", ["mtc", "q", "tau"])
+def test_contact_pipeline_has_three_execution_modes(tmp_path: Path, mode: str):
     controller = _Controller()
     pipeline = ContactWMInferencePipeline(
         _config(tmp_path, mode),
@@ -214,10 +214,6 @@ def test_contact_pipeline_has_four_execution_modes(tmp_path: Path, mode: str):
     assert output.tau_target.shape == (7,)
     if mode == "q":
         assert output.joint_position_command is not None
-    elif mode == "osc_qp":
-        assert output.qp_result is not None
-        assert controller.targets[-1].joint_accelerations is not None
-        assert controller.targets[-1].joint_torques is not None
     else:
         assert output.joint_position_command is None
     pipeline.close()
@@ -250,17 +246,16 @@ def test_joint_dp_actions_are_fk_converted_before_contact_wm(tmp_path: Path):
 
     pipeline.step(_sample())
 
-    condition = wm.inputs[-1]["target_relative_pose"][0].detach().cpu().numpy()
+    condition = wm.inputs[-1]["action"][0].detach().cpu().numpy()
     expected_translation = np.repeat([[0.1, 0.2, 0.3]], 8, axis=0)
     np.testing.assert_allclose(condition[:, :3], expected_translation)
-    np.testing.assert_allclose(condition[:, 7:10], 0.0)
-    np.testing.assert_allclose(condition[:, 14:17], expected_translation)
+    np.testing.assert_allclose(condition[:, 3:], [[0.0, 0.0, 0.0, 1.0]] * 8)
     pipeline.close()
 
 
-def test_contact_pipeline_clamps_mit_velocity_and_feedback(tmp_path: Path):
+def test_contact_pipeline_clamps_mtc_velocity_and_feedback(tmp_path: Path):
     pipeline = ContactWMInferencePipeline(
-        _config(tmp_path, "mit"),
+        _config(tmp_path, "mtc"),
         dp_model=_DP(),
         pinn_model=_ContactWM(),
         controller=_Controller(),
@@ -272,8 +267,8 @@ def test_contact_pipeline_clamps_mit_velocity_and_feedback(tmp_path: Path):
     pipeline.close()
 
 
-def test_contact_pipeline_applies_feedback_limit_to_firmware_gains(tmp_path: Path):
-    config = _config(tmp_path, "mit")
+def test_contact_pipeline_reports_configured_mtc_gains(tmp_path: Path):
+    config = _config(tmp_path, "mtc")
     config = replace(
         config,
         execution=replace(
@@ -300,15 +295,16 @@ def test_contact_pipeline_applies_feedback_limit_to_firmware_gains(tmp_path: Pat
         output.tau_command - output.tau_target,
         atol=1.0e-10,
     )
-    assert np.max(np.abs(firmware_feedback)) <= 0.05 + 1.0e-10
-    assert np.any(output.mit_kp < np.asarray(config.execution.mit_kp))
+    assert np.isfinite(firmware_feedback).all()
+    np.testing.assert_allclose(output.mit_kp, config.execution.mit_kp)
+    np.testing.assert_allclose(output.mit_kd, config.execution.mit_kd)
     pipeline.close()
 
 
-def test_contact_pipeline_zeroes_feedback_when_feedforward_uses_torque_cap(
+def test_contact_pipeline_clips_mtc_total_torque(
     tmp_path: Path,
 ):
-    config = _config(tmp_path, "mit")
+    config = _config(tmp_path, "mtc")
     config = replace(
         config,
         safety=replace(config.safety, maximum_command_torque_nm=(0.2,) * 7),
@@ -326,8 +322,6 @@ def test_contact_pipeline_zeroes_feedback_when_feedforward_uses_torque_cap(
         controller=_Controller(),
     )
     output = pipeline.step(_sample())
-    np.testing.assert_allclose(output.tau_target, 0.2)
-    np.testing.assert_allclose(output.mit_kp, 0.0)
-    np.testing.assert_allclose(output.mit_kd, 0.0)
-    np.testing.assert_allclose(output.tau_command, output.tau_target)
+    assert np.max(np.abs(output.tau_target)) <= 0.2 + 1.0e-10
+    assert np.max(np.abs(output.tau_command)) <= 0.2 + 1.0e-10
     pipeline.close()

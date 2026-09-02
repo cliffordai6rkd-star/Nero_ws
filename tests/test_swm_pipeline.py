@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -19,7 +20,7 @@ from inference.config import (
 )
 from inference.pipeline import InferenceInput
 from inference.swm_pipeline import SWMInferencePipeline
-from nero_collection.control import DynamicsSnapshot, OSCQPConfig
+from nero_collection.control import DynamicsSnapshot
 
 
 class _DP(torch.nn.Module):
@@ -98,7 +99,7 @@ class _Model:
 class _Controller:
     def __init__(self):
         self.model = _Model()
-        self.config = OSCQPConfig(horizon_steps=2, dt_s=0.01)
+        self.config = SimpleNamespace(horizon_steps=2, dt_s=0.01)
 
 
 def _sample(timestamp: float, q_cmd: np.ndarray) -> InferenceInput:
@@ -123,7 +124,6 @@ def test_swm_uses_training_state_and_action_contract(tmp_path: Path):
         action="joint",
         predictor=PredictorConfig(mode="swm"),
         execution=ExecutionConfig(mode="q"),
-        osc_qp=OSCQPConfig(horizon_steps=2, dt_s=0.01),
     )
     swm = _SWM()
     pipeline = SWMInferencePipeline(
@@ -154,7 +154,7 @@ runtime: {collection_config: collection.yaml}
         encoding="utf-8",
     )
     config = load_inference_config(path)
-    assert config.predictor.mode == "swm_opd"
+    assert config.predictor.mode == "contact_world_model_opd"
     assert config.execution.mode == "mtc"
     assert config.execution.mtc_alpha == 0.25
     assert config.execution.mtc_q_cmd_source == "wm_state"
@@ -177,7 +177,6 @@ def test_swm_mtc_preserves_firmware_gains_and_sends_residual(tmp_path: Path):
         ),
         safety=SafetyConfig(maximum_joint_position_step_rad=(1.0,) * 7),
         torque_filter=TorqueFilterConfig(enabled=False),
-        osc_qp=OSCQPConfig(horizon_steps=2, dt_s=0.01),
     )
     controller = _Controller()
     controller.model.velocity_limit = np.full(7, 100.0)
@@ -223,7 +222,6 @@ def test_swm_tau_mode_keeps_predicted_torque_semantics(tmp_path: Path):
         execution=ExecutionConfig(mode="tau"),
         safety=SafetyConfig(maximum_joint_position_step_rad=(1.0,) * 7),
         torque_filter=TorqueFilterConfig(enabled=False),
-        osc_qp=OSCQPConfig(horizon_steps=2, dt_s=0.01),
     )
     pipeline = SWMInferencePipeline(
         config,

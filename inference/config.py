@@ -165,7 +165,9 @@ class InferenceConfig:
     robot: RobotConfig
     runtime: RuntimeConfig
     # Semantic contract of each seven-dimensional DP action.
-    # ``eepose`` is [x,y,z,qx,qy,qz,qw]; ``joint`` is absolute arm q.
+    # ``eepose`` is [x,y,z,qx,qy,qz,qw]; ``joint`` is absolute arm q.  Contact
+    # WM action conditions are always absolute ee_pose; joint actions are FK
+    # converted at the WM boundary.
     action: str = "eepose"
     # Canonical name for the Contact World Model checkpoint.  The historical
     # ``pinn_checkpoint`` field remains as a constructor/read compatibility
