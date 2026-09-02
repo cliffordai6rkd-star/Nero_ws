@@ -16,13 +16,17 @@ def main() -> None:
         description="Nero DP inference with direct-q/tau and MTC control"
     )
     parser.add_argument("--config", required=True)
-    mode = parser.add_mutually_exclusive_group(required=True)
+    mode = parser.add_mutually_exclusive_group(required=False)
     mode.add_argument(
         "--check",
         action="store_true",
         help="restore configured checkpoint-defined models and validate runtime configuration",
     )
-    mode.add_argument("--run", action="store_true", help="start the online inference loop")
+    mode.add_argument(
+        "--run",
+        action="store_true",
+        help="start the online inference loop (the default when no mode is given)",
+    )
     parser.add_argument("--backend", choices=("pyagxarm", "mock"), default=None)
     parser.add_argument("--duration", type=float, default=None)
     parser.add_argument(
@@ -38,6 +42,8 @@ def main() -> None:
     parser.add_argument("--skip-can-setup", action="store_true")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
+    if not args.check and not args.run:
+        args.run = True
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper()),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",

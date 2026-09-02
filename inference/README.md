@@ -176,9 +176,7 @@ beta schedule、prediction type、模型权重和 normalizer 保持不变。DDIM
 退出。也可以用 `--single-step` 启动后直接处于等待状态：
 
 ```bash
-python -m inference.cli \
-  --config inference/configs/nero_contact_wm.yaml \
-  --run --single-step --backend pyagxarm --enable-command
+python -m inference.cli --config inference/configs/nero_contact_wm.yaml
 ```
 
 单步请求会保留到下一张有效相机帧和 CAN 状态都可用，因此一次 `s` 不会因为传感器暂时
@@ -273,20 +271,24 @@ execution:
   mode: mtc  # q / tau
 ```
 
-在线启动时需让当前工作区和 PINN 源码都可导入：
+Ubuntu 20.04 上使用 `uv` 配置推理环境：
 
 ```bash
-conda run -n nero_dp bash -lc '\
-  cd /home/rei/mnt/code/lcx/nero_ws && \
-  PYTHONPATH=.:/home/rei/mnt/code/lcx/PINN python -m inference.cli \
-    --config inference/configs/nero_contact_wm.yaml \
-    --run --backend pyagxarm --enable-command'
+sudo apt update
+sudo apt install -y build-essential pkg-config git curl libgl1 libglib2.0-0 \
+  libglfw3 can-utils v4l-utils
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="${HOME}/.local/bin:${PATH}"
+cd /home/rei/mnt/code/lcx/nero_ws
+uv python install 3.10
+bash setup_env.sh
+source .venv/bin/activate
 ```
 
-例如先只检查 checkpoint 和契约：
+启动在线推理：
 
 ```bash
-python -m inference.cli --config inference/configs/nero_contact_wm.yaml --check
+python -m inference.cli --config inference/configs/nero_contact_wm.yaml
 ```
 
 ## H5 -> MuJoCo 独立仿真分支
@@ -516,12 +518,6 @@ predictor:
   mode: contact_world_model
   action_chunk_mode: first
   action_condition_fill: chunk
-```
-
-检查配置并真实恢复两个 checkpoint：
-
-```bash
-python -m inference.cli --config inference/configs/nero_contact_wm.yaml --check
 ```
 
 Mock 端到端运行（仍会真实加载三个 checkpoint）：

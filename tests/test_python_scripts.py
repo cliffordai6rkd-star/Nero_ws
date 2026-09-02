@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-import subprocess
 from types import SimpleNamespace
 
 import h5py
@@ -112,17 +111,8 @@ def test_open_rerun_uses_current_python_environment(tmp_path: Path, monkeypatch)
     ]
 
 
-def test_setup_env_resolves_named_environment(monkeypatch) -> None:
-    def fake_run(command, **kwargs):
-        assert command[-3:] == ["env", "list", "--json"]
-        return subprocess.CompletedProcess(
-            command,
-            0,
-            stdout=json.dumps({"envs": ["/opt/conda", "/opt/conda/envs/nero"]}),
-        )
+def test_setup_env_defaults_to_uv_python() -> None:
+    args = setup_env._parse_args([])
 
-    monkeypatch.setattr(setup_env.subprocess, "run", fake_run)
-
-    assert setup_env._find_conda_environment("conda", "nero") == Path(
-        "/opt/conda/envs/nero"
-    )
+    assert args.venv == ".venv"
+    assert args.python_version == "3.10"

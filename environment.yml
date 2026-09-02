@@ -1,3 +1,5 @@
+# Legacy Conda manifest. Use ``bash setup_env.sh`` (uv) for the supported
+# Ubuntu inference environment.
 name: nero
 channels:
   - conda-forge

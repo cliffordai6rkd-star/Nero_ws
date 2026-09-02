@@ -93,58 +93,31 @@ python scripts/replay_h5_hardware.py runs/next_background_dataruns/next_backgrou
 - wipe_board双相机30hz遥操数据
 - insert_usb双相机30hz遥操数据
 
-## 推理命令
+## uv 环境与推理
+
+Ubuntu 20.04 上安装系统依赖和 `uv`：
 
 ```bash
-python -m inference.cli --config inference/configs/nero_direct_ik.yaml --check
+sudo apt update
+sudo apt install -y build-essential pkg-config git curl libgl1 libglib2.0-0 \
+  libglfw3 can-utils v4l-utils
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="${HOME}/.local/bin:${PATH}"
 ```
 
-```bash
-python scripts/infer_h5_mujoco.py \
-  runs/wipe_board/episode_0024_20260815_153252.h5 \
-  --config inference/configs/nero_direct_ik.yaml \
-  --simulation-config calibration/config.yaml \
-  --mode q \
-  --observation-mode recorded \
-  --max-steps 200 \
-  --output /tmp/nero_direct_ik.npz \
-  --scene-output /tmp/nero_direct_ik.xml
-```
+在项目根目录创建并同步 Python 3.10 环境（DP 依赖要求 Python 小于 3.11）：
 
 ```bash
-python scripts/infer_h5_mujoco.py \
-  runs/wipe_board/episode_0024_20260815_153252.h5 \
-  --config inference/configs/nero_contact_wm.yaml \
-  --simulation-config calibration/config.yaml \
-  --mode mtc \
-  --observation-mode recorded \
-  --max-steps 200 \
-  --output /tmp/nero_contact_wm_mtc.npz \
-  --scene-output /tmp/nero_contact_wm_mtc.xml
+cd /home/rei/mnt/code/lcx/nero_ws
+uv python install 3.10
+bash setup_env.sh
+source .venv/bin/activate
 ```
 
-```bash
-python scripts/infer_h5_mujoco.py \
-  runs/wipe_board/episode_0024_20260815_153252.h5 \
-  --config inference/configs/nero_contact_wm.yaml \
-  --simulation-config calibration/config.yaml \
-  --mode q \
-  --observation-mode recorded \
-  --max-steps 200 \
-  --output /tmp/nero_contact_wm_q.npz \
-  --scene-output /tmp/nero_contact_wm_q.xml
-```
+启动推理：
 
 ```bash
-python scripts/infer_h5_mujoco.py \
-  runs/wipe_board/episode_0024_20260815_153252.h5 \
-  --config inference/configs/nero_contact_wm.yaml \
-  --simulation-config calibration/config.yaml \
-  --mode tau \
-  --observation-mode recorded \
-  --max-steps 200 \
-  --output /tmp/nero_contact_wm_tau.npz \
-  --scene-output /tmp/nero_contact_wm_tau.xml
+python -m inference.cli --config inference/configs/nero_contact_wm.yaml
 ```
 
 标定夹爪零点

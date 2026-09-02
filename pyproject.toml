@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "nero-collection"
 version = "0.1.0"
 description = "Nero dual-arm teleoperation data collection."
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.11"
 dependencies = [
     "av>=15,<16",
     "cmeel-tinyxml2>=10,<11; platform_system == 'Linux'",
@@ -29,14 +29,59 @@ nero-inference = "inference.cli:main"
 
 [project.optional-dependencies]
 tau-ext-inference = [
-    "torch>=2.3,<3",
+    "torch==2.7.1",
 ]
 lerobot-dp = [
     "lerobot==0.4.0",
 ]
+inference = [
+    "torch==2.7.1",
+    "torchvision==0.22.1",
+    "torchcodec==0.5",
+    "lerobot==0.4.0",
+]
+hardware = [
+    "python-can>=3.3.4",
+    "pyAgxArm @ git+https://github.com/agilexrobotics/pyAgxArm.git@799b8412fbe8b9156bc9892d3dbeb2df7e98be71",
+]
+legacy-dp = [
+    "diffusion-policy[training,test]",
+]
 gpu-identification = [
     "jax[cuda12]==0.6.2; platform_system == 'Linux' and python_version < '3.11'",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=7,<9",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+conflicts = [
+    [
+        { extra = "gpu-identification" },
+        { extra = "inference" },
+    ],
+    [
+        { extra = "gpu-identification" },
+        { extra = "tau-ext-inference" },
+    ],
+    [
+        { extra = "gpu-identification" },
+        { extra = "legacy-dp" },
+    ],
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }
+diffusion-policy = { path = "third_party/diffusion_policy", editable = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
