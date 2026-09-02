@@ -764,10 +764,10 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
             ddq_future[1:] = np.diff(dq_future, axis=0) / dt
         q_trajectory = q_future.copy()
         q_command = q_trajectory[0].copy()
-        # Keep the raw WM prediction for diagnostics; only ``tau_command`` is
-        # passed through the causal safety filter before transport.
+        # Clip the WM prediction before any MTC blending.  MTC applies the
+        # causal torque filter to the final blended total below; pure ``tau``
+        # mode applies it to this WM total directly.
         tau_pred = self._clip_tau(tau_future[0])
-        tau_ff = self._filtered_tau(tau_pred, sample.tau)
         contact = reference.get("contact_state")
         contact0 = None if contact is None else np.asarray(contact[0]).copy()
         common = dict(
@@ -782,7 +782,7 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
             wm_inference_time_s=self._last_wm_inference_time_s,
             joint_position_target=q_command.copy(),
             joint_velocity_target=dq_future[0].copy(),
-            torque_target=tau_ff.copy(),
+            torque_target=tau_pred.copy(),
             contact_state=contact0,
             control_mode=self._contact_execution_mode,
             joint_position_trajectory=q_trajectory.copy(),
@@ -815,7 +815,7 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
             mtc = self.mtc_controller.compute(
                 q=sample.q,
                 dq=sample.dq,
-                tau_pred=tau_ff,
+                tau_pred=tau_pred,
                 q_hat=q_command,
                 delta_q_hat=delta_for_control,
             )
@@ -828,11 +828,12 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
             # residual so diagnostics describe the torque the fixed-gain MIT
             # command can actually request at this sampled q/dq.
             requested_total = self._clip_tau(mtc.tau_command)
-            t_ff = self._clip_tau(requested_total - mtc.tau_pd)
+            filtered_total = self._filtered_tau(requested_total, sample.tau)
+            t_ff = self._clip_tau(filtered_total - mtc.tau_pd)
             effective_total = self._clip_tau(mtc.tau_pd + t_ff)
             return InferenceOutput(
                 tau_command=effective_total,
-                tau_unfiltered=effective_total.copy(),
+                tau_unfiltered=requested_total.copy(),
                 joint_position_command=None,
                 mit_kp=kp,
                 mit_kd=kd,
@@ -847,9 +848,11 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
                 },
             )
         if self._contact_execution_mode == "tau":
+            tau_ff = self._filtered_tau(tau_pred, sample.tau)
             return InferenceOutput(
                 tau_command=tau_ff.copy(), tau_unfiltered=tau_pred.copy(),
-                joint_position_command=None, **common
+                joint_position_command=None,
+                **{**common, "torque_target": tau_ff.copy()},
             )
 
         raise RuntimeError(f"unsupported Contact WM execution mode {self._contact_execution_mode!r}")
@@ -946,10 +949,17 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
             previous = command
         return result
 
-    def _filtered_tau(self, value: np.ndarray, initial: np.ndarray) -> np.ndarray:
+    def _filtered_tau(
+        self,
+        value: np.ndarray,
+        initial: np.ndarray,
+        *,
+        dt_s: float | None = None,
+    ) -> np.ndarray:
         clipped = self._clip_tau(value)
+        filter_dt_s = self._control_dt_s if dt_s is None else float(dt_s)
         filtered = self._torque_filter.apply(
-            clipped, dt_s=self._control_dt_s, initial_tau=self._clip_tau(initial)
+            clipped, dt_s=filter_dt_s, initial_tau=self._clip_tau(initial)
         )
         return self._clip_tau(filtered)
 

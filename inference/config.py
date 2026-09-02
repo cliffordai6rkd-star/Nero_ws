@@ -51,7 +51,8 @@ class ExecutionConfig:
     mit_velocity_limit: float | tuple[float, ...] = 5.0
     mit_feedback_torque_limit: float | tuple[float, ...] | None = None
     # Multi-target controller (MTC) blends a data-style q/v/gravity torque
-    # candidate with the WM-predicted total torque.
+    # candidate with the WM-predicted total torque.  ``mtc_alpha`` is the WM
+    # weight; the q/v candidate receives ``1 - mtc_alpha``.
     mtc_alpha: float = 0.5
     # ``wm_state`` uses q_hat; ``wm_delta`` reconstructs q_cmd_hat as
     # q_hat + delta_q_hat.  ``q_hat`` and ``q_cmd_hat`` are accepted aliases.

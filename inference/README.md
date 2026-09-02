@@ -232,12 +232,12 @@ python scripts/infer_h5_direct_ik.py \
 使用配置时，通过 `execution.mode` 选择三种执行方式：
 
 - `mtc`：计算 `tau_qv = Kp(q_cmd-q)-Kd*dq+g(q)`，再与 WM 第一帧
-  `tau_pred` 按 `mtc_alpha` 融合。`mtc_q_cmd_source: wm_state` 使用 `q_hat`；
-  `wm_delta` 使用 `q_hat + delta_q_hat`。固件继续使用配置的 `mit_kp/mit_kd`、
-  零速度目标，`torque_target` 只发送 `tau_cmd - tau_pd` 的残差，避免重复叠加
-  固件已经计算的位置/速度反馈。timestamp asynchronous worker 使用
-  `tau_cmd=(1-alpha)tau_pd+alpha*tau_ref`，其中 `alpha` 是 WM 权重，`q_ref` 按
-  100 Hz 直接消费。
+  `tau_pred` 融合；`mtc_alpha` 统一表示 WM 总力矩权重，即
+  `tau_cmd=(1-alpha)tau_qv+alpha*tau_pred`。`mtc_q_cmd_source: wm_state`
+  使用 `q_hat`；`wm_delta` 使用 `q_hat + delta_q_hat`。固件继续使用配置的
+  `mit_kp/mit_kd`、零速度目标，`torque_target` 只发送 `tau_cmd - tau_pd`
+  的残差，避免重复叠加固件已经计算的位置/速度反馈。异步 worker 使用同一
+  公式，`q_ref` 按 100 Hz 直接消费。
 - `q`：对预测 q 做关节限位/单周期步长保护后调用 `command_joint_positions()`。
 - `tau`：仅下发限幅/滤波后的 WM `tau_pred`。硬件使用 MIT 报文作为传输
   envelope，但 `q/dq` 反馈增益固定为零，因此不会叠加 `kp/kd`、重力或其它控制项。
@@ -477,10 +477,18 @@ worker 在 `StateHistoryBuffer` 和 action plan 上做 snapshot，并把推理�
 `timing.report_interval_s` 汇总打印实际控制频率、完整周期最新耗时、PINN/DP
 平均推理耗时。汇总打印不会在每个控制周期执行，减少终端 I/O 对实时性的影响。
 
-`tau` 链的第一帧预测不会绕过滤波直接下发。`torque_filter` 在最终力矩限幅内执行：
+`torque_filter` 对最终准备下发的总力矩执行；MTC 不会在 q/v 与 WM 融合前滤波：
 
 ```text
-WM tau_pred
+MTC: WM tau_ref -> torque clip
+  -> q/v + WM total-torque blend
+  -> causal median spike rejection
+  -> first-order low-pass
+  -> hard per-axis slew-rate limit
+  -> final torque clip
+  -> MIT t_ff residual
+
+tau mode: WM tau_pred
   -> torque clip
   -> causal median spike rejection
   -> first-order low-pass
@@ -492,8 +500,8 @@ WM tau_pred
 `median_window` 必须为正奇数；窗口越大会抑制更长尖峰，但也增加相位延迟。
 `lowpass_cutoff_hz: null` 可关闭低通，`rate_limit_nm_s: null` 可关闭硬变化率限制。
 滤波器以当前实测关节力矩作为首周期状态，并在每次 `reset()` 时清空历史。
-`InferenceOutput.tau_unfiltered` 保留限幅后的 WM 原始输出，
-`InferenceOutput.tau_command` 是实际准备下发的滤波后输出。
+`InferenceOutput.tau_unfiltered` 保留滤波前的限幅值（MTC 为融合总力矩，`tau`
+模式为 WM 力矩），`InferenceOutput.tau_command` 是实际准备下发的滤波后输出。
 
 DP checkpoint 需遵循 diffusion-policy workspace 格式，并提供
 `policy.predict_action(obs)["action"]` future chunk 和 `action_target`。Contact WM v2

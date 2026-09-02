@@ -40,8 +40,8 @@ predictor:
 execution:
   # mtc | q | tau
   mode: mtc
-  # MTC blends the data-side q/v torque with Contact WM tau_ref;
-  # mtc_alpha is the WM torque weight in the timestamped runtime.
+  # MTC blends q/v+gravity with Contact WM's predicted total torque;
+  # mtc_alpha is the WM torque weight in both synchronous and timestamped paths.
   mtc_alpha: 0.5
   # The timestamped runtime uses WM q_ref directly (legacy sync mode keeps
   # wm_state/wm_delta compatibility through the ContactWM pipeline).

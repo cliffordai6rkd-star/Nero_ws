@@ -325,3 +325,31 @@ def test_contact_pipeline_clips_mtc_total_torque(
     assert np.max(np.abs(output.tau_target)) <= 0.2 + 1.0e-10
     assert np.max(np.abs(output.tau_command)) <= 0.2 + 1.0e-10
     pipeline.close()
+
+
+def test_contact_mtc_filters_final_blended_torque(tmp_path: Path):
+    config = replace(
+        _config(tmp_path, "mtc"),
+        torque_filter=TorqueFilterConfig(
+            enabled=True,
+            median_window=1,
+            lowpass_cutoff_hz=1.0,
+            rate_limit_nm_s=None,
+        ),
+    )
+    pipeline = ContactWMInferencePipeline(
+        config,
+        dp_model=_DP(),
+        pinn_model=_ContactWM(),
+        controller=_Controller(),
+    )
+    output = pipeline.step(_sample())
+
+    # q/v and WM each contribute 0.1 before filtering.  The filter must see
+    # their blended total (0.15), not WM tau (0.2) on its own.
+    filter_alpha = 1.0 - np.exp(-2.0 * np.pi * 1.0 * 0.01)
+    expected_total = 0.15 * filter_alpha
+    np.testing.assert_allclose(output.tau_unfiltered, 0.15, atol=1.0e-8)
+    np.testing.assert_allclose(output.tau_command, expected_total, atol=1.0e-8)
+    np.testing.assert_allclose(output.tau_target, expected_total - 0.1, atol=1.0e-8)
+    pipeline.close()

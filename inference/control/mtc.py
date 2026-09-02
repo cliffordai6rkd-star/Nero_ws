@@ -65,6 +65,8 @@ class MTCController:
 
     ``tau_qv`` follows the data collection semantics exactly: the desired
     velocity is zero and the damping term uses the measured current velocity.
+    ``alpha`` is the WM total-torque weight; the q/v candidate receives
+    ``1 - alpha``.
     ``wm_delta`` reconstructs the command represented by the Contact WM contract as
     ``q_hat + delta_q_hat``; ``wm_state`` uses ``q_hat`` directly.
     """
@@ -132,7 +134,10 @@ class MTCController:
         gravity = self._gravity_torque(measured_q)
         tau_pd = self.kp * (q_cmd - measured_q) - self.kd * measured_dq
         tau_qv = tau_pd + gravity
-        tau_command = self.alpha * tau_qv + (1.0 - self.alpha) * predicted_tau
+        # ``alpha`` is the WM total-torque weight for both synchronous and
+        # timestamped execution paths.  The q/v candidate therefore receives
+        # the complementary weight.
+        tau_command = (1.0 - self.alpha) * tau_qv + self.alpha * predicted_tau
         return MTCResult(
             q_cmd=q_cmd,
             gravity=gravity,
@@ -153,21 +158,23 @@ class MTCController:
     ) -> MTCResult:
         """Compute the asynchronous WM-weighted blend at one control tick.
 
-        The timestamped runtime defines ``alpha`` as the WM torque weight and
-        intentionally omits the legacy gravity candidate.  The original
-        :meth:`compute` method remains unchanged for synchronous compatibility.
+        ``alpha`` is the WM total-torque weight, matching :meth:`compute`.
+        The q/v candidate includes the measured-state gravity torque so the
+        asynchronous and synchronous paths have the same torque semantics.
         """
         measured_q = _vector("MTC measured q", q)
         measured_dq = _vector("MTC measured dq", dq)
         predicted_tau = _vector("MTC tau_ref", tau_ref)
         q_cmd = self.resolve_q_cmd(q_ref)
+        gravity = self._gravity_torque(measured_q)
         tau_pd = self.kp * (q_cmd - measured_q) - self.kd * measured_dq
-        tau_command = (1.0 - self.alpha) * tau_pd + self.alpha * predicted_tau
+        tau_qv = tau_pd + gravity
+        tau_command = (1.0 - self.alpha) * tau_qv + self.alpha * predicted_tau
         return MTCResult(
             q_cmd=q_cmd,
-            gravity=np.zeros(DOF, dtype=np.float64),
+            gravity=gravity,
             tau_pd=tau_pd,
-            tau_qv=tau_pd.copy(),
+            tau_qv=tau_qv,
             tau_pred=predicted_tau,
             tau_command=tau_command,
             alpha=self.alpha,

@@ -655,6 +655,20 @@ class NeroInferenceRuntime:
             clip_tau = getattr(pipeline, "_clip_tau", None)
             if callable(clip_tau):
                 tau_ref = clip_tau(tau_ref)
+            filter_tau = getattr(pipeline, "_filtered_tau", None)
+
+            def filter_final_tau(value: np.ndarray) -> np.ndarray:
+                """Filter the total torque immediately before MIT transport."""
+
+                if callable(filter_tau):
+                    return filter_tau(
+                        value,
+                        state.tau,
+                        dt_s=prediction_dt_s,
+                    )
+                if callable(clip_tau):
+                    return clip_tau(value)
+                return np.asarray(value, dtype=np.float64)
 
             if not wm_enabled:
                 # With the fast WM disabled, DP's absolute-joint action plan
@@ -676,7 +690,7 @@ class NeroInferenceRuntime:
                     self._set_q_cmd(q_ref)
                 return {"q_ref": q_ref, "tau_ref": tau_ref, "tau_cmd": np.zeros(7)}
             if mode == "tau":
-                tau_cmd = tau_ref.copy()
+                tau_cmd = filter_final_tau(tau_ref)
                 if self.command_enabled:
                     self.arm.command_joint_impedance(
                         q=state.q,
@@ -688,9 +702,10 @@ class NeroInferenceRuntime:
                     self._set_q_cmd(state.q)
                 return {"q_ref": q_ref, "tau_ref": tau_ref, "tau_cmd": tau_cmd}
 
-            # MTC is evaluated at the transport rate.  The physical torque is
-            # (1-alpha)*tau_pd + alpha*tau_ref; firmware receives the same
-            # configured gains and only the residual feed-forward.
+            # MTC is evaluated at the transport rate.  ``alpha`` is the WM
+            # total-torque weight; the complementary q/v candidate includes
+            # gravity.  Firmware receives the same configured gains and only
+            # the residual feed-forward.
             kp = np.asarray(self.config.execution.mit_kp, dtype=np.float64).reshape(-1)
             kd = np.asarray(self.config.execution.mit_kd, dtype=np.float64).reshape(-1)
             if kp.size == 1:
@@ -714,9 +729,19 @@ class NeroInferenceRuntime:
                 tau_cmd = np.asarray(mtc_result.tau_command, dtype=np.float64)
             else:
                 tau_pd = kp * (q_ref - state.q) - kd * state.dq
-                tau_cmd = (1.0 - alpha) * tau_pd + alpha * tau_ref
-            if callable(clip_tau):
-                tau_cmd = clip_tau(tau_cmd)
+                gravity_fn = getattr(async_mtc, "_gravity_torque", None)
+                gravity = (
+                    np.asarray(gravity_fn(state.q), dtype=np.float64)
+                    if callable(gravity_fn)
+                    else np.zeros(7, dtype=np.float64)
+                )
+                tau_qv = tau_pd + gravity
+                tau_cmd = (1.0 - alpha) * tau_qv + alpha * tau_ref
+            # Clip the WM branch before blending, then filter the final blended
+            # total torque immediately before reconstructing the MIT residual.
+            # ``state.tau`` seeds the causal filter after each pipeline reset;
+            # the asynchronous control cadence is the filter sample period.
+            tau_cmd = filter_final_tau(tau_cmd)
             t_ff = tau_cmd - tau_pd
             if callable(clip_tau):
                 # Keep the transport packet within the same per-joint safety
