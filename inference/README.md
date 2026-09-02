@@ -279,7 +279,7 @@ sudo apt install -y build-essential pkg-config git curl libgl1 libglib2.0-0 \
   libglfw3 can-utils v4l-utils
 curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="${HOME}/.local/bin:${PATH}"
-cd /home/rei/mnt/code/lcx/nero_ws
+cd /mnt/code/lcx/nero_ws
 uv python install 3.10
 bash setup_env.sh
 ```
@@ -289,6 +289,9 @@ bash setup_env.sh
 ```bash
 uv run python -m inference.cli --config inference/configs/nero_contact_wm.yaml
 ```
+
+`uv run` 会自动使用项目的 `.venv`，无需手动激活环境。若需要直接使用
+`python` 命令，也可以先运行 `source .venv/bin/activate`。
 
 ## H5 -> MuJoCo 独立仿真分支
 
