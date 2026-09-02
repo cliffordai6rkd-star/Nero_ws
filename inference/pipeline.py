@@ -213,7 +213,7 @@ class NeroInferencePipeline:
             else:
                 if config.pinn_checkpoint is None:
                     raise ValueError(
-                        "pinn_checkpoint is required when predictor.enabled=true"
+                        "contactworldmodel is required when predictor.enabled=true"
                     )
                 self.pinn = restore_checkpoint_model(
                     config.pinn_checkpoint.path,
@@ -555,8 +555,16 @@ class NeroInferencePipeline:
         for model in (self.dp, self.pinn):
             if model is None:
                 continue
-            if hasattr(model, "reset"):
-                model.reset()
+            reset = getattr(model, "reset", None)
+            if callable(reset):
+                reset()
+                continue
+            # Native LeRobot policies expose ``reset_episode`` rather than the
+            # legacy ``reset`` method.  The timestamped DP worker owns the
+            # policy queue, so episode boundaries must clear either contract.
+            reset_episode = getattr(model, "reset_episode", None)
+            if callable(reset_episode):
+                reset_episode()
 
     def close(self) -> None:
         """Stop the asynchronous DP worker after the control session."""

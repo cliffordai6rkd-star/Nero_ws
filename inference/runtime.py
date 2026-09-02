@@ -127,11 +127,69 @@ class NeroInferenceRuntime:
         )
         if self._modular_image_keys is not None and not self._modular_image_keys:
             raise ValueError("modular_image_keys must contain at least one camera key")
-        requested_policy = str(config.architecture.policy_type).strip().lower()
+        requested_policy = (
+            str(config.architecture.policy_type).strip().lower().replace("-", "_")
+        )
+        requested_world_model = (
+            str(config.architecture.world_model_type)
+            .strip()
+            .lower()
+            .replace("-", "_")
+        )
+        requested_predictor_mode = (
+            str(config.predictor.mode).strip().lower().replace("-", "_")
+        )
+        requested_inference_mode = (
+            str(config.predictor.inference_mode).strip().lower().replace("-", "_")
+        )
+        # ``architecture: lerobotdp + contact_wm`` is the first-party
+        # timestamped fast/slow graph.  It must bypass the generic modular
+        # runner: that runner owns a synchronous DP chunk scheduler and would
+        # prevent the dedicated DP/WM/control workers from being enabled.
+        # ``predictor.enabled`` only controls whether the WM worker is present;
+        # the DP and 100 Hz control workers remain active in either case.
+        self._timestamp_architecture_requested = (
+            bool(config.architecture.enabled)
+            and requested_policy
+            in {"lerobotdp", "lerobot_diffusion_policy"}
+            and requested_world_model
+            in {
+                "contact_wm",
+                "contact_world_model",
+                "contact_world_model_opd",
+            }
+        )
+        if self._timestamp_architecture_requested:
+            if modular_inference is not None or modular_builder is not None:
+                raise ValueError(
+                    "lerobotdp + contact_wm uses the timestamped runtime and "
+                    "does not accept modular_inference/modular_builder"
+                )
+            if str(config.action).strip().lower().replace("-", "_") != "joint":
+                raise ValueError(
+                    "lerobotdp + contact_wm timestamped execution requires action=joint"
+                )
+            if config.predictor.enabled and requested_predictor_mode not in {
+                "contact_wm",
+                "contact_world_model",
+                "contact_world_model_opd",
+            }:
+                raise ValueError(
+                    "lerobotdp + contact_wm requires predictor.mode=contact_world_model "
+                    "when predictor.enabled=true"
+                )
+            if requested_inference_mode in {"async", "asynchronous"}:
+                requested_inference_mode = "asynchronous"
+            else:
+                raise ValueError(
+                    "lerobotdp + contact_wm requires "
+                    "predictor.inference_mode=asynchronous"
+                )
         self._auto_modular_policy = (
             config.architecture.enabled
             and requested_policy
             in {"dp", "diffusion_policy", "lerobotdp", "lerobot_diffusion_policy"}
+            and not self._timestamp_architecture_requested
             and modular_inference is None
             and modular_builder is None
         )
@@ -150,7 +208,14 @@ class NeroInferenceRuntime:
                 "modular_inference or modular_builder; the official TAVLA "
                 "checkpoint loader is repository-specific"
             )
-        if config.architecture.enabled:
+        if self._timestamp_architecture_requested:
+            log.info(
+                "timestamped fast/slow architecture enabled policy=%s "
+                "world_model=%s; using DP/WM/control workers",
+                config.architecture.policy_type,
+                config.architecture.world_model_type,
+            )
+        elif config.architecture.enabled:
             log.info(
                 "modular inference architecture enabled policy=%s world_model=%s; "
                 "legacy pipeline remains the model-stage compatibility adapter",
@@ -394,8 +459,19 @@ class NeroInferenceRuntime:
             not self._modular_mode
             and str(config.predictor.inference_mode).strip().lower().replace("-", "_")
             in {"asynchronous", "async"}
-            and callable(getattr(self.pipeline, "predict_contact_reference", None))
+            and (
+                (
+                    self._timestamp_architecture_requested
+                    and not config.predictor.enabled
+                )
+                or callable(getattr(self.pipeline, "predict_contact_reference", None))
+            )
         )
+        if self._timestamp_architecture_requested and not self._timestamp_async_enabled:
+            raise RuntimeError(
+                "lerobotdp + contact_wm did not produce a timestamped Contact WM "
+                "pipeline; expected predict_contact_reference() and asynchronous mode"
+            )
         if self._timestamp_async_enabled and not self._continuous_state_stream_enabled:
             # The asynchronous contract requires state acquisition to remain
             # independent of DP latency even on a mock/simulated backend.
@@ -548,6 +624,7 @@ class NeroInferenceRuntime:
         """Construct the non-blocking DP/WM/100 Hz control graph."""
 
         pipeline = self.pipeline
+        wm_enabled = bool(self.config.predictor.enabled)
 
         def infer_dp(observation):
             # ``DiffusionPolicyAdapter`` handles both the legacy checkpoint and
@@ -578,6 +655,20 @@ class NeroInferenceRuntime:
             clip_tau = getattr(pipeline, "_clip_tau", None)
             if callable(clip_tau):
                 tau_ref = clip_tau(tau_ref)
+
+            if not wm_enabled:
+                # With the fast WM disabled, DP's absolute-joint action plan
+                # is the target source.  Control still runs at 100 Hz, so each
+                # 25 Hz action token is held by ActionPlanBuffer's ZOH query.
+                if self.command_enabled:
+                    self.arm.command_joint_positions(q_ref)
+                    self._set_q_cmd(q_ref)
+                return {
+                    "q_ref": q_ref,
+                    "tau_ref": tau_ref,
+                    "tau_cmd": np.zeros(7, dtype=np.float64),
+                    "source": "dp",
+                }
 
             if mode == "q":
                 if self.command_enabled:
@@ -657,22 +748,25 @@ class NeroInferenceRuntime:
             step_s=action_step_s,
             source=self._sample_async_dp_observation,
         )
-        wm_worker = WMWorker(
-            self.state_history_buffer,
-            self.action_plan_buffer,
-            self.wm_target_buffer,
-            infer_wm,
-            prediction_horizon=prediction_horizon,
-            prediction_dt_s=prediction_dt_s,
-            request_period_s=max(1.0 / 16.0, prediction_dt_s),
-            state_horizon_s=self.state_history_buffer.horizon_s,
-            action_horizon_s=prediction_horizon * prediction_dt_s,
-        )
+        wm_worker = None
+        if wm_enabled:
+            wm_worker = WMWorker(
+                self.state_history_buffer,
+                self.action_plan_buffer,
+                self.wm_target_buffer,
+                infer_wm,
+                prediction_horizon=prediction_horizon,
+                prediction_dt_s=prediction_dt_s,
+                request_period_s=max(1.0 / 16.0, prediction_dt_s),
+                state_horizon_s=self.state_history_buffer.horizon_s,
+                action_horizon_s=prediction_horizon * prediction_dt_s,
+            )
         control_worker = ControlWorker(
             self.state_history_buffer,
             self.wm_target_buffer,
             control,
             rate_hz=1.0 / prediction_dt_s,
+            action_buffer=(None if wm_enabled else self.action_plan_buffer),
         )
         return TimestampFastSlowRuntime(
             state_buffer=self.state_history_buffer,

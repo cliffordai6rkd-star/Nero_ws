@@ -35,6 +35,34 @@ architecture:
 
 WM 尚未确定时使用 `NullWorldModel`，它不会在基类中引入额外的分支。
 
+Contact WM 的在线部署使用 timestamp 双异步路径。将配置收束为：
+
+```yaml
+architecture:
+  enabled: true
+  policy_type: lerobotdp
+  world_model_type: contact_wm
+predictor:
+  enabled: true
+  mode: contact_world_model
+  inference_mode: asynchronous
+```
+
+该组合由 `NeroInferenceRuntime` 直接构造 Contact WM 管线和独立 worker，不经过
+`InferenceBase/ModularInferenceRunner` 的同步 action scheduler。DP worker 在新图像到达后
+执行一次 LeRobot DP，并把返回的 8 个 `[7]` 绝对关节动作以
+`start_time + k*0.04 s` 写入 `ActionPlanBuffer`。`predictor.enabled=true` 时，WM worker
+按 16 Hz 左右读取 `StateHistoryBuffer.query(t-0.5, t)` 和
+`ActionPlanBuffer.query(t, t+0.32)`，把 25 Hz 动作以 ZOH 重采样到 100 Hz 条件后预测 32 个
+`[q_ref, tau_ref]`；推理延迟对应的过期前缀会被丢弃，剩余轨迹按绝对时间写入
+`WMTargetBuffer`，相邻预测的前 40 ms 做重叠融合。控制 worker 不等待模型，以 100 Hz
+查询 `WMTargetBuffer`，并通过 MTC 计算和发送当前时刻的力矩。
+
+当 `predictor.enabled=false` 时不加载 Contact WM，也不启动 WM worker；控制 worker 仍以
+100 Hz 运行，并直接从 `ActionPlanBuffer` 消费 DP action chunk（每个 25 Hz token 由 ZOH
+保持四个控制 tick），通过 `command_joint_positions()` 下发绝对关节位置。因此两种模式
+共享同一套 DP/timestamp pipeline，只有 WM 阶段按开关启停。
+
 相机的 `output_size` 只影响模型输入；开启 `visualize` 后预览默认使用裁剪后的
 采集分辨率。需要单独缩放预览时配置 `preview_output_size`：
 
@@ -55,7 +83,7 @@ cameras:
 `predictor.enabled` 是执行链路开关：
 
 - `true`：加载 PINN Contact World Model v2，并按 `execution.mode` 选择 MTC、q 或 tau；
-- `false`：不加载 `pinn_checkpoint`，DP action -> IK -> `q`，runtime 通过
+- `false`：不加载 `contactworldmodel`，DP action -> IK -> `q`，runtime 通过
   `command_joint_positions()` 下发关节位置。
 
 顶层 `action` 声明 DP checkpoint 的 7 维输出语义：
@@ -180,7 +208,7 @@ python scripts/infer_h5_direct_ik.py \
 `q_command [N,7]` 是关节步长限制后实际送入播放/真机接口的命令。此外还包含原始
 `q_observed`、完整 IK 解 `q_ik`、时间戳对齐索引和 IK 残差，同时保存生成的
 `.scene.xml`。默认配置为 `configs/nero_direct_ik.yaml`，其中不包含
-`pinn_checkpoint`，并通过 `dp_checkpoint.dino_model_path` 使用
+`contactworldmodel`，并通过 `dp_checkpoint.dino_model_path` 使用
 `/mnt/code/lcx/model/dinov3-vitb16-pretrain-lvd1689m` 的本地 backbone，不访问网络。
 
 当前唯一的 WM 推理契约是 PINN `ContactWorldModel v2`。配置支持的规范模式为
@@ -220,7 +248,7 @@ dp_checkpoint:
   device: cuda:0
   use_ema: true
 
-pinn_checkpoint:
+contactworldmodel:
   path: ../../model/carswm/latest.pt
   device: cuda:0
   use_ema: true
@@ -274,13 +302,14 @@ python scripts/infer_h5_mujoco.py \
   --config inference/configs/nero_contact_wm.yaml \
   --simulation-config calibration/config.yaml \
   --dp-checkpoint /path/to/dp.ckpt \
-  --pinn-checkpoint /path/to/contact_wm_student.pt \
+  --contactworldmodel /path/to/contact_wm_student.pt \
   --mode mtc --max-steps 200 --output /tmp/nero_mujoco_mtc.npz
 ```
 
-`--dp-checkpoint` and `--pinn-checkpoint` are optional overrides. The checked-in
-Contact WM YAML uses paths relative to the repository config directory (the PINN
-checkpoint is `../../../PINN/outputs/contact_world_model_ep2_multytoken/checkpoints/latest.pt`);
+`--dp-checkpoint` and `--contactworldmodel` are optional overrides (`--pinn-checkpoint`
+remains a CLI compatibility alias). The checked-in Contact WM YAML uses paths relative
+to the repository config directory (`model/carswm/latest.pt` and the LeRobot DP
+directory);
 replace only the DP path when
 using a different policy checkpoint.  The CLI validates both checkpoint files
 and the local DINO directory before allocating the models, so a stale path fails
@@ -324,7 +353,7 @@ future tau -> causal torque filter (mode=tau or MTC feed-forward)
 - Pinocchio 逆动力学；
 - `tau_ext -> wrench_ext` 阻尼 Jacobian 映射。
 
-`predictor.enabled: false` 时 `pinn_checkpoint` 可从 YAML 中完全省略。开启 predictor 时，
+`predictor.enabled: false` 时 `contactworldmodel` 可从 YAML 中完全省略。开启 predictor 时，
 Contact WM 的网络参数、输入维度、horizon、action condition 和归一化器必须保存在
 checkpoint 的 `config`/`normalizer` 中，推理配置不会重复声明它们。加载器会在恢复权重前
 校验 v2 版本、四路输入以及 7 维关节/action；旧 V1/V3/V4/V5 或旧 OPD 权重会明确拒绝。

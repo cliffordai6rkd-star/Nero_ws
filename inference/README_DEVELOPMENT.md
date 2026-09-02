@@ -32,7 +32,15 @@ ActionResolver -> SafetyGuard -> RobotController
 计划。`NeroInferencePipeline` 暂时保留同名私有方法作为兼容委托；新增代码应直接
 依赖这些 stage，不要再向 pipeline 添加新的观测缓存或 action 游标字段。
 
-当前仓库仍保留 `NeroInferencePipeline` 和 `NeroInferenceRuntime` 作为旧 DP/WM 入口。它们通过 sampler、runner 和 controller 适配器逐步接入新边界，但还没有完全改成 `class NeroInferenceRuntime(InferenceBase)`。因此不要把 `architecture.enabled` 当作已经完成的切换开关；目前它主要用于声明和日志，真正的 modular builder 仍在迁移中。
+当前仓库仍保留 `NeroInferencePipeline` 和 `NeroInferenceRuntime` 作为旧 DP/WM 兼容入口。
+对于 `architecture.enabled=true, policy_type=lerobotdp,
+world_model_type=contact_wm`，runtime 已将其作为 timestamp 双异步模式的唯一组合入口：
+它直接连接 DP worker、Contact WM worker 和 100 Hz control worker，不再经过
+`InferenceBase/ModularInferenceRunner` 的同步 scheduler。`predictor.enabled=false` 时
+省略 Contact WM worker，控制 worker 直接按时间戳消费 DP action plan；DP 与控制的异步
+边界保持不变。其它历史 modular policy 仍可通过显式
+`modular_inference`/`modular_builder` 运行；不要把这些兼容路径与 Contact WM 的三线程
+执行模型混用。
 
 ## 2. 公共数据契约
 

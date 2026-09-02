@@ -65,6 +65,7 @@ def apply_checkpoint_overrides(
     *,
     dp_checkpoint: Path | None = None,
     pinn_checkpoint: Path | None = None,
+    contactworldmodel: Path | None = None,
 ) -> InferenceConfig:
     """Return ``config`` with optional command-line checkpoint replacements.
 
@@ -82,16 +83,23 @@ def apply_checkpoint_overrides(
                 path=dp_checkpoint.expanduser().resolve(),
             ),
         )
-    if pinn_checkpoint is not None:
-        if config.pinn_checkpoint is None:
+    if pinn_checkpoint is not None and contactworldmodel is not None:
+        raise ValueError("pass only one of pinn_checkpoint/contactworldmodel")
+    contact_override = contactworldmodel or pinn_checkpoint
+    if contact_override is not None:
+        if config.contactworldmodel is None:
             raise ValueError(
-                "--pinn-checkpoint requires predictor.enabled=true and a PINN config"
+                "--contactworldmodel requires predictor.enabled=true and a Contact WM config"
             )
         config = replace(
             config,
+            contactworldmodel=replace(
+                config.contactworldmodel,
+                path=contact_override.expanduser().resolve(),
+            ),
             pinn_checkpoint=replace(
                 config.pinn_checkpoint,
-                path=pinn_checkpoint.expanduser().resolve(),
+                path=contact_override.expanduser().resolve(),
             ),
         )
     return config
@@ -123,9 +131,9 @@ def validate_checkpoint_paths(config: InferenceConfig) -> None:
 
     paths = [("DP", config.dp_checkpoint.path)]
     if config.predictor.enabled:
-        if config.pinn_checkpoint is None:
-            raise ValueError("predictor.enabled=true requires pinn_checkpoint")
-        paths.append(("PINN", config.pinn_checkpoint.path))
+        if config.contactworldmodel is None:
+            raise ValueError("predictor.enabled=true requires contactworldmodel")
+        paths.append(("ContactWorldModel", config.contactworldmodel.path))
     for kind, path in paths:
         if not path.is_file():
             raise FileNotFoundError(
@@ -157,7 +165,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--config",
         type=Path,
         default=ROOT / "inference/configs/nero_contact_wm.yaml",
-        help="inference config containing DP/PINN checkpoints and execution.mode",
+        help="inference config containing DP/Contact WM checkpoints and execution.mode",
     )
     parser.add_argument(
         "--simulation-config",
@@ -172,8 +180,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--pinn-checkpoint",
+        "--contactworldmodel",
         type=Path,
-        help="override config.pinn_checkpoint.path for this replay",
+        dest="pinn_checkpoint",
+        help="override config.contactworldmodel.path for this replay",
     )
     parser.add_argument("--camera", help="H5 camera group; defaults to runtime.camera")
     parser.add_argument(

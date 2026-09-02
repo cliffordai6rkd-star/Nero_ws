@@ -715,11 +715,17 @@ class ControlWorker(_LatestWorker):
         control_fn: Callable[[StateSample, WMTarget | None, float], Any],
         *,
         rate_hz: float = 100.0,
+        action_buffer: ActionPlanBuffer | None = None,
     ) -> None:
         super().__init__(name="nero-control-worker")
         self.state_buffer = state_buffer
         self.target_buffer = target_buffer
         self.control_fn = control_fn
+        # When the WM is disabled, the same 100 Hz loop can consume the
+        # timestamped DP action plan directly.  Keeping this optional preserves
+        # the normal WMTargetBuffer path without introducing a second control
+        # thread or a chunk-index scheduler.
+        self.action_buffer = action_buffer
         self.rate_hz = float(rate_hz)
         if not np.isfinite(self.rate_hz) or self.rate_hz <= 0.0:
             raise ValueError("control rate_hz must be positive and finite")
@@ -742,6 +748,18 @@ class ControlWorker(_LatestWorker):
             state = self.state_buffer.latest()
             if state is not None:
                 target = self.target_buffer.query_target(now)
+                if target is None and self.action_buffer is not None:
+                    action = self.action_buffer.query_with_timestamps(
+                        now,
+                        now + self.period_s,
+                        rate_hz=self.rate_hz,
+                    )
+                    if action is not None:
+                        target = WMTarget(
+                            now,
+                            action.values[0],
+                            np.zeros(DOF, dtype=np.float64),
+                        )
                 self._last_output = self.control_fn(state, target, now)
                 self._cycles += 1
             deadline += self.period_s
@@ -753,7 +771,7 @@ class ControlWorker(_LatestWorker):
 
 
 class TimestampFastSlowRuntime:
-    """Small coordinator joining the three workers and their buffers."""
+    """Small coordinator joining DP/control workers and an optional WM worker."""
 
     def __init__(
         self,
@@ -762,7 +780,7 @@ class TimestampFastSlowRuntime:
         action_buffer: ActionPlanBuffer,
         target_buffer: WMTargetBuffer,
         dp_worker: DPWorker,
-        wm_worker: WMWorker,
+        wm_worker: WMWorker | None,
         control_worker: ControlWorker,
     ) -> None:
         self.state_buffer = state_buffer
@@ -774,12 +792,14 @@ class TimestampFastSlowRuntime:
 
     def start(self) -> None:
         self.dp_worker.start()
-        self.wm_worker.start()
+        if self.wm_worker is not None:
+            self.wm_worker.start()
         self.control_worker.start()
 
     def stop(self) -> None:
         self.control_worker.stop()
-        self.wm_worker.stop()
+        if self.wm_worker is not None:
+            self.wm_worker.stop()
         self.dp_worker.stop()
 
     def reset(self) -> None:

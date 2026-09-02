@@ -167,6 +167,10 @@ class InferenceConfig:
     # Semantic contract of each seven-dimensional DP action.
     # ``eepose`` is [x,y,z,qx,qy,qz,qw]; ``joint`` is absolute arm q.
     action: str = "eepose"
+    # Canonical name for the Contact World Model checkpoint.  The historical
+    # ``pinn_checkpoint`` field remains as a constructor/read compatibility
+    # alias for older scripts and tests.
+    contactworldmodel: CheckpointConfig | None = None
     pinn_checkpoint: CheckpointConfig | None = None
     dp_sampling: DPSamplingConfig = field(default_factory=DPSamplingConfig)
     ik: IKConfig = field(default_factory=IKConfig)
@@ -182,6 +186,16 @@ class InferenceConfig:
     )
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     architecture: ArchitectureConfig = field(default_factory=ArchitectureConfig)
+
+    def __post_init__(self) -> None:
+        # A config loaded from YAML normally supplies only the canonical field;
+        # older Python callers may still supply only ``pinn_checkpoint``.  Do
+        # not overwrite a deliberately different alias during dataclasses.replace
+        # so both migration paths remain usable.
+        if self.contactworldmodel is None and self.pinn_checkpoint is not None:
+            object.__setattr__(self, "contactworldmodel", self.pinn_checkpoint)
+        elif self.pinn_checkpoint is None and self.contactworldmodel is not None:
+            object.__setattr__(self, "pinn_checkpoint", self.contactworldmodel)
 
 
 T = TypeVar("T")
@@ -487,15 +501,22 @@ def load_inference_config(path: str | Path) -> InferenceConfig:
         mtc_alpha=mtc_alpha,
         mtc_q_cmd_source=mtc_q_cmd_source,
     )
-    pinn_raw = raw.get("pinn_checkpoint")
-    if pinn_raw is None:
+    contact_raw = raw.get("contactworldmodel")
+    legacy_pinn_raw = raw.get("pinn_checkpoint")
+    if contact_raw is not None and legacy_pinn_raw is not None:
+        raise ValueError(
+            "configure only one of contactworldmodel or pinn_checkpoint"
+        )
+    checkpoint_raw = contact_raw if contact_raw is not None else legacy_pinn_raw
+    checkpoint_name = "contactworldmodel" if contact_raw is not None else "pinn_checkpoint"
+    if checkpoint_raw is None:
         if predictor.enabled:
             raise ValueError(
-                "pinn_checkpoint is required when predictor.enabled=true"
+                "contactworldmodel is required when predictor.enabled=true"
             )
-        pinn = None
+        contactworldmodel = None
     else:
-        pinn = _checkpoint(pinn_raw, base, "pinn_checkpoint")
+        contactworldmodel = _checkpoint(checkpoint_raw, base, checkpoint_name)
     robot_raw = _mapping(raw.get("robot"), "robot")
     _reject_unknown(robot_raw, RobotConfig, "robot")
     urdf_path = _required_path(robot_raw.get("urdf_path"), base, "robot.urdf_path")
@@ -687,7 +708,7 @@ def load_inference_config(path: str | Path) -> InferenceConfig:
     )
     return InferenceConfig(
         dp_checkpoint=dp,
-        pinn_checkpoint=pinn,
+        contactworldmodel=contactworldmodel,
         robot=robot,
         runtime=runtime,
         action=action,

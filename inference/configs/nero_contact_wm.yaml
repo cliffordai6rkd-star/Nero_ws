@@ -13,17 +13,18 @@ dp_checkpoint:
 action: joint
 
 architecture:
-  enabled: false
-  policy_type: legacy_pipeline
+  enabled: true
+  policy_type: lerobotdp
   world_model_type: contact_wm
 
-pinn_checkpoint:
+contactworldmodel:
   # ContactWorldModel v2 checkpoint from PINN (EMA weights by default).
   path: ../../model/carswm/latest.pt
   device: cuda:0
   use_ema: true
 
 predictor:
+  # false disables only the WM worker; DP action chunks are still executed.
   enabled: true
   mode: contact_world_model
   # DP samples a fresh image window, then holds its 8-token direct-joint plan
@@ -52,7 +53,7 @@ execution:
 
 dp_sampling:
   method: ddim
-  num_inference_steps: 10
+  num_inference_steps: 50
   # false makes DP camera-only; force-aware checkpoints require true.
   use_tau_ext_observation: false
 

@@ -55,7 +55,7 @@ def main() -> None:
         if config.predictor.enabled:
             if config.pinn_checkpoint is None:
                 raise ValueError(
-                    "pinn_checkpoint is required when predictor.enabled=true"
+                    "contactworldmodel is required when predictor.enabled=true"
                 )
             pinn = restore_checkpoint_model(
                 config.pinn_checkpoint.path,
