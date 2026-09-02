@@ -176,7 +176,7 @@ beta schedule、prediction type、模型权重和 normalizer 保持不变。DDIM
 退出。也可以用 `--single-step` 启动后直接处于等待状态：
 
 ```bash
-python -m inference.cli --config inference/configs/nero_contact_wm.yaml
+uv run python -m inference.cli --config inference/configs/nero_contact_wm.yaml
 ```
 
 单步请求会保留到下一张有效相机帧和 CAN 状态都可用，因此一次 `s` 不会因为传感器暂时
@@ -282,13 +282,12 @@ export PATH="${HOME}/.local/bin:${PATH}"
 cd /home/rei/mnt/code/lcx/nero_ws
 uv python install 3.10
 bash setup_env.sh
-source .venv/bin/activate
 ```
 
 启动在线推理：
 
 ```bash
-python -m inference.cli --config inference/configs/nero_contact_wm.yaml
+uv run python -m inference.cli --config inference/configs/nero_contact_wm.yaml
 ```
 
 ## H5 -> MuJoCo 独立仿真分支

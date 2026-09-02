@@ -111,13 +111,12 @@ export PATH="${HOME}/.local/bin:${PATH}"
 cd /home/rei/mnt/code/lcx/nero_ws
 uv python install 3.10
 bash setup_env.sh
-source .venv/bin/activate
 ```
 
 启动推理：
 
 ```bash
-python -m inference.cli --config inference/configs/nero_contact_wm.yaml
+uv run python -m inference.cli --config inference/configs/nero_contact_wm.yaml
 ```
 
 标定夹爪零点

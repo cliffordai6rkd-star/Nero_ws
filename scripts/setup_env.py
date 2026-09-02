@@ -81,8 +81,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"PINN project not found at {pinn}; native WM checkpoints unavailable")
 
     print("\nEnvironment is ready.")
-    print(f"  source {venv / 'bin/activate'}")
-    print("  python -m inference.cli --config inference/configs/nero_contact_wm.yaml")
+    print("  uv run python -m inference.cli --config inference/configs/nero_contact_wm.yaml")
     return 0
 
 
