@@ -1,11 +1,11 @@
 # Contact-aware state world-model inference configuration.
-# The checkpoint below uses the canonical q/dq/delta_q/tau + direct-joint-action
-# contract implemented by SWMInferencePipeline. Change execution.mode to mtc,
-# q, or tau as needed.
+# The checkpoint below uses PINN's canonical ContactWorldModel v2 contract:
+# q/dq/delta_q/tau history plus a direct-joint action condition. Change
+# execution.mode to mtc, q, or tau as needed.
 dp_checkpoint:
   # Shared joint-action DP checkpoint for offline and deployed inference.
-  path: ../../../model/dp/insert_usb/100ep15w/checkpoints/latest.ckpt
-  dino_model_path: ../../../model/dinov3-vitb16-pretrain-lvd1689m
+  path: ../../model/dp/pretrained_model-20260901T082955Z-1-001/pretrained_model
+  dino_model_path: null
   device: cuda:0
   use_ema: true
 
@@ -15,32 +15,34 @@ action: joint
 architecture:
   enabled: false
   policy_type: legacy_pipeline
-  world_model_type: swm
+  world_model_type: contact_wm
 
 pinn_checkpoint:
-  # Checkpoint contract: q/dq/delta_q/tau history + direct 7-joint action.
-  path: ../../model/carswm/epoch_0001200.pt
+  # ContactWorldModel v2 checkpoint from PINN (EMA weights by default).
+  path: ../../model/carswm/latest.pt
   device: cuda:0
   use_ema: true
 
 predictor:
   enabled: true
-  mode: swm_opd
+  mode: contact_world_model
   # DP samples a fresh image window, then holds its 8-token direct-joint plan
   # while the WM continues to run at the 100 Hz CAN/state rate.
-  inference_mode: open_loop
+  inference_mode: asynchronous
   action_chunk_mode: all
   action_condition_fill: chunk
   action_execution_mode: chunk
-  action_step_s: null
+  action_step_s: 0.04
 
 execution:
   # mtc | q | tau
   mode: mtc
-  # MTC blends the data-style q/v/gravity torque with the SWM torque output.
+  # MTC blends the data-side q/v torque with Contact WM tau_ref;
+  # mtc_alpha is the WM torque weight in the timestamped runtime.
   mtc_alpha: 0.5
-  # wm_state=q_hat; wm_delta=q_hat+delta_q_hat.
-  mtc_q_cmd_source: wm_delta
+  # The timestamped runtime uses WM q_ref directly (legacy sync mode keeps
+  # wm_state/wm_delta compatibility through the ContactWM pipeline).
+  mtc_q_cmd_source: wm_state
   # MTC keeps these data-side gains in the firmware MIT
   # command and sends a residual feed-forward completing the blended torque.
   mit_kp: [3.0, 3.0, 2.0, 3.5, 2.0, 2.0, 3.0]

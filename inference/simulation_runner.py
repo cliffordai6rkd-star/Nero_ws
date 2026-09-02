@@ -37,7 +37,12 @@ from inference.h5_observation_stream import (
     H5ObservationStream,
 )
 from inference.mujoco_backend import MujocoBackendConfig, MujocoDynamicsBackend
-from inference.pipeline import InferenceInput, InferenceOutput, NeroInferencePipeline
+from inference.pipeline import (
+    InferenceInput,
+    InferenceOutput,
+    NeroInferencePipeline,
+    _CONTACT_WORLD_MODEL_MODES,
+)
 
 
 log = logging.getLogger(__name__)
@@ -207,31 +212,10 @@ def build_pipeline(
     """
 
     predictor_mode = str(config.predictor.mode).strip().lower().replace("-", "_")
-    if config.predictor.enabled and predictor_mode in {
-        "contact_world_model",
-        "contact_world_model_opd",
-        "contact_wm",
-        "contact_wm_opd",
-    }:
-        from inference.contact_pipeline import ContactWMInferencePipeline
+    if config.predictor.enabled and predictor_mode in _CONTACT_WORLD_MODEL_MODES:
+        from inference.contact_wm_pipeline import ContactWMInferencePipeline
 
         return ContactWMInferencePipeline(
-            config,
-            dp_model=dp_model,
-            pinn_model=pinn_model,
-            controller=controller,
-        )
-    if config.predictor.enabled and predictor_mode in {
-        "swm",
-        "swm_opd",
-        "torque_world_model",
-        "torque_world_model_opd",
-        "torque_wm",
-        "torque_wm_opd",
-    }:
-        from inference.swm_pipeline import SWMInferencePipeline
-
-        return SWMInferencePipeline(
             config,
             dp_model=dp_model,
             pinn_model=pinn_model,

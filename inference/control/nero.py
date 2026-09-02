@@ -45,7 +45,7 @@ class NeroPipelineOutputController:
                     )
                 q_cmd = np.asarray(output.joint_position_command, dtype=np.float64)
                 self.arm.command_joint_positions(q_cmd)
-            elif control_mode == "mtc":
+            elif control_mode in {"mtc", "mit"}:
                 q_target = getattr(output, "joint_position_target", None)
                 dq_target = getattr(output, "joint_velocity_target", None)
                 tau_target = getattr(output, "torque_target", None)

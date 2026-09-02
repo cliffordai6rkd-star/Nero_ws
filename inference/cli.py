@@ -64,16 +64,6 @@ def main() -> None:
                 kind="PINN",
                 pinn_mode=config.predictor.mode,
             )
-        if config.predictor.enabled and config.predictor.mode in {
-            "world_model_v3",
-            "world_model_v4",
-            "world_model_v5",
-        }:
-            from inference.world_model import WorldModelWrenchAdapter
-
-            WorldModelWrenchAdapter.from_collection_config(
-                config.runtime.collection_config
-            )
         print(
             json.dumps(
                 {

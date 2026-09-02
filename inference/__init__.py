@@ -24,9 +24,11 @@ from inference.pipeline import (
     IKResult,
     NeroInferencePipeline,
 )
-from inference.contact_pipeline import (
+from inference.contact_wm_pipeline import (
     ContactInferencePipeline,
     ContactWMInferencePipeline,
+    ContactWorldModelInferencePipeline,
+    ContactWMPipeline,
 )
 from inference.swm_pipeline import (
     SWMInferencePipeline,
@@ -72,6 +74,20 @@ from inference.control import (
     CallableActionResolver,
     DirectActionResolver,
 )
+from inference.async_fast_slow import (
+    ActionPlan,
+    ActionPlanBuffer,
+    ActionTrajectory,
+    ControlWorker,
+    DPWorker,
+    StateHistoryBuffer,
+    StateHistorySnapshot,
+    StateSample,
+    TimestampFastSlowRuntime,
+    WMTarget,
+    WMTargetBuffer,
+    WMWorker,
+)
 from inference.stages import ActionPlanExecutor, DPObservationBuffer
 from inference.factory import (
     CONTROLLER_REGISTRY,
@@ -108,6 +124,8 @@ __all__ = [
     "IKResult",
     "NeroInferencePipeline",
     "ContactWMInferencePipeline",
+    "ContactWorldModelInferencePipeline",
+    "ContactWMPipeline",
     "ContactInferencePipeline",
     "SWMInferencePipeline",
     "SWMPipeline",
@@ -143,6 +161,18 @@ __all__ = [
     "BasicSafetyGuard",
     "CallableActionResolver",
     "DirectActionResolver",
+    "ActionPlan",
+    "ActionPlanBuffer",
+    "ActionTrajectory",
+    "ControlWorker",
+    "DPWorker",
+    "StateHistoryBuffer",
+    "StateHistorySnapshot",
+    "StateSample",
+    "TimestampFastSlowRuntime",
+    "WMTarget",
+    "WMTargetBuffer",
+    "WMWorker",
     "Observation",
     "SimulationRunnerConfig",
     "SimulationRunResult",

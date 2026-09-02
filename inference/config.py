@@ -39,7 +39,7 @@ class PredictorConfig:
 
 @dataclass(frozen=True)
 class ExecutionConfig:
-    """How a q/tau world-model prediction is sent to the arm."""
+    """How a Contact WM q/tau prediction is sent to the arm."""
 
     # Inference exposes only direct q/tau and the MTC blend.  MIT remains a
     # firmware transport primitive used by MTC, not a standalone mode.
@@ -298,28 +298,33 @@ def load_inference_config(path: str | Path) -> InferenceConfig:
     if not isinstance(predictor.enabled, bool):
         raise ValueError("predictor.enabled must be a boolean")
     predictor_mode = predictor.mode.strip().lower()
-    if predictor_mode == "world_model":
-        predictor_mode = "world_model_v5"
-    if predictor_mode in {"torque_world_model", "torque_wm"}:
-        predictor_mode = "swm"
-    elif predictor_mode in {"torque_world_model_opd", "torque_wm_opd"}:
-        predictor_mode = "swm_opd"
-    if predictor_mode not in {
-        "wrench_gru",
+    if predictor_mode in {
+        "world_model",
         "world_model_v3",
         "world_model_v4",
         "world_model_v5",
-        "contact_world_model",
-        "contact_world_model_opd",
-        "contact_wm",
-        "contact_wm_opd",
         "swm",
         "swm_opd",
+        "torque_world_model",
+        "torque_world_model_opd",
+        "torque_wm",
+        "torque_wm_opd",
+        "contact_wm",
+        "contact_wm_opd",
+    }:
+        predictor_mode = (
+            "contact_world_model_opd"
+            if predictor_mode.endswith("_opd")
+            else "contact_world_model"
+        )
+    if predictor_mode not in {
+        "wrench_gru",
+        "contact_world_model",
+        "contact_world_model_opd",
     }:
         raise ValueError(
-            "predictor.mode must be 'wrench_gru', 'world_model_v3', "
-            "'world_model_v4', 'world_model_v5', 'contact_world_model', "
-            "or 'contact_world_model_opd', 'swm', or 'swm_opd'"
+            "predictor.mode must be 'wrench_gru', 'contact_world_model', "
+            "or 'contact_world_model_opd'"
         )
     inference_mode = predictor.inference_mode.strip().lower().replace("-", "_")
     if inference_mode == "async":
@@ -657,6 +662,20 @@ def load_inference_config(path: str | Path) -> InferenceConfig:
         raise ValueError("architecture.enabled must be a boolean")
     policy_type = str(architecture.policy_type).strip().lower()
     world_model_type = str(architecture.world_model_type).strip().lower()
+    world_model_type = {
+        "swm": "contact_wm",
+        "swm_opd": "contact_wm",
+        "torque_world_model": "contact_wm",
+        "torque_world_model_opd": "contact_wm",
+        "torque_wm": "contact_wm",
+        "torque_wm_opd": "contact_wm",
+        "world_model": "contact_wm",
+        "world_model_v3": "contact_wm",
+        "world_model_v4": "contact_wm",
+        "world_model_v5": "contact_wm",
+        "contact_world_model": "contact_wm",
+        "contact_world_model_opd": "contact_wm",
+    }.get(world_model_type, world_model_type)
     if not policy_type:
         raise ValueError("architecture.policy_type must be non-empty")
     if not world_model_type:

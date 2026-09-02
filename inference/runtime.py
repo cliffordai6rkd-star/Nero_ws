@@ -12,7 +12,7 @@ from typing import Any, Callable
 import numpy as np
 
 from inference.config import InferenceConfig, resolve_camera_key
-from inference.pipeline import NeroInferencePipeline
+from inference.pipeline import NeroInferencePipeline, _CONTACT_WORLD_MODEL_MODES
 from inference.state_stream import (
     ContinuousInferenceSample,
     ContinuousInferenceStateStream,
@@ -31,6 +31,17 @@ from inference.control.base import ArmRobotController
 from inference.control.resolver import DirectActionResolver
 from inference.control.safety import BasicSafetyGuard
 from inference.policies.dp import DiffusionPolicy
+from inference.async_fast_slow import (
+    ActionPlanBuffer,
+    ControlWorker,
+    DPWorker,
+    StateHistoryBuffer,
+    TimestampFastSlowRuntime,
+    WMTarget,
+    WMTargetBuffer,
+    WMWorker,
+    monotonic_time,
+)
 from nero_collection.arms.factory import build_arm
 from nero_collection.cameras import CameraFrame, CameraManager, CameraVisualizer
 from nero_collection.config import CollectionConfig, load_config
@@ -176,26 +187,10 @@ class NeroInferenceRuntime:
             self.pipeline = modular_inference
         elif pipeline is not None:
             self.pipeline = pipeline
-        elif config.predictor.enabled and config.predictor.mode in {
-            "contact_world_model",
-            "contact_world_model_opd",
-            "contact_wm",
-            "contact_wm_opd",
-        }:
-            from inference.contact_pipeline import ContactWMInferencePipeline
+        elif config.predictor.enabled and config.predictor.mode in _CONTACT_WORLD_MODEL_MODES:
+            from inference.contact_wm_pipeline import ContactWMInferencePipeline
 
             self.pipeline = ContactWMInferencePipeline(config)
-        elif config.predictor.enabled and config.predictor.mode in {
-            "swm",
-            "swm_opd",
-            "torque_world_model",
-            "torque_world_model_opd",
-            "torque_wm",
-            "torque_wm_opd",
-        }:
-            from inference.swm_pipeline import SWMInferencePipeline
-
-            self.pipeline = SWMInferencePipeline(config)
         else:
             self.pipeline = NeroInferencePipeline(config)
         self.online_tau_ext = online_tau_ext or OnlineTauExtInference(
@@ -372,6 +367,48 @@ class NeroInferenceRuntime:
                 image_keys=self._pipeline_image_keys,
                 on_observation=self._on_modular_observation,
             )
+        # Contact WM deployments use three independent clocks.  These buffers
+        # are created for every runtime (so integrations can inspect them),
+        # while workers are enabled only for the timestamped Contact WM mode.
+        contact_history_horizon = int(
+            getattr(self.pipeline, "_contact_history_horizon", 50) or 50
+        )
+        contact_prediction_horizon = int(
+            getattr(self.pipeline, "_contact_future_horizon", 32) or 32
+        )
+        contact_prediction_dt = float(
+            getattr(self.pipeline, "_contact_sampling_dt_s", 0.01) or 0.01
+        )
+        contact_action_step = float(
+            getattr(self.pipeline, "_contact_action_period_s", 0.04) or 0.04
+        )
+        self.state_history_buffer = StateHistoryBuffer(
+            rate_hz=1.0 / contact_prediction_dt,
+            horizon_s=contact_history_horizon * contact_prediction_dt,
+        )
+        self.action_plan_buffer = ActionPlanBuffer(default_step_s=contact_action_step)
+        self.wm_target_buffer = WMTargetBuffer(
+            blend_duration_s=0.04,
+        )
+        self._timestamp_async_enabled = bool(
+            not self._modular_mode
+            and str(config.predictor.inference_mode).strip().lower().replace("-", "_")
+            in {"asynchronous", "async"}
+            and callable(getattr(self.pipeline, "predict_contact_reference", None))
+        )
+        if self._timestamp_async_enabled and not self._continuous_state_stream_enabled:
+            # The asynchronous contract requires state acquisition to remain
+            # independent of DP latency even on a mock/simulated backend.
+            self._continuous_state_stream_enabled = True
+        self._async_runtime: TimestampFastSlowRuntime | None = None
+        self._async_last_image_timestamps: tuple[tuple[str, int], ...] | None = None
+        if self._timestamp_async_enabled:
+            self._async_runtime = self._build_timestamp_async_runtime(
+                contact_prediction_horizon,
+                contact_prediction_dt,
+                contact_action_step,
+            )
+        self.async_runtime = self._async_runtime
         self._observation_warmup_started_us: int | None = None
         self._inference_control_mode_ready = False
 
@@ -475,6 +512,22 @@ class NeroInferenceRuntime:
 
     def _on_stream_sample(self, sample: ContinuousInferenceSample) -> None:
         self._last_valid_arm_state_s = time.monotonic()
+        if self._timestamp_async_enabled:
+            # ``ContinuousInferenceStateStream`` retains its historical wall
+            # timestamp for compatibility.  The asynchronous control graph
+            # uses a monotonic timestamp captured at this callback boundary.
+            try:
+                self.state_history_buffer.append(
+                    monotonic_time(),
+                    sample.q,
+                    sample.dq,
+                    tau=sample.tau,
+                    q_cmd=getattr(sample, "q_cmd", None),
+                )
+            except Exception:
+                # A malformed state must never take down the 100 Hz acquisition
+                # thread; the worker will simply wait for the next valid sample.
+                log.warning("failed to append asynchronous state history", exc_info=True)
         if bool(getattr(self.tau_ext_plotter, "enabled", False)):
             try:
                 self.tau_ext_plotter.append(
@@ -486,28 +539,196 @@ class NeroInferenceRuntime:
                 # Diagnostics must never stop the fixed-rate state stream.
                 log.warning("tau_ext inference plot update failed", exc_info=True)
 
-    def _start_state_stream(self) -> None:
-        if not self._continuous_state_stream_enabled:
-            return
-        self._state_stream.clear()
-        self._last_consumed_state_timestamp_us = 0
-        self._last_state_stream_rollover_count = self._state_stream.history_rollover_count
-        self._last_arm_timestamp_us = 0
-        log.info(
-            "continuous inference state stream started history=%d poll=%.1fms",
-            self._state_stream.history_size,
-            self._state_stream.poll_interval_s * 1.0e3,
+    def _build_timestamp_async_runtime(
+        self,
+        prediction_horizon: int,
+        prediction_dt_s: float,
+        action_step_s: float,
+    ) -> TimestampFastSlowRuntime:
+        """Construct the non-blocking DP/WM/100 Hz control graph."""
+
+        pipeline = self.pipeline
+
+        def infer_dp(observation):
+            # ``DiffusionPolicyAdapter`` handles both the legacy checkpoint and
+            # the native LeRobot contract.  The worker owns the only DP model
+            # call, so its temporal queue is never touched by the control loop.
+            return pipeline._dp_policy.predict(observation)
+
+        def infer_wm(history, action):
+            return pipeline.predict_contact_reference(history, action)
+
+        def control(state, target: WMTarget | None, timestamp_s: float):
+            del timestamp_s
+            mode = str(getattr(self.config.execution, "mode", "mtc")).lower()
+            if target is None:
+                q_ref = np.asarray(state.q, dtype=np.float64).copy()
+                tau_ref = np.zeros(7, dtype=np.float64)
+            else:
+                q_ref = np.asarray(target.q_ref, dtype=np.float64).copy()
+                tau_ref = np.asarray(target.tau_ref, dtype=np.float64).copy()
+
+            safe_q_fn = getattr(pipeline, "_safe_joint_position_trajectory", None)
+            if callable(safe_q_fn):
+                q_ref = safe_q_fn(
+                    state.q,
+                    q_ref[None],
+                    dt_s=prediction_dt_s,
+                )[0]
+            clip_tau = getattr(pipeline, "_clip_tau", None)
+            if callable(clip_tau):
+                tau_ref = clip_tau(tau_ref)
+
+            if mode == "q":
+                if self.command_enabled:
+                    self.arm.command_joint_positions(q_ref)
+                    self._set_q_cmd(q_ref)
+                return {"q_ref": q_ref, "tau_ref": tau_ref, "tau_cmd": np.zeros(7)}
+            if mode == "tau":
+                tau_cmd = tau_ref.copy()
+                if self.command_enabled:
+                    self.arm.command_joint_impedance(
+                        q=state.q,
+                        v_des=np.zeros(7, dtype=np.float64),
+                        kp=np.zeros(7, dtype=np.float64),
+                        kd=np.zeros(7, dtype=np.float64),
+                        t_ff=tau_cmd,
+                    )
+                    self._set_q_cmd(state.q)
+                return {"q_ref": q_ref, "tau_ref": tau_ref, "tau_cmd": tau_cmd}
+
+            # MTC is evaluated at the transport rate.  The physical torque is
+            # (1-alpha)*tau_pd + alpha*tau_ref; firmware receives the same
+            # configured gains and only the residual feed-forward.
+            kp = np.asarray(self.config.execution.mit_kp, dtype=np.float64).reshape(-1)
+            kd = np.asarray(self.config.execution.mit_kd, dtype=np.float64).reshape(-1)
+            if kp.size == 1:
+                kp = np.repeat(kp, 7)
+            if kd.size == 1:
+                kd = np.repeat(kd, 7)
+            if kp.shape != (7,) or kd.shape != (7,):
+                raise ValueError("MTC firmware gains must be scalar or seven-vectors")
+            alpha = float(self.config.execution.mtc_alpha)
+            async_mtc = getattr(pipeline, "mtc_controller", None)
+            compute_timestamped = getattr(async_mtc, "compute_timestamped", None)
+            if callable(compute_timestamped) and getattr(async_mtc, "q_cmd_source", "wm_state") == "wm_state":
+                mtc_result = compute_timestamped(
+                    q=state.q,
+                    dq=state.dq,
+                    q_ref=q_ref,
+                    tau_ref=tau_ref,
+                )
+                q_ref = np.asarray(mtc_result.q_cmd, dtype=np.float64)
+                tau_pd = np.asarray(mtc_result.tau_pd, dtype=np.float64)
+                tau_cmd = np.asarray(mtc_result.tau_command, dtype=np.float64)
+            else:
+                tau_pd = kp * (q_ref - state.q) - kd * state.dq
+                tau_cmd = (1.0 - alpha) * tau_pd + alpha * tau_ref
+            if callable(clip_tau):
+                tau_cmd = clip_tau(tau_cmd)
+            t_ff = tau_cmd - tau_pd
+            if callable(clip_tau):
+                # Keep the transport packet within the same per-joint safety
+                # limit as the synchronous Contact WM path, then report the
+                # effective total torque that firmware can actually produce.
+                t_ff = clip_tau(t_ff)
+                tau_cmd = clip_tau(tau_pd + t_ff)
+            if self.command_enabled:
+                self.arm.command_joint_impedance(
+                    q=q_ref,
+                    v_des=np.zeros(7, dtype=np.float64),
+                    kp=kp,
+                    kd=kd,
+                    t_ff=t_ff,
+                )
+                self._set_q_cmd(q_ref)
+            return {
+                "q_ref": q_ref,
+                "tau_ref": tau_ref,
+                "tau_pd": tau_pd,
+                "tau_cmd": tau_cmd,
+                "t_ff": t_ff,
+                "alpha": alpha,
+            }
+
+        dp_worker = DPWorker(
+            infer_dp,
+            self.action_plan_buffer,
+            step_s=action_step_s,
+            source=self._sample_async_dp_observation,
         )
-        self._state_stream.start()
+        wm_worker = WMWorker(
+            self.state_history_buffer,
+            self.action_plan_buffer,
+            self.wm_target_buffer,
+            infer_wm,
+            prediction_horizon=prediction_horizon,
+            prediction_dt_s=prediction_dt_s,
+            request_period_s=max(1.0 / 16.0, prediction_dt_s),
+            state_horizon_s=self.state_history_buffer.horizon_s,
+            action_horizon_s=prediction_horizon * prediction_dt_s,
+        )
+        control_worker = ControlWorker(
+            self.state_history_buffer,
+            self.wm_target_buffer,
+            control,
+            rate_hz=1.0 / prediction_dt_s,
+        )
+        return TimestampFastSlowRuntime(
+            state_buffer=self.state_history_buffer,
+            action_buffer=self.action_plan_buffer,
+            target_buffer=self.wm_target_buffer,
+            dp_worker=dp_worker,
+            wm_worker=wm_worker,
+            control_worker=control_worker,
+        )
+
+    def _sample_async_dp_observation(self):
+        """Sample cameras/state and suppress duplicate image anchors for DP."""
+        observation = self._observation_sampler.sample()
+        if observation is None:
+            return None
+        anchors = tuple(
+            sorted(
+                (str(key), int(value))
+                for key, value in observation.image_timestamps_us.items()
+            )
+        )
+        if anchors == self._async_last_image_timestamps:
+            return None
+        self._async_last_image_timestamps = anchors
+        self._latest_frame = self._observation_sampler.latest_frame
+        self._latest_frames = self._observation_sampler.latest_frames
+        return observation
+
+    def _start_state_stream(self) -> None:
+        if self._continuous_state_stream_enabled:
+            self._state_stream.clear()
+            self._last_consumed_state_timestamp_us = 0
+            self._last_state_stream_rollover_count = self._state_stream.history_rollover_count
+            self._last_arm_timestamp_us = 0
+            log.info(
+                "continuous inference state stream started history=%d poll=%.1fms",
+                self._state_stream.history_size,
+                self._state_stream.poll_interval_s * 1.0e3,
+            )
+            self._state_stream.start()
+        if self._async_runtime is not None and not self._async_runtime.control_worker.running:
+            self._async_runtime.start()
 
     def _stop_state_stream(self, *, clear: bool = False) -> None:
-        if not self._continuous_state_stream_enabled:
-            return
-        self._state_stream.stop()
+        if self._async_runtime is not None:
+            self._async_runtime.stop()
+        if self._continuous_state_stream_enabled:
+            self._state_stream.stop()
+            if clear:
+                self._state_stream.clear()
+            self._last_consumed_state_timestamp_us = 0
+            self._last_state_stream_rollover_count = self._state_stream.history_rollover_count
         if clear:
-            self._state_stream.clear()
-        self._last_consumed_state_timestamp_us = 0
-        self._last_state_stream_rollover_count = self._state_stream.history_rollover_count
+            self.state_history_buffer.clear()
+            self.action_plan_buffer.clear()
+            self.wm_target_buffer.clear()
 
     def start(self) -> None:
         if self._started:
@@ -594,6 +815,7 @@ class NeroInferenceRuntime:
         # exactly one pipeline control cycle even when cameras or CAN lag.
         manual_step = bool(single_step)
         step_requested = False
+        async_cycle_base = 0
         final_reset_succeeded = False
         failed = False
         log.info(
@@ -629,6 +851,36 @@ class NeroInferenceRuntime:
                     manual_step = False
                     step_requested = False
                     log.info("continuous inference resumed")
+                if self._timestamp_async_enabled:
+                    assert self._async_runtime is not None
+                    for worker in (
+                        self._async_runtime.dp_worker,
+                        self._async_runtime.wm_worker,
+                        self._async_runtime.control_worker,
+                    ):
+                        fault = worker.fault
+                        if fault is not None:
+                            raise RuntimeError(
+                                f"asynchronous {worker._name} failed"
+                            ) from fault
+                    total_cycles = self._async_runtime.cycles
+                    episode_steps = total_cycles - async_cycle_base
+                    maximum_steps = self.config.runtime.maximum_inference_steps
+                    if maximum_steps is not None and episode_steps >= maximum_steps:
+                        log.info(
+                            "ending inference episode %d: reached maximum_steps=%d",
+                            self._episode_index,
+                            maximum_steps,
+                        )
+                        self._restart_episode()
+                        async_cycle_base = self._async_runtime.cycles
+                        self._episode_index += 1
+                        episode_steps = 0
+                        log.info("inference episode %d started", self._episode_index)
+                    # DP/WM/control run independently; this thread only handles
+                    # lifecycle and operator input and never calls model inference.
+                    time.sleep(0.002)
+                    continue
                 if manual_step and not step_requested:
                     # TerminalKeys is non-blocking; avoid spinning while the
                     # operator is inspecting the last command/visualization.
@@ -704,7 +956,7 @@ class NeroInferenceRuntime:
         self._end_episode_state()
         if self.command_enabled:
             self._reset_arm_to_rest("episode boundary")
-        # SWM's delta_q is relative to the command held in this episode.  Do
+        # Contact WM's delta_q is relative to the command held in this episode.  Do
         # not carry a prior episode's q_cmd across the reset; seed the new
         # history from the post-reset measured state before restarting the
         # fixed-rate stream.
@@ -731,6 +983,7 @@ class NeroInferenceRuntime:
         self.tau_ext_plotter.clear_history()
         self._latest_frame = None
         self._latest_frames.clear()
+        self._async_last_image_timestamps = None
         self._reset_observation_protection()
 
     def _reset_observation_protection(self) -> None:
@@ -789,29 +1042,7 @@ class NeroInferenceRuntime:
             return
         if not self.command_enabled or not self.config.predictor.enabled:
             return
-        if (
-            self.config.predictor.mode
-            in {
-                "contact_world_model",
-                "contact_world_model_opd",
-                "contact_wm",
-                "contact_wm_opd",
-            }
-            and self.config.execution.mode == "q"
-        ):
-            return
-        if (
-            self.config.predictor.mode
-            in {
-                "swm",
-                "swm_opd",
-                "torque_world_model",
-                "torque_world_model_opd",
-                "torque_wm",
-                "torque_wm_opd",
-            }
-            and self.config.execution.mode == "q"
-        ):
+        if self.config.predictor.mode in _CONTACT_WORLD_MODEL_MODES and self.config.execution.mode == "q":
             return
         self.arm.validate_joint_impedance_support()
         self.arm.configure_joint_impedance_mode()
@@ -1077,6 +1308,11 @@ class NeroInferenceRuntime:
             )
         self._last_valid_arm_state_s = time.monotonic()
         self._last_arm_timestamp_us = sample.timestamp_us
+        if self._timestamp_async_enabled and not self._continuous_state_stream_enabled:
+            # Mock/offline backends do not run the dedicated state-stream
+            # thread; the DP sampler's state read is their 100 Hz acquisition
+            # source and must feed the same timestamped history.
+            self._on_stream_sample(sample)
         return sample
 
     def _drain_state_observations(self) -> None:
@@ -1096,6 +1332,12 @@ class NeroInferenceRuntime:
                 self._state_stream.history_size,
             )
             self._last_state_stream_rollover_count = rollover_count
+        if self._timestamp_async_enabled:
+            # StateHistoryBuffer is fed directly by the stream callback.  Do
+            # not also mutate ContactWMInferencePipeline's legacy history: that
+            # path belongs to synchronous ``step`` compatibility only.
+            self._last_consumed_state_timestamp_us = records[-1].timestamp_us
+            return
         # Legacy DP/WM pipelines maintain their own high-rate CAN history.
         # Modular policies receive the canonical observation directly; only
         # call an optional history hook when the injected object explicitly
@@ -1113,14 +1355,7 @@ class NeroInferenceRuntime:
                 wrench=record.wrench,
                 timestamp_s=record.timestamp_us * 1.0e-6,
             )
-            if self.config.predictor.mode in {
-                "swm",
-                "swm_opd",
-                "torque_world_model",
-                "torque_world_model_opd",
-                "torque_wm",
-                "torque_wm_opd",
-            }:
+            if self.config.predictor.mode in _CONTACT_WORLD_MODEL_MODES:
                 values["q_cmd"] = getattr(record, "q_cmd", None)
             if callable(append_history):
                 append_history(**values)
@@ -1129,6 +1364,11 @@ class NeroInferenceRuntime:
     def step(self):
         if not self._started:
             raise RuntimeError("runtime must be started before step()")
+        if self._timestamp_async_enabled:
+            # In timestamped mode the control worker owns the 100 Hz cadence;
+            # a foreground ``step`` is only a non-blocking diagnostics read.
+            assert self._async_runtime is not None
+            return self._async_runtime.last_output
         return self.pipeline_runner.step()
 
     def _get_q_cmd(self, timestamp_us: int) -> np.ndarray | None:
@@ -1179,25 +1419,7 @@ class NeroInferenceRuntime:
                 and self.command_enabled
                 and self.config.predictor.enabled
                 and not (
-                    self.config.predictor.mode
-                    in {
-                        "contact_world_model",
-                        "contact_world_model_opd",
-                        "contact_wm",
-                        "contact_wm_opd",
-                    }
-                    and self.config.execution.mode == "q"
-                )
-                and not (
-                    self.config.predictor.mode
-                    in {
-                        "swm",
-                        "swm_opd",
-                        "torque_world_model",
-                        "torque_world_model_opd",
-                        "torque_wm",
-                        "torque_wm_opd",
-                    }
+                    self.config.predictor.mode in _CONTACT_WORLD_MODEL_MODES
                     and self.config.execution.mode == "q"
                 )
             ):

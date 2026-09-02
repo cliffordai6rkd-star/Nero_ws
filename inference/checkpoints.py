@@ -105,6 +105,32 @@ def _prepare_optional_package_source(target: Any, *, kind: str) -> None:
         break
 
 
+def _prepare_pinn_source() -> None:
+    """Expose the sibling PINN checkout when it is not installed as a wheel."""
+
+    candidates = (
+        Path(__file__).resolve().parents[2] / "PINN",
+        Path("/mnt/code/lcx/PINN"),
+        Path("/home/rei/mnt/code/lcx/PINN"),
+    )
+    for root in candidates:
+        if not (root / "model" / "pinn_model").is_dir():
+            continue
+        root_text = str(root)
+        if root_text not in sys.path:
+            sys.path.insert(0, root_text)
+        package = sys.modules.get("model")
+        package_path = getattr(package, "__path__", None)
+        if package_path is not None:
+            source_text = str(root / "model")
+            if source_text not in package_path:
+                try:
+                    package_path.insert(0, source_text)
+                except (AttributeError, TypeError):
+                    package.__path__ = [source_text, *list(package_path)]
+        return
+
+
 def restore_checkpoint_model(
     path: str | Path,
     device: str,
@@ -115,6 +141,24 @@ def restore_checkpoint_model(
     model_overrides: Mapping[str, Any] | None = None,
 ) -> Any:
     """Instantiate a model solely from checkpoint cfg and restore its weights."""
+    pinn_mode = str(pinn_mode).strip().lower().replace("-", "_")
+    # Keep old mode strings source-compatible while making ContactWorldModel
+    # v2 the only WM implementation that can be restored.
+    wm_aliases = {
+        "world_model": "contact_world_model",
+        "world_model_v3": "contact_world_model",
+        "world_model_v4": "contact_world_model",
+        "world_model_v5": "contact_world_model",
+        "swm": "contact_world_model",
+        "torque_world_model": "contact_world_model",
+        "torque_wm": "contact_world_model",
+        "swm_opd": "contact_world_model_opd",
+        "torque_world_model_opd": "contact_world_model_opd",
+        "torque_wm_opd": "contact_world_model_opd",
+        "contact_wm": "contact_world_model",
+        "contact_wm_opd": "contact_world_model_opd",
+    }
+    pinn_mode = wm_aliases.get(pinn_mode, pinn_mode)
     try:
         import torch
     except ImportError as exc:
@@ -144,18 +188,29 @@ def restore_checkpoint_model(
             )
     if not checkpoint_path.is_file():
         raise CheckpointError(f"{kind} checkpoint does not exist: {checkpoint_path}")
-    with checkpoint_path.open("rb") as stream:
-        try:
-            import dill
-
-            payload = torch.load(
-                stream,
-                map_location="cpu",
-                pickle_module=dill,
-                weights_only=False,
-            )
-        except ImportError:
-            payload = torch.load(stream, map_location="cpu", weights_only=False)
+    try:
+        import dill
+    except ImportError:
+        dill = None
+    try:
+        # Open a fresh stream for the fallback path.  ``torch.load`` may have
+        # consumed bytes before raising a missing-class ImportError, so the
+        # same file handle cannot safely be reused.
+        with checkpoint_path.open("rb") as stream:
+            if dill is None:
+                payload = torch.load(stream, map_location="cpu", weights_only=False)
+            else:
+                payload = torch.load(
+                    stream,
+                    map_location="cpu",
+                    pickle_module=dill,
+                    weights_only=False,
+                )
+    except ModuleNotFoundError as exc:
+        raise CheckpointError(
+            f"{kind} checkpoint deserialization requires missing module "
+            f"{exc.name!r}"
+        ) from exc
     if not isinstance(payload, Mapping):
         raise CheckpointError(f"{kind} checkpoint root must be a mapping")
     cfg = payload.get("cfg", payload.get("config"))
@@ -214,49 +269,24 @@ def restore_checkpoint_model(
                         del scheduler_cfg[key]
         model = hydra.utils.instantiate(model_cfg)
     elif kind.upper() == "PINN":
+        _prepare_pinn_source()
         try:
             if pinn_mode == "wrench_gru":
                 from model.pinn_model.model_v1 import WrenchSequenceGRUV1
 
                 model_type = WrenchSequenceGRUV1
-            elif pinn_mode == "world_model_v3":
-                from model.pinn_model.model_v3 import DeterministicWorldModelV3
-
-                model_type = DeterministicWorldModelV3
-            elif pinn_mode == "world_model_v4":
-                from model.pinn_model.model_v4 import DeterministicWorldModelV4
-
-                model_type = DeterministicWorldModelV4
-            elif pinn_mode == "world_model_v5":
-                from model.pinn_model.model_v5 import StateToStateFlowWorldModelV5
-
-                model_type = StateToStateFlowWorldModelV5
             elif pinn_mode in {
                 "contact_world_model",
                 "contact_world_model_opd",
                 "contact_wm",
                 "contact_wm_opd",
             }:
-                from model.pinn_model.torque_world_model import TorqueWorldModel
+                from model.pinn_model.contact_world_model import ContactWorldModel
 
-                model_type = TorqueWorldModel
-            elif pinn_mode in {
-                "swm",
-                "swm_opd",
-                "torque_world_model",
-                "torque_world_model_opd",
-                "torque_wm",
-                "torque_wm_opd",
-            }:
-                from model.pinn_model.torque_world_model import TorqueWorldModel
-
-                model_type = TorqueWorldModel
+                model_type = ContactWorldModel
             else:
                 raise CheckpointError(
-                    "pinn_mode must be 'wrench_gru', 'world_model_v3', "
-                    "'world_model_v4', 'world_model_v5', "
-                    "'contact_world_model', 'contact_world_model_opd', "
-                    "'swm', or 'swm_opd', "
+                    "pinn_mode must be 'wrench_gru' or a Contact World Model mode, "
                     f"got {pinn_mode!r}"
                 )
         except ImportError as exc:
@@ -276,42 +306,25 @@ def restore_checkpoint_model(
         "contact_wm",
         "contact_wm_opd",
     }:
-        contact_contract = bool(getattr(model, "q_tau_contact_contract", False))
-        contact_contract = contact_contract or (
-            str(getattr(model, "state_contract", "")).lower() == "q_tau_contact"
-        )
-        if not contact_contract:
+        expected_version = getattr(model, "MODEL_VERSION", "contact_world_model_v2")
+        if payload.get("model_version") != expected_version:
             raise CheckpointError(
-                "contact world-model inference requires checkpoint model.state_contract="
-                "'q_tau_contact'"
-            )
-
-    if kind.upper() == "PINN" and pinn_mode in {
-        "swm",
-        "swm_opd",
-        "torque_world_model",
-        "torque_world_model_opd",
-        "torque_wm",
-        "torque_wm_opd",
-    }:
-        state_contract = str(getattr(model, "state_contract", "")).lower()
-        if state_contract != "q_dq_delta_q_tau":
-            raise CheckpointError(
-                "SWM inference requires checkpoint model.state_contract="
-                "'q_dq_delta_q_tau'"
-            )
-        supported = tuple(getattr(model, "SUPPORTED_INPUTS", ()))
-        required = {"q", "dq", "delta_q", "tau"}
-        if supported and not required.issubset(set(supported)):
-            raise CheckpointError(
-                "SWM checkpoint model.SUPPORTED_INPUTS must include q, dq, delta_q, tau"
+                "WM checkpoint is not a canonical ContactWorldModel v2 checkpoint: "
+                f"model_version={payload.get('model_version')!r}, "
+                f"expected={expected_version!r}"
             )
         configured_inputs = tuple(getattr(model, "inputs", ()))
-        if configured_inputs and not required.issubset(
-            {str(value).lower() for value in configured_inputs}
-        ):
+        required_inputs = ("q", "dq", "delta_q", "tau")
+        if configured_inputs != required_inputs:
             raise CheckpointError(
-                "SWM checkpoint model.inputs must include q, dq, delta_q, tau"
+                "ContactWorldModel inference requires model.inputs="
+                f"{list(required_inputs)}, got {list(configured_inputs)}"
+            )
+        if int(getattr(model, "joint_dim", 7)) != 7 or int(
+            getattr(model, "action_dim", 7)
+        ) != 7:
+            raise CheckpointError(
+                "ContactWorldModel inference requires joint_dim=7 and action_dim=7"
             )
 
     state_dicts = payload.get("state_dicts")

@@ -22,36 +22,31 @@ from nero_collection.control import PinocchioDynamicsModel
 log = logging.getLogger(__name__)
 
 
-_LINK7_TARGET_GRIPPER_TCP_CURRENT_CHECKPOINT = Path(
-    "/mnt/code/lcx/PINN/outputs/contact_world_model_opd_sweep/20260819_113728/"
-    "teacher/checkpoints/step_00100000.pt"
-).resolve()
-
-
-_Q_TAU_WORLD_MODEL_MODES = frozenset(
-    ("world_model_v4", "world_model_v5")
-)
+# Kept as empty compatibility constants so old imports do not break.  WM
+# dispatch is now handled exclusively by ContactWMInferencePipeline.
+_Q_TAU_WORLD_MODEL_MODES = frozenset()
 _CONTACT_WORLD_MODEL_MODES = frozenset(
     (
         "contact_world_model",
         "contact_world_model_opd",
         "contact_wm",
         "contact_wm_opd",
-    )
-)
-_SWM_MODES = frozenset(
-    (
+        # Compatibility spellings. They all use ContactWorldModel v2; no
+        # separate legacy world-model implementation remains.
         "swm",
         "swm_opd",
         "torque_world_model",
         "torque_world_model_opd",
         "torque_wm",
         "torque_wm_opd",
+        "world_model",
+        "world_model_v3",
+        "world_model_v4",
+        "world_model_v5",
     )
 )
-_WORLD_MODEL_MODES = frozenset(
-    ("world_model_v3", *_Q_TAU_WORLD_MODEL_MODES)
-)
+_SWM_MODES = frozenset()
+_WORLD_MODEL_MODES = frozenset()
 
 
 @dataclass
@@ -100,9 +95,9 @@ class InferenceInput:
     timestamp_s: float
     wrench_to_control_rotation: np.ndarray | None = None
     image_timestamp_s: float | Mapping[str, float] | None = None
-    # Command held by the follower at this state sample.  SWM training uses
-    # q_cmd-q as delta_q; legacy callers may omit it and the SWM pipeline
-    # falls back to the currently held DP joint action.
+    # Command held by the follower at this state sample. Contact WM training uses
+    # q_cmd-q as delta_q; offline callers may omit it and the Contact WM pipeline
+    # falls back to the last known command or the measured q.
     q_cmd: np.ndarray | None = None
 
 
@@ -258,7 +253,7 @@ class NeroInferencePipeline:
         ):
             raise ValueError(
                 "the legacy wrench_gru torque-control path was removed with its "
-                "optimizer; use a contact/SWM world model with "
+                "optimizer; use a Contact WM pipeline with "
                 "execution.mode=q, mtc, or tau"
             )
         if controller is None:
@@ -444,11 +439,7 @@ class NeroInferencePipeline:
         self._pinn_action_condition_mode = str(
             pinn_model_config.get("action_condition_mode", "relative_pose")
         ).lower()
-        if self._predictor_mode in _SWM_MODES:
-            # Native SWM consumes direct joint actions; it builds its own
-            # action/mask condition in ``SWMInferencePipeline``.
-            self._pinn_action_condition_mode = "direct"
-        elif self._pinn_action_condition_mode not in {
+        if self._pinn_action_condition_mode not in {
             "absolute_pose",
             "relative_pose",
         }:
@@ -460,14 +451,7 @@ class NeroInferencePipeline:
         self._pinn_future_horizon = int(getattr(self.pinn, "future_horizon", 1))
         configured_action_fill = config.predictor.action_condition_fill
         self._pinn_action_condition_fill = (
-            "hold"
-            if configured_action_fill == "auto"
-            and self._predictor_mode == "world_model_v5"
-            else (
-                "chunk"
-                if configured_action_fill == "auto"
-                else configured_action_fill
-            )
+            "chunk" if configured_action_fill == "auto" else configured_action_fill
         )
         loss_config = (
             checkpoint_config.get("loss", {})
@@ -503,14 +487,6 @@ class NeroInferencePipeline:
         self._action_frame_name = str(action_frame_name)
         self._control_frame_name = config.robot.frame_name
         self._wm_current_frame_name = self._action_frame_name
-        if _uses_link7_target_gripper_tcp_current_contract(config):
-            self._action_frame_name = "link7"
-            self._wm_current_frame_name = "gripper_tcp"
-            log.info(
-                "applying checkpoint-specific WM frame contract: "
-                "target_action=link7 current_ee_pose=gripper_tcp checkpoint=%s",
-                config.pinn_checkpoint.path,
-            )
         self._action_to_control_transform: np.ndarray | None = None
         self._target_wrenches = np.zeros((self._control_horizon_steps, 6), dtype=np.float64)
         self._last_tau: np.ndarray | None = None
@@ -677,7 +653,7 @@ class NeroInferencePipeline:
         self._timing_pinn_s += perf_counter() - pinn_started_s
         raise RuntimeError(
             "the legacy wrench/world-model torque path was removed; use the "
-            "contact-WM or SWM pipeline with execution.mode=q, mtc, or tau"
+            "Contact WM pipeline with execution.mode=q, mtc, or tau"
         )
 
     def _update_dp_execution(
@@ -1867,8 +1843,9 @@ class NeroInferencePipeline:
         ):
             return
         # The continuous observation stage exposes both legacy (v/a) and
-        # canonical (dq/ddq) aliases, plus optional q_cmd for SWM.  Select the
-        # exact legacy contract here instead of rejecting harmless metadata.
+        # Canonical (dq/ddq) aliases plus optional q_cmd are accepted here so
+        # the continuous state bridge can feed Contact WM without discarding
+        # metadata from the hardware stream.
         values = {
             key: np.asarray(value, dtype=np.float32).copy()
             for key, value in values.items()
@@ -2606,15 +2583,20 @@ def _predict_dp_action(
     # and tests that imported it from the legacy module.
     return predict_diffusion_action(model, obs, action_type=action_type)
 
+
 def _uses_link7_target_gripper_tcp_current_contract(
     config: InferenceConfig,
 ) -> bool:
-    checkpoint = config.pinn_checkpoint
-    return (
-        checkpoint is not None
-        and checkpoint.path.resolve()
-        == _LINK7_TARGET_GRIPPER_TCP_CURRENT_CHECKPOINT
-    )
+    """Deprecated compatibility probe for the removed legacy frame split.
+
+    Contact WM v2 uses direct seven-joint action tokens, so no checkpoint gets
+    the historical ``link7``/``gripper_tcp`` override anymore.  Keep the
+    symbol importable for downstream diagnostics while making the old special
+    case permanently inactive.
+    """
+
+    del config
+    return False
 
 
 def _model_device(model: Any) -> Any:

@@ -54,18 +54,15 @@ cameras:
 
 `predictor.enabled` 是执行链路开关：
 
-- `true`：加载 contact/SWM predictor，并按 `execution.mode` 选择 MTC、q 或 tau；
+- `true`：加载 PINN Contact World Model v2，并按 `execution.mode` 选择 MTC、q 或 tau；
 - `false`：不加载 `pinn_checkpoint`，DP action -> IK -> `q`，runtime 通过
   `command_joint_positions()` 下发关节位置。
 
 顶层 `action` 声明 DP checkpoint 的 7 维输出语义：
 
 - `action: eepose`（默认）：`[x,y,z,qx,qy,qz,qw]`，纯 DP 分支通过 IK 执行；
-- `action: joint`：绝对七轴 `q`，纯 DP 分支直接执行，不调用 IK。启用 WM 时，整段
-  joint action 会先用 URDF 对 `robot.action_frame_name` 做 FK，再以相同的
-  `[x,y,z,qx,qy,qz,qw]` pose 契约输入 WM。一般情况下 WM 的 target/current pose
-  使用同一 action frame；`contact_world_model_opd_sweep/.../step_00100000.pt` 因训练
-  数据契约特殊，推理端临时固定复现 `target=link7, current=gripper_tcp`。
+- `action: joint`：绝对七轴 `q`，纯 DP 分支直接执行，不调用 IK。启用 Contact WM 时，
+  action token 也直接以 7 维绝对关节位置传入，不经过末端位姿 FK 或旧的 frame 特例。
 
 关闭 predictor 时的数据流为：
 
@@ -115,18 +112,12 @@ predictor:
 
 `predictor.action_condition_fill` 控制高频 PINN 如何消费低频 DP action：
 
-- `auto`：`world_model_v5` 使用 `hold`，其他 predictor 使用 `chunk`；
+- `auto`：Contact WM v2 使用 `chunk`；
 - `hold`：DP 新结果安装时锁存当前安全 action，并重复填满整个 PINN future horizon；
 - `chunk`：输入尚未执行的 DP action chunk，长度不足时保持最后一帧补齐。
 
-V5 默认 hold 的锁存值只在 DP 真正更新时改变，不随高频 PINN 周期或 QP action chunk
-游标推进而改变。因此 80 Hz V5 在两次低频 DP 更新之间始终收到相同的 `[1,F,7]`
-action condition。
-
-严格保持一个 DP action 时应使用 `action_chunk_mode: first`（或 `mean`）配合 `hold`，
-保证 QP 和 V5 使用同一个目标。如果 `action_chunk_mode: all` 需要执行完整 action chunk，
-应把 `action_condition_fill` 改为 `chunk`；`all + hold` 会让 QP waypoint 与 V5 condition
-逐渐不一致，只适合有意进行该消融时使用。
+Contact WM v2 的 action condition 始终取当前尚未执行的 DP chunk，长度不足时重复最后一帧
+补齐到 checkpoint 声明的 8 个 token；这与训练时的 direct action padding 语义一致。
 
 `ik` 配置收敛容差、阻尼、迭代步长和关节限位 margin；IK 不收敛时拒绝下发。
 `safety.maximum_joint_position_step_rad` 再限制每个控制周期相对当前 `q` 的最大变化。
@@ -192,30 +183,28 @@ python scripts/infer_h5_direct_ik.py \
 `pinn_checkpoint`，并通过 `dp_checkpoint.dino_model_path` 使用
 `/mnt/code/lcx/model/dinov3-vitb16-pretrain-lvd1689m` 的本地 backbone，不访问网络。
 
-`predictor.mode` 提供多类可切换的状态/力预测后端：
+当前唯一的 WM 推理契约是 PINN `ContactWorldModel v2`。配置支持的规范模式为
+`contact_world_model` 和 `contact_world_model_opd`；历史 `swm`、`torque_world_model`、
+`world_model_v3/v4/v5` 字符串只在配置解析时兼容映射到这两个模式，不再实例化旧模型。
 
-- `wrench_gru`：原 V1，GRU 直接预测 future wrench；
-- `world_model_v3`：V3 联合预测 future `q/v/a/tau`，再经过 Nero 接触力链得到
-  future wrench。V3 内部生成的 wrench 仅用于训练正则，部署时不会作为控制目标。
-- `world_model_v4`：V4 只预测 future `q/tau`，再由 checkpoint 内保存的 Nero
-  因果状态估计契约重建 future `v/a`，最后经过同一接触力链得到 future wrench。
-- `world_model_v5`：V5 从历史末段 `[q,tau,0]` 出发，用条件 Flow ODE 联合生成
-  future `q/tau/contact logit`，再因果重建 `v/a` 并经过同一 Nero 接触力链。
+`inference/configs/nero_contact_wm.yaml` 默认加载
+`model/carswm/latest.pt`，并使用 `model/dp/pretrained_model-20260901T082955Z-1-001/pretrained_model`
+作为 LeRobot DP。该 Contact WM checkpoint
+必须包含 `model_version: contact_world_model_v2`、`model.inputs: [q, dq, delta_q, tau]`、
+`joint_dim=7` 和 `action_dim=7`。运行时输入为 50 个 100 Hz 的
+`q/dq/delta_q/tau` 历史与 8 个 25 Hz、7 维绝对关节 action token；输出为 32 步 future
+`q/dq/delta_q/tau` 及可选的三阶段 `contact_state_pred`。所有低维输入和输出均按 checkpoint
+中的 `normalizer` 处理，`delta_q` 始终由实际 command history 的 `q_cmd - q` 构造。
 
-当前 `inference/configs/nero_contact_wm.yaml` 和 `nero_swm.yaml` 均收束到
-`model/carswm/epoch_0001200.pt`，统一使用原生 `SWMInferencePipeline`。该 checkpoint
-的输入是 50 个 100 Hz 的 `q/dq/delta_q/tau` 历史和 8 个 25 Hz、7 维绝对关节 action
-token；输出 future `q/dq/delta_q/tau` 及三阶段 contact state。`delta_q` 始终按实际下发的
-`q_cmd - q` 构造，输入归一化和 flow 推理步数直接读取 checkpoint 元数据。
-
-旧 `ContactWMInferencePipeline` 仍保留用于历史 `q_tau_contact` checkpoint，但不再用于
-上述 `carswm` 文件。使用这两个配置时，通过 `execution.mode` 选择三种执行方式：
+使用配置时，通过 `execution.mode` 选择三种执行方式：
 
 - `mtc`：计算 `tau_qv = Kp(q_cmd-q)-Kd*dq+g(q)`，再与 WM 第一帧
   `tau_pred` 按 `mtc_alpha` 融合。`mtc_q_cmd_source: wm_state` 使用 `q_hat`；
   `wm_delta` 使用 `q_hat + delta_q_hat`。固件继续使用配置的 `mit_kp/mit_kd`、
   零速度目标，`torque_target` 只发送 `tau_cmd - tau_pd` 的残差，避免重复叠加
-  固件已经计算的位置/速度反馈。
+  固件已经计算的位置/速度反馈。timestamp asynchronous worker 使用
+  `tau_cmd=(1-alpha)tau_pd+alpha*tau_ref`，其中 `alpha` 是 WM 权重，`q_ref` 按
+  100 Hz 直接消费。
 - `q`：对预测 q 做关节限位/单周期步长保护后调用 `command_joint_positions()`。
 - `tau`：仅下发限幅/滤波后的 WM `tau_pred`。硬件使用 MIT 报文作为传输
   envelope，但 `q/dq` 反馈增益固定为零，因此不会叠加 `kp/kd`、重力或其它控制项。
@@ -223,43 +212,30 @@ token；输出 future `q/dq/delta_q/tau` 及三阶段 contact state。`delta_q` 
 `execution.mode: mtc` 只发送残差 `torque_target`；
 `tau_command` 是按当前采样的 q/dq 计算出的融合总力矩（触发发送限幅时记录限幅后的值）。
 
-原生 SWM（`predictor.mode: swm` 或 `swm_opd`）使用 PINN checkpoint 中声明的
-`q/dq/delta_q/tau` 四路 100 Hz 状态历史，以及 25 Hz 的 7 维绝对关节 action chunk。
-运行时不会在这四路输入外追加滤波；checkpoint 内的 normalizer 和模型预处理负责训练时
-的变换。`delta_q` 始终按实际下发的 `q_cmd - q` 构造，首个状态样本没有上一条命令时为零。
-SWM 的 `dataloader.expert_fps` 是动作推进时钟，必须与 DP checkpoint 的动作时间步一致；
-不一致会在启动时拒绝，避免动作 chunk 被错误地按另一频率消费。SWM 输出可以通过
-`execution.mode` 选择：
-
-- `q`：下发限幅后的预测 q；
-- `mtc`：按 `mtc_alpha` 融合 q/v/gravity 候选与预测 tau，并通过固定 MIT 增益发送残差 feedforward；
-- `tau`：仅下发经过限幅/滤波的预测 `tau_pred`，硬件传输时 `kp=kd=0`；
-
 最小配置形态如下：
 
 ```yaml
 dp_checkpoint:
-  path: ../../../model/dp/insert_usb/200ep/optimizer_step=00095000.ckpt
-  image_encoder: imagenet
+  path: ../../model/dp/pretrained_model-20260901T082955Z-1-001/pretrained_model
   device: cuda:0
   use_ema: true
 
 pinn_checkpoint:
-  path: ../../model/carswm/epoch_0001200.pt
+  path: ../../model/carswm/latest.pt
   device: cuda:0
   use_ema: true
 
 action: joint
 predictor:
   enabled: true
-  mode: swm_opd
+  mode: contact_world_model
   inference_mode: asynchronous
   action_chunk_mode: all
   action_execution_mode: chunk
-  action_step_s: null
+  action_step_s: 0.04
 
 execution:
-  mode: q  # mtc / tau
+  mode: mtc  # q / tau
 ```
 
 在线启动时需让当前工作区和 PINN 源码都可导入：
@@ -268,7 +244,7 @@ execution:
 conda run -n nero_dp bash -lc '\
   cd /home/rei/mnt/code/lcx/nero_ws && \
   PYTHONPATH=.:/home/rei/mnt/code/lcx/PINN python -m inference.cli \
-    --config inference/configs/nero_swm.yaml \
+    --config inference/configs/nero_contact_wm.yaml \
     --run --backend pyagxarm --enable-command'
 ```
 
@@ -285,7 +261,7 @@ python -m inference.cli --config inference/configs/nero_contact_wm.yaml --check
 `q` 是软件 PD 位置伺服，`mtc` 是固定固件增益下的融合总力矩，`tau` 直接使用
 `tau_command`；三种模式都不会直接写 `data.qpos`。
 
-默认每 10 ms 调一次策略、每 1 ms 做 MuJoCo 子步。SWM 接收 50 个 100 Hz 的
+默认每 10 ms 调一次策略、每 1 ms 做 MuJoCo 子步。Contact WM v2 接收 50 个 100 Hz 的
 q/dq/delta_q/tau 历史和 DP 的 8 个 7 维绝对关节 action token。默认 `recorded` 观测模式用 H5 的 q/dq/ddq/tau
 作为策略输入，同时记录仿真状态；要检查闭环漂移可使用 `hybrid_closed_loop`，此时图像和
 wrench 仍来自 H5，而 q/dq/tau 改用仿真上一周期状态。
@@ -302,9 +278,10 @@ python scripts/infer_h5_mujoco.py \
   --mode mtc --max-steps 200 --output /tmp/nero_mujoco_mtc.npz
 ```
 
-`--dp-checkpoint` and `--pinn-checkpoint` are optional overrides.  The checked-in
-contact/SWM YAML uses paths relative to the repository config directory (for
-example `../../model/carswm/epoch_0001200.pt`); replace only the DP path when
+`--dp-checkpoint` and `--pinn-checkpoint` are optional overrides. The checked-in
+Contact WM YAML uses paths relative to the repository config directory (the PINN
+checkpoint is `../../../PINN/outputs/contact_world_model_ep2_multytoken/checkpoints/latest.pt`);
+replace only the DP path when
 using a different policy checkpoint.  The CLI validates both checkpoint files
 and the local DINO directory before allocating the models, so a stale path fails
 with a short actionable message.  For a pure DP -> IK replay,
@@ -328,46 +305,14 @@ Python 环境，代码会明确报告该依赖错误。
 离线 runner 要求 `predictor.inference_mode: open_loop`，这样 DP 在新图像窗口到达时同步
 更新，结果不依赖主机线程调度；只有明确接受非确定性时才传 `--allow-asynchronous`。
 
-V3 运行时数据流为：
+Contact WM v2 运行时数据流为：
 
 ```text
-image + wrench history -> DP checkpoint -> action_target (xyz + xyzw)
-q/v/a/tau/wrench history + future action -> world_model_v3 -> future q/v/a/tau
-future q/v/a/tau -> RNEA tau_g + frozen tau_other - tau -> tau_ext_cal
-tau_ext -> damped J(q)^T inverse -> future target wrench_ext
-legacy wrench reference (no longer executable; migrate to contact/SWM q, mtc or tau)
-```
-
-V4 运行时数据流为：
-
-```text
-image + wrench history -> DP checkpoint -> action_target (xyz + xyzw)
-DP physical action -> V4 checkpoint action normalization
-q/tau history + normalized future action -> world_model_v4 -> future q/tau
-[observed q history, predicted future q]
-  -> causal q mean/LPF -> difference -> dq LPF -> difference -> ddq LPF
-future q/dq/ddq/tau -> RNEA tau_g + frozen tau_other - tau -> tau_ext_cal
-tau_ext -> damped J(q)^T inverse -> future target wrench_ext
-legacy wrench reference (no longer executable; migrate to contact/SWM q, mtc or tau)
-```
-
-V5 运行时数据流为：
-
-```text
-image + wrench history -> DP checkpoint -> future action chunk
-q/tau history + normalized future action -> state/action GRU + Cross-Attention
-recent [q,tau,0] -> checkpoint-configured 8-step Heun Flow ODE
-Flow -> future q/tau/contact logit
-future q -> checkpoint causal estimator -> future v/a
-future q/v/a/tau -> Nero physical chain -> raw future wrench_ext
-sigmoid(contact logit) >= probability_threshold -> hard-gated target wrench_ext
-legacy wrench reference (no longer executable; migrate to contact/SWM q, mtc or tau)
-```
-
-V1 运行时仍为：
-
-```text
-current q/v/a/tau + future action -> wrench_gru -> future target wrench_ext
+image + wrench history -> DP checkpoint -> 8-token absolute joint action
+q/dq/delta_q/tau history + action/action_mask -> ContactWorldModel v2
+  -> future q/dq/delta_q/tau/contact_state
+future q -> q command (mode=q) or MTC q_cmd
+future tau -> causal torque filter (mode=tau or MTC feed-forward)
 ```
 
 历史 `configs/nero_pipeline.yaml` 已随旧控制链删除。当前配置仍通过
@@ -380,10 +325,9 @@ current q/v/a/tau + future action -> wrench_gru -> future target wrench_ext
 - `tau_ext -> wrench_ext` 阻尼 Jacobian 映射。
 
 `predictor.enabled: false` 时 `pinn_checkpoint` 可从 YAML 中完全省略。开启 predictor 时，
-DP/PINN 的网络参数、输入维度、horizon、action condition 模式、末端 frame
-和归一化器必须保存在 checkpoint 的 `cfg`/`config` 中，推理配置不会重复声明它们。
-`predictor.mode` 只选择 checkpoint 的运行时输出契约，并不重复声明网络结构；切换 mode
-时必须同时把 `pinn_checkpoint.path` 换成相应的 V1/V3/V4/V5 checkpoint。
+Contact WM 的网络参数、输入维度、horizon、action condition 和归一化器必须保存在
+checkpoint 的 `config`/`normalizer` 中，推理配置不会重复声明它们。加载器会在恢复权重前
+校验 v2 版本、四路输入以及 7 维关节/action；旧 V1/V3/V4/V5 或旧 OPD 权重会明确拒绝。
 
 完整在线观测链为：
 
@@ -470,16 +414,20 @@ normalizer 之前。
 
 - `open_loop` 下 DP 仅在 action 计划完成后同步推理一次；`asynchronous` 下才使用独立
   worker，并且仅在出现新的训练频率 image anchor 时提交，避免对同一观测反复采样。
-- `wrench_gru` 每个控制周期使用最新机器人状态和完整 future action chunk 推理，
-  `forward_step()` 的 GRU 循环状态会跨周期携带。
-- `world_model_v3/v4/v5` 独立维护 checkpoint 指定长度的历史
-  `q/v/a/tau/wrench` 物理量窗口；
-  episode 开头按训练数据的边界规则复制首帧左填充，并按 checkpoint
-  状态估计配置中的 `sampling_dt`（旧 V3 回退到 `loss.sampling_dt`）对低维状态做固定
-  时间网格插值。归一化输出先恢复为物理量；V3 直接送入接触力链，V4 先从物理 q
-  因果重建 v/a。
+- Contact WM v2 独立维护 checkpoint 指定长度的 `q/dq/delta_q/tau` 物理量窗口；
+  episode 开头按训练数据的边界规则复制首帧左填充，并按 checkpoint 的 `high_fps` 做固定
+  时间网格插值。`delta_q` 在插值时由保持的 `q_cmd` 与插值后的 `q` 重新计算，避免把旧测量
+  状态嵌入 command delta。归一化输入和输出严格使用 checkpoint 的 normalizer。
 - 每次 PINN 完成后立即更新 world-model 参考；q、MTC 或 tau 控制链直接消费最新参考。
 - DP 尚未完成新推理时，控制链持续执行上一次 action；不会等待 DP。
+
+Contact WM 的 `predictor.inference_mode: asynchronous` 使用绝对 monotonic timestamp
+连接三个独立 worker：DP worker 将 25 Hz、8-token chunk 写入 `ActionPlanBuffer`，WM
+worker 在 `StateHistoryBuffer` 和 action plan 上做 snapshot，并把推理结果中已过期的
+前缀丢弃后写入带时间戳的 `WMTargetBuffer`。100 Hz control worker 只查询
+`WMTargetBuffer`，不会等待任一模型；新旧 WM trajectory 在 40 ms overlap 内插值融合。
+因此 WM 的推理频率和 trajectory 的执行频率完全解耦，约 60 ms 的推理延迟不会导致每
+次从 prediction[0] 回退执行。
 
 因此实际控制更新速度由 PINN 推理与传输耗时自然决定，不由额外的 QP 离散步长决定。
 力矩滤波器使用相邻 `InferenceInput.timestamp_s` 的实测周期更新。
@@ -507,88 +455,39 @@ WM tau_pred
 `InferenceOutput.tau_command` 是实际准备下发的滤波后输出。
 
 DP checkpoint 需遵循 diffusion-policy workspace 格式，并提供
-`policy.predict_action(obs)["action"]` future chunk 和 `action_target`。
-每个 action 固定为 `[x,y,z,qx,qy,qz,qw]`。若 chunk 短于 PINN horizon，尾部用最后一个
-目标保持，长于 horizon 则截断。
+`policy.predict_action(obs)["action"]` future chunk 和 `action_target`。Contact WM v2
+要求每个 action 是绝对七轴关节位置 `[q1,...,q7]`；若 chunk 短于 8 个 token，尾部重复
+最后一帧补齐，长于 8 则截断。
 
-PINN 的 action condition 完全由 checkpoint 内的 `model` 配置恢复：
+PINN checkpoint 支持 `/mnt/code/lcx/PINN` 原生格式
+`checkpoint["config"] + checkpoint["model"] + checkpoint["normalizer"]`。恢复出的
+`ContactWorldModel` 必须提供 `predict(batch, steps, solver)`，返回 flat 的
+`q_pred/dq_pred/delta_q_pred/tau_pred`（以及可选 contact 输出）。
 
-- `action_condition_mode: absolute_pose`：直接传 DP 的绝对 future pose，与当前
-  `wrench_sequence_v1.yaml` 训练预处理一致。
-- `action_condition_mode: relative_pose`：在线用历史最后一个关节状态做 Pinocchio FK，
-  并在 PINN 所在 GPU 上批量计算
-  `[p_future-p_current, q_current⁻¹⊗q_future]`；相对四元数统一为 `qw >= 0`。
-- `action_current_frame_name` 指定 DP/PINN action 所属 frame。当前数据对应 `link7`；
-  控制链使用 `robot.frame_name: gripper_base`。推理启动时缓存固定的
-  `T_link7_gripper_base`，将每个 action pose 转成控制 frame。
+Contact WM v2 的输入和输出均带 batch 维。加载器会在恢复 state dict 前验证版本和维度；
+不符合契约的旧权重不会静默回退到其它模型。
 
-这些选项不会出现在 `inference/configs/nero_pipeline.yaml`；修改 PINN 训练逻辑后必须
-使用包含相应配置和权重的新 checkpoint。旧 checkpoint 未声明
-`action_condition_mode` 时按训练器历史默认值 `relative_pose` 兼容。
-
-PINN checkpoint 支持 `/mnt/code/lcx/PINN` 的原生格式：
-`checkpoint["config"] + checkpoint["model"] + checkpoint["normalizer"]`。也支持配置内含
-`policy._target_` 或 `model._target_` 的通用格式。恢复出的模型
-应实现 `predict_force(inputs)`（也兼容 `predict(inputs)` 或 `forward(inputs)`）。
-`predictor.mode: wrench_gru` 对应原生 `WrenchSequenceGRUV1.forward_step()`，会自动使用 checkpoint 的 `model.inputs`
-选择 `q/v/a/tau`，从 checkpoint normalizer 恢复归一化，并以 checkpoint 的
-`model.action_key` 接收 future action condition。旧 V1 checkpoint 若未声明
-`action_key`，推理端不会额外注入 condition。输入均带 batch 维；
-输出为 6D wrench，或包含 `f_ext/wrench/force/force_target/target_wrench` 之一的字典。
-wrench 统一采用“环境作用于工具”的 `[Fx,Fy,Fz,Mx,My,Mz]`。DP/PINN 使用
-collection checkpoint 训练时的 wrench 坐标系；如果 collection 配置为 `local`，
-runtime 会在进入控制链前将 measured/target wrench 旋转至
-`LOCAL_WORLD_ALIGNED`。
-
-`predictor.mode: world_model_v3` 对应原生 `DeterministicWorldModelV3.predict()`。
-推理端使用 collection 配置中的同一个 tau_other checkpoint、Pinocchio URDF、重力、锁定关节、
-末端 frame、参考坐标系和阻尼系数。tau_other 对“实测历史 + V3 预测未来”做一次无状态序列推理，
-因此不会修改 runtime 中用于当前实测 wrench 的在线 tau_other GRU 隐状态。V3 的
-`history_horizon` 必须不小于 tau_other checkpoint 的训练 horizon（当前均为 50）。
-
-`predictor.mode: world_model_v4` 对应原生 `DeterministicWorldModelV4.predict()`。
-V4 checkpoint 的 `model.state_estimator` 保存 `sampling_dt`、q 均值窗口和 q/dq/ddq
-三个低通截止频率。推理端反归一化 q/tau 后调用 checkpoint 模型自带的
-`reconstruct_future_state()`，训练与部署因此使用同一份 Torch 因果递推实现；实测历史
-v/a 仍用于 tau_other 历史，预测未来 v/a 只从预测 q 得到。当前打包训练数据没有每个子采样
-timestamp，所以该固定网格保证的是训练/部署约定一致，不等价于逐点复现原始异步 CAN
-滤波状态。
-
-启用新 V4 checkpoint 的 `contact_gate` 后，模型还会输出 `[1,F,1]` 的
-`contact_probability`。推理端先用预测 q/v/a/tau 计算 raw Nero wrench，再从 checkpoint
-恢复 `probability_threshold`，逐 future step 对模型预测概率做二分类；非接触点的
-六维 target wrench 整体置零。物理力阈值和连续帧确认只用于离线制作训练 label，
-在线门控不读取实测 wrench、不执行时间滞回，也不把 contact 状态作为模型输入。
-没有 `contact_gate` 的旧 V4 checkpoint 保持原始未门控行为。
-
-`predictor.mode: world_model_v5` 对应原生
-`StateToStateFlowWorldModelV5.predict()`。在线不提供 contact 输入；模型在 Flow source
-的第 15 维填零，并按 checkpoint 的 `flow_inference_steps` 和 `flow_solver` 从真实历史
-q/tau 积分到 future q/tau/contact。当前默认是 8 步 Heun。Flow contact logit 经 sigmoid
-后沿用上述 `probability_threshold` 硬门控，物理阈值、滞回帧数和 contact label 仍只属于
-离线训练数据处理。
-
-推荐 V5 在线配置：
+推荐 Contact WM 在线配置：
 
 ```yaml
 predictor:
   enabled: true
-  mode: world_model_v5
+  mode: contact_world_model
   action_chunk_mode: first
-  action_condition_fill: auto  # V5 自动采用 hold
+  action_condition_fill: chunk
 ```
 
 检查配置并真实恢复两个 checkpoint：
 
 ```bash
-python scripts/nero_inference.py --config inference/configs/nero_pipeline.yaml --check
+python -m inference.cli --config inference/configs/nero_contact_wm.yaml --check
 ```
 
 Mock 端到端运行（仍会真实加载三个 checkpoint）：
 
 ```bash
 python scripts/nero_inference.py \
-  --config inference/configs/nero_pipeline.yaml \
+  --config inference/configs/nero_contact_wm.yaml \
   --run --backend mock --duration 10
 ```
 
@@ -596,7 +495,7 @@ python scripts/nero_inference.py \
 
 ```bash
 python scripts/nero_inference.py \
-  --config inference/configs/nero_pipeline.yaml \
+  --config inference/configs/nero_contact_wm.yaml \
   --run
 ```
 
@@ -605,7 +504,7 @@ predictor 开启时按 `execution.mode` 下发（`tau` 模式使用零增益 MIT
 
 ```bash
 python scripts/nero_inference.py \
-  --config inference/configs/nero_pipeline.yaml \
+  --config inference/configs/nero_contact_wm.yaml \
   --run --enable-command
 ```
 

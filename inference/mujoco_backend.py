@@ -146,7 +146,7 @@ def _normalize_mode(mode: str) -> str:
 def _extract_output_command(output: Any, mode: str | None = None) -> MujocoCommand:
     """Map an ``InferenceOutput``-like object to a simulation command.
 
-    The contact/SWM pipeline's MTC ``tau_command`` already includes feedback
+    The Contact WM pipeline's MTC ``tau_command`` already includes feedback
     evaluated at the recorded hardware state.  For a closed-loop simulation we
     intentionally use its ``torque_target`` feed-forward/residual component
     and recompute feedback from MuJoCo's current q/dq.

@@ -205,7 +205,7 @@ class ContinuousInferenceStateStream:
         )
         # Older callers did not provide a command-history callback.  Falling
         # back to the measured q keeps that contract usable and represents a
-        # zero ``delta_q`` condition for SWM until a held command is available.
+        # zero ``delta_q`` condition for Contact WM until a held command is available.
         if q_cmd is None:
             q_cmd = state.q
         q_cmd = np.asarray(q_cmd, dtype=np.float64).reshape(-1)
@@ -293,7 +293,7 @@ class ContinuousInferenceStateStream:
             acquired_timestamp_us=acquired_timestamp_us,
             # Keep the canonical state streams in acquisition units.  The
             # tau-ext estimator may maintain a separate source-filter bank,
-            # but that bank is not part of the SWM input contract; SWM's
+            # but that bank is not part of the Contact WM input contract;
             # checkpoint is responsible for its own preprocessing.
             q=np.asarray(tau_result.q_raw, dtype=np.float64).copy(),
             dq=np.asarray(tau_result.dq_raw, dtype=np.float64).copy(),

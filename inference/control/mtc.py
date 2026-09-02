@@ -1,4 +1,4 @@
-"""Multi-target torque controller for the native SWM inference contract.
+"""Multi-target torque controller for the native Contact WM contract.
 
 MTC (multi-target controller) combines a data-style zero-velocity impedance
 candidate with the torque predicted by the world model.  The controller is a
@@ -65,7 +65,7 @@ class MTCController:
 
     ``tau_qv`` follows the data collection semantics exactly: the desired
     velocity is zero and the damping term uses the measured current velocity.
-    ``wm_delta`` reconstructs the command represented by the SWM contract as
+    ``wm_delta`` reconstructs the command represented by the Contact WM contract as
     ``q_hat + delta_q_hat``; ``wm_state`` uses ``q_hat`` directly.
     """
 
@@ -138,6 +138,36 @@ class MTCController:
             gravity=gravity,
             tau_pd=tau_pd,
             tau_qv=tau_qv,
+            tau_pred=predicted_tau,
+            tau_command=tau_command,
+            alpha=self.alpha,
+        )
+
+    def compute_timestamped(
+        self,
+        *,
+        q: Any,
+        dq: Any,
+        tau_ref: Any,
+        q_ref: Any,
+    ) -> MTCResult:
+        """Compute the asynchronous WM-weighted blend at one control tick.
+
+        The timestamped runtime defines ``alpha`` as the WM torque weight and
+        intentionally omits the legacy gravity candidate.  The original
+        :meth:`compute` method remains unchanged for synchronous compatibility.
+        """
+        measured_q = _vector("MTC measured q", q)
+        measured_dq = _vector("MTC measured dq", dq)
+        predicted_tau = _vector("MTC tau_ref", tau_ref)
+        q_cmd = self.resolve_q_cmd(q_ref)
+        tau_pd = self.kp * (q_cmd - measured_q) - self.kd * measured_dq
+        tau_command = (1.0 - self.alpha) * tau_pd + self.alpha * predicted_tau
+        return MTCResult(
+            q_cmd=q_cmd,
+            gravity=np.zeros(DOF, dtype=np.float64),
+            tau_pd=tau_pd,
+            tau_qv=tau_pd.copy(),
             tau_pred=predicted_tau,
             tau_command=tau_command,
             alpha=self.alpha,
