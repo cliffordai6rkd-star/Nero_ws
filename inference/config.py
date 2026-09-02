@@ -215,7 +215,8 @@ def resolve_camera_key(
     ``checkpoint_image_keys`` describes the keys the policy actually consumes;
     ``collection_camera_keys`` describes enabled acquisition streams.  An
     explicit ``configured`` value remains a supported override, but is always
-    checked against both contracts.  When no override is supplied, a unique
+    checked against both contracts; every checkpoint key must be present in the
+    enabled collection set.  When no override is supplied, a unique
     model/acquisition intersection is selected.  Multi-camera datasets use the
     wrist stream as the conventional anchor because the training converters
     timestamp/aligned rows against ``cameras/wrist``; any other ambiguous case
@@ -236,6 +237,14 @@ def resolve_camera_key(
             dict.fromkeys(str(key).strip() for key in collection_camera_keys)
         )
         collection_keys = tuple(key for key in collection_keys if key)
+        missing = [key for key in model_keys if key not in collection_keys]
+        if missing:
+            raise ValueError(
+                "checkpoint requires cameras that are not enabled in the "
+                "collection config: missing="
+                f"{missing}, checkpoint image keys={list(model_keys)}, "
+                f"enabled collection cameras={list(collection_keys)}"
+            )
         candidates = [key for key in model_keys if key in collection_keys]
         if not candidates:
             raise ValueError(

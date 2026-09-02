@@ -76,6 +76,13 @@ cameras:
     visualize: true
 ```
 
+在线推理会从 DP checkpoint 的 `input_features` 自动读取
+`observation.images.<name>`，并将这些名称与 `runtime.collection_config` 中启用的
+相机匹配。数采可以配置额外相机（例如 checkpoint 只声明 `side`、`wrist` 时仍可启用
+`side_2`）；额外画面仍可采集和预览，但不会进入 DP/WM observation。checkpoint 声明的
+任一路相机若未在数采配置中启用，runtime 会在启动时直接报错，而不是等待永远不会到达的
+帧。`runtime.camera` 只选择时间对齐用的 anchor，不能扩大 checkpoint 的输入相机集合。
+
 推理时的 `tau_ext` 图复用数采的 `RealtimeJointPlotter`，数据由
 `inference/diagnostics/tau_ext.py` 适配，不会阻塞状态采样和控制线程。
 `realtime_plot.norm` 默认为 `l1` 以保持历史曲线；需要数学上的欧氏范数时设置为 `l2`。
@@ -349,7 +356,7 @@ future tau -> causal torque filter (mode=tau or MTC feed-forward)
 `runtime.collection_config` 指向 `configs/master_slave_can.yaml`，复用其中的：
 
 - 从臂 CAN、固件和 rest pose；
-- 腕部相机；
+- checkpoint 声明且数采启用的相机（当前 DP 为 `side`、`wrist`；额外配置的相机仍可采集和预览）；
 - `tau_other` checkpoint；
 - Pinocchio 逆动力学；
 - `tau_ext -> wrench_ext` 阻尼 Jacobian 映射。

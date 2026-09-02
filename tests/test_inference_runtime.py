@@ -17,8 +17,9 @@ from inference.config import (
     RobotConfig,
     RuntimeConfig,
     load_inference_config,
+    resolve_camera_key,
 )
-from inference.runtime import NeroInferenceRuntime
+from inference.runtime import NeroInferenceRuntime, _checkpoint_image_keys_if_available
 from inference.control.nero import NeroPipelineOutputController
 from nero_collection.arms.base import ArmState
 from nero_collection.cameras import CameraFrame
@@ -134,6 +135,18 @@ class _TwoCameras(_Cameras):
                 camera_name="wrist",
                 timestamp_us=40_000,
                 frame=np.full((8, 8, 3), 2, dtype=np.uint8),
+            ),
+        ]
+
+
+class _ThreeCameras(_TwoCameras):
+    def poll(self):
+        return [
+            *super().poll(),
+            CameraFrame(
+                camera_name="side_2",
+                timestamp_us=50_000,
+                frame=np.full((8, 8, 3), 3, dtype=np.uint8),
             ),
         ]
 
@@ -561,6 +574,42 @@ def test_runtime_passes_independent_multicamera_timestamps() -> None:
         "wrist": pytest.approx(0.040),
     }
     assert isinstance(pipeline.inputs[-1].image, dict)
+
+
+def test_runtime_uses_only_checkpoint_cameras_from_collection() -> None:
+    pipeline = _Pipeline()
+    pipeline._image_keys = ("side", "wrist")
+    runtime = NeroInferenceRuntime(
+        _config(),
+        backend="mock",
+        command_enabled=False,
+        pipeline=pipeline,
+        arm=_Arm(),
+        cameras=_ThreeCameras(),
+        online_tau_ext=_TauExt(),
+        wrench_estimator=_Wrench(),
+    )
+
+    assert runtime._pipeline_image_keys == ("side", "wrist")
+    assert runtime.observation_sampler.camera_keys == ("side", "wrist")
+    assert runtime.resolved_camera == "wrist"
+
+
+def test_resolve_camera_key_rejects_missing_checkpoint_camera() -> None:
+    with pytest.raises(ValueError, match="missing=.*wrist"):
+        resolve_camera_key(
+            None,
+            ("side", "wrist"),
+            ("side", "side_2"),
+        )
+
+
+def test_checkpoint_camera_names_are_read_from_input_features() -> None:
+    checkpoint = (
+        ROOT
+        / "model/dp/pretrained_model-20260901T082955Z-1-001/pretrained_model"
+    )
+    assert _checkpoint_image_keys_if_available(checkpoint) == ("side", "wrist")
 
 
 def test_episode_reset_restarts_warmup_and_clears_wrench_filter() -> None:
