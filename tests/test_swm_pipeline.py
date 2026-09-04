@@ -189,17 +189,16 @@ def test_swm_mtc_preserves_firmware_gains_and_sends_residual(tmp_path: Path):
     sample = replace(_sample(0.0, np.zeros(7)), dq=np.full(7, 0.1))
     output = pipeline.step(sample)
 
-    # q_hat=0.1 and delta_q_hat=0.1 reconstruct q_cmd=0.2.  The MTC q/v
-    # candidate is 1.5*0.2 - 0.5*0.1 + gravity(0.3) = 0.55; blending with
-    # tau_pred=0.1 at alpha=0.5 gives 0.325.  Firmware contributes the PD
-    # term (0.25), so only the residual 0.075 is transported as t_ff.
+    # q_hat=0.1 and delta_q_hat=0.1 reconstruct q_cmd=0.2. Firmware
+    # contributes the PD term (0.25), so the transported feed-forward is
+    # gravity(0.3) plus the scaled WM residual 0.5*tau_pred(0.1).
     assert output.control_mode == "mtc"
     np.testing.assert_allclose(output.q_target, 0.2, atol=1.0e-6)
     np.testing.assert_allclose(output.dq_target, 0.0, atol=1.0e-6)
     np.testing.assert_allclose(output.mtc_tau_qv, 0.55, atol=1.0e-6)
     np.testing.assert_allclose(output.mtc_tau_pred, 0.1, atol=1.0e-6)
-    np.testing.assert_allclose(output.tau_command, 0.325, atol=1.0e-6)
-    np.testing.assert_allclose(output.tau_target, 0.075, atol=1.0e-6)
+    np.testing.assert_allclose(output.tau_command, 0.6, atol=1.0e-6)
+    np.testing.assert_allclose(output.tau_target, 0.35, atol=1.0e-6)
     np.testing.assert_allclose(output.mit_kp, 1.5, atol=1.0e-6)
     np.testing.assert_allclose(output.mit_kd, 0.5, atol=1.0e-6)
     np.testing.assert_allclose(
@@ -211,7 +210,7 @@ def test_swm_mtc_preserves_firmware_gains_and_sends_residual(tmp_path: Path):
     pipeline.close()
 
 
-def test_swm_tau_mode_keeps_predicted_torque_semantics(tmp_path: Path):
+def test_swm_tau_mode_adds_gravity_to_predicted_residual(tmp_path: Path):
     config = InferenceConfig(
         dp_checkpoint=CheckpointConfig(tmp_path / "dp.pt", device="cpu"),
         pinn_checkpoint=CheckpointConfig(tmp_path / "swm.pt", device="cpu"),
@@ -232,10 +231,10 @@ def test_swm_tau_mode_keeps_predicted_torque_semantics(tmp_path: Path):
 
     output = pipeline.step(_sample(0.0, np.zeros(7)))
 
-    # The injected dynamics model has gravity=0.3, but direct WM-tau mode
-    # must not add it (or runtime command damping) to the predicted 0.1 Nm.
+    # Direct WM-tau mode sends analytical gravity plus the predicted residual,
+    # with firmware feedback gains disabled.
     assert output.control_mode == "tau"
-    np.testing.assert_allclose(output.tau_command, np.full(7, 0.1), atol=1.0e-6)
-    np.testing.assert_allclose(output.tau_unfiltered, np.full(7, 0.1), atol=1.0e-6)
-    np.testing.assert_allclose(output.torque_target, np.full(7, 0.1), atol=1.0e-6)
+    np.testing.assert_allclose(output.tau_command, np.full(7, 0.4), atol=1.0e-6)
+    np.testing.assert_allclose(output.tau_unfiltered, np.full(7, 0.4), atol=1.0e-6)
+    np.testing.assert_allclose(output.torque_target, np.full(7, 0.4), atol=1.0e-6)
     pipeline.close()

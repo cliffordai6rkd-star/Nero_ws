@@ -12,7 +12,7 @@ class _Dynamics:
         return np.asarray(q, dtype=np.float64) * 0.25
 
 
-def test_mtc_blends_qv_and_predicted_torque():
+def test_mtc_adds_predicted_residual_to_qv_gravity():
     controller = MTCController(
         model=_Dynamics(),
         kp=np.full(7, 2.0),
@@ -34,18 +34,17 @@ def test_mtc_blends_qv_and_predicted_torque():
 
     gravity = q * 0.25
     tau_qv = 2.0 * (q_hat - q) + 0.5 * (0.0 - dq) + gravity
-    # alpha is the WM total-torque weight; q/v receives the complementary weight.
-    expected = 0.75 * tau_qv + 0.25 * tau_pred
+    expected = tau_qv + 0.25 * tau_pred
     np.testing.assert_allclose(result.q_cmd, q_hat)
     np.testing.assert_allclose(result.gravity, gravity)
     np.testing.assert_allclose(result.tau_pd, 2.0 * (q_hat - q) - 0.5 * dq)
     np.testing.assert_allclose(result.tau_qv, tau_qv)
     np.testing.assert_allclose(result.tau_pred, tau_pred)
     np.testing.assert_allclose(result.tau_command, expected)
-    np.testing.assert_allclose(result.tau_feedforward_fixed_gains, expected - result.tau_pd)
+    np.testing.assert_allclose(result.tau_feedforward_fixed_gains, gravity + 0.25 * tau_pred)
 
 
-def test_timestamped_mtc_includes_gravity_with_same_alpha_semantics():
+def test_timestamped_mtc_adds_residual_with_same_alpha_semantics():
     controller = MTCController(
         model=_Dynamics(),
         kp=np.full(7, 2.0),
@@ -68,12 +67,12 @@ def test_timestamped_mtc_includes_gravity_with_same_alpha_semantics():
     gravity = q * 0.25
     tau_pd = 2.0 * (q_ref - q) - 0.5 * dq
     tau_qv = tau_pd + gravity
-    expected = 0.75 * tau_qv + 0.25 * tau_ref
+    expected = tau_qv + 0.25 * tau_ref
     np.testing.assert_allclose(result.gravity, gravity)
     np.testing.assert_allclose(result.tau_pd, tau_pd)
     np.testing.assert_allclose(result.tau_qv, tau_qv)
     np.testing.assert_allclose(result.tau_command, expected)
-    np.testing.assert_allclose(result.tau_feedforward_fixed_gains, expected - tau_pd)
+    np.testing.assert_allclose(result.tau_feedforward_fixed_gains, gravity + 0.25 * tau_ref)
 
 
 def test_mtc_wm_delta_reconstructs_q_command_and_validates_inputs():

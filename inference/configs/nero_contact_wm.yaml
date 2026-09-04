@@ -40,14 +40,14 @@ predictor:
 execution:
   # mtc | q | tau
   mode: mtc
-  # MTC blends q/v+gravity with Contact WM's predicted total torque;
-  # mtc_alpha is the WM torque weight in both synchronous and timestamped paths.
-  mtc_alpha: 0.5
+  # MTC keeps firmware q/v feedback and sends g(q) plus the Contact WM
+  # gravity-relative torque residual. mtc_alpha scales only that residual.
+  mtc_alpha: 1.0
   # The timestamped runtime uses WM q_ref directly (legacy sync mode keeps
   # wm_state/wm_delta compatibility through the ContactWM pipeline).
   mtc_q_cmd_source: wm_state
-  # MTC keeps these data-side gains in the firmware MIT
-  # command and sends a residual feed-forward completing the blended torque.
+  # MTC keeps these data-side gains in the firmware MIT command; t_ff carries
+  # analytical gravity plus the scaled Contact WM residual.
   mit_kp: [3.0, 3.0, 2.0, 3.5, 2.0, 2.0, 3.0]
   mit_kd:  [0.1, 0.1, 0.25, 0.25, 0.1, 0.1, 0.1]
   mit_velocity_limit: [1, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
@@ -103,8 +103,9 @@ ik:
   joint_position_margin_rad: 0.02
 
 torque_filter:
-  enabled: true
-  median_window: 3
+  enabled: false
+  median_window: 1
+  # When enabled, this filters only the WM residual, not analytical gravity.
   lowpass_cutoff_hz: 15.0
   rate_limit_nm_s: [50, 50, 50, 40, 30, 20, 20]
 

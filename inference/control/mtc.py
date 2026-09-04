@@ -1,9 +1,9 @@
 """Multi-target torque controller for the native Contact WM contract.
 
-MTC (multi-target controller) combines a data-style zero-velocity impedance
-candidate with the torque predicted by the world model.  The controller is a
-pure numerical component; the legacy runtime adapter is responsible for
-transporting its result through the arm API.
+MTC (multi-target controller) keeps the firmware's zero-velocity impedance
+path intact and adds the Contact WM torque as a residual on top of analytical
+gravity compensation.  The controller is a pure numerical component; the legacy
+runtime adapter is responsible for transporting its result through the arm API.
 """
 
 from __future__ import annotations
@@ -44,6 +44,8 @@ class MTCResult:
     gravity: np.ndarray
     tau_pd: np.ndarray
     tau_qv: np.ndarray
+    # Kept as ``tau_pred`` for compatibility with existing telemetry/tests.
+    # The Contact WM value is now a residual relative to gravity compensation.
     tau_pred: np.ndarray
     tau_command: np.ndarray
     alpha: float
@@ -52,21 +54,19 @@ class MTCResult:
     def tau_feedforward_fixed_gains(self) -> np.ndarray:
         """Feed-forward needed when the firmware keeps the full q/v gains.
 
-        The firmware will add ``tau_pd`` through its PD path.  This residual
-        is useful to the MIT transport adapter when the configured data-side
-        gains must remain unchanged.
+        The firmware will add ``tau_pd`` through its PD path.  The feed-forward
+        therefore carries analytical gravity plus the scaled WM residual.
         """
 
         return self.tau_command - self.tau_pd
 
 
 class MTCController:
-    """Blend q/v/gravity and WM-predicted total torque candidates.
+    """Combine firmware q/v feedback with gravity and WM residual torque.
 
     ``tau_qv`` follows the data collection semantics exactly: the desired
     velocity is zero and the damping term uses the measured current velocity.
-    ``alpha`` is the WM total-torque weight; the q/v candidate receives
-    ``1 - alpha``.
+    ``alpha`` is the WM residual gain.
     ``wm_delta`` reconstructs the command represented by the Contact WM contract as
     ``q_hat + delta_q_hat``; ``wm_state`` uses ``q_hat`` directly.
     """
@@ -134,10 +134,7 @@ class MTCController:
         gravity = self._gravity_torque(measured_q)
         tau_pd = self.kp * (q_cmd - measured_q) - self.kd * measured_dq
         tau_qv = tau_pd + gravity
-        # ``alpha`` is the WM total-torque weight for both synchronous and
-        # timestamped execution paths.  The q/v candidate therefore receives
-        # the complementary weight.
-        tau_command = (1.0 - self.alpha) * tau_qv + self.alpha * predicted_tau
+        tau_command = tau_qv + self.alpha * predicted_tau
         return MTCResult(
             q_cmd=q_cmd,
             gravity=gravity,
@@ -156,11 +153,11 @@ class MTCController:
         tau_ref: Any,
         q_ref: Any,
     ) -> MTCResult:
-        """Compute the asynchronous WM-weighted blend at one control tick.
+        """Compute the asynchronous residual-compensated MTC at one control tick.
 
-        ``alpha`` is the WM total-torque weight, matching :meth:`compute`.
-        The q/v candidate includes the measured-state gravity torque so the
-        asynchronous and synchronous paths have the same torque semantics.
+        ``alpha`` is the WM residual gain, matching :meth:`compute`.  The q/v
+        candidate includes the measured-state gravity torque so the asynchronous
+        and synchronous paths have the same torque semantics.
         """
         measured_q = _vector("MTC measured q", q)
         measured_dq = _vector("MTC measured dq", dq)
@@ -169,7 +166,7 @@ class MTCController:
         gravity = self._gravity_torque(measured_q)
         tau_pd = self.kp * (q_cmd - measured_q) - self.kd * measured_dq
         tau_qv = tau_pd + gravity
-        tau_command = (1.0 - self.alpha) * tau_qv + self.alpha * predicted_tau
+        tau_command = tau_qv + self.alpha * predicted_tau
         return MTCResult(
             q_cmd=q_cmd,
             gravity=gravity,

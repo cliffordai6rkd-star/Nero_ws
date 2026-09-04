@@ -1,9 +1,10 @@
 """Inference pipeline for the native PINN Contact World Model v2.
 
-The model condition is ``q``, ``dq``, ``delta_q``, ``tau`` plus an 8-token
-absolute ee-pose action and mask.  The implementation reuses the mature DP
-observation/action scheduling in ``NeroInferencePipeline`` while keeping the
-Contact WM state contract explicit at the boundary.
+The model condition is a checkpoint-declared subset of the Contact WM state
+history, plus an 8-token absolute ee-pose action and mask.  New checkpoints may
+emit only ``q`` and a gravity-relative torque residual.  The implementation
+reuses the mature DP observation/action scheduling in ``NeroInferencePipeline``
+while keeping the Contact WM state contract explicit at the boundary.
 """
 
 from __future__ import annotations
@@ -110,12 +111,21 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
         configured_inputs = tuple(getattr(model, "inputs", ()) or ())
         if not configured_inputs and isinstance(model_cfg, Mapping):
             configured_inputs = tuple(model_cfg.get("inputs", ()) or ())
-        required_inputs = ("q", "dq", "delta_q", "tau")
-        if configured_inputs and tuple(str(key).lower() for key in configured_inputs) != required_inputs:
+        if configured_inputs:
+            configured_inputs = tuple(str(key).strip().lower() for key in configured_inputs)
+        else:
+            configured_inputs = ("q", "dq", "delta_q", "tau")
+        supported_inputs = {"q", "dq", "delta_q", "tau"}
+        if (
+            len(set(configured_inputs)) != len(configured_inputs)
+            or any(key not in supported_inputs for key in configured_inputs)
+            or not {"q", "tau"}.issubset(configured_inputs)
+        ):
             raise ValueError(
-                "Contact WM checkpoint model.inputs must be exactly "
-                f"{list(required_inputs)}"
+                "Contact WM checkpoint model.inputs must be a unique subset of "
+                "['q', 'dq', 'delta_q', 'tau'] containing q and tau"
             )
+        self._contact_input_keys = configured_inputs
         action_dim = int(
             getattr(
                 model,
@@ -279,9 +289,13 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
         self, timestamp_s: float, values: Mapping[str, np.ndarray]
     ) -> None:
         required = ("q", "tau")
-        if any(key not in values for key in required) or ("dq" not in values and "v" not in values):
-            raise ValueError("Contact WM observation requires q, dq, and tau")
+        if any(key not in values for key in required):
+            raise ValueError("Contact WM observation requires q and tau")
         dq_value = values.get("dq", values.get("v"))
+        if dq_value is None:
+            if "dq" in self._contact_input_keys:
+                raise ValueError("Contact WM observation requires dq for this checkpoint")
+            dq_value = np.zeros(7, dtype=np.float32)
         q_cmd = values.get("q_cmd")
         if q_cmd is None and values.get("delta_q") is not None:
             q_cmd = np.asarray(values["q"], dtype=np.float32) + np.asarray(
@@ -430,11 +444,12 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
     def _predict_contact_reference(self) -> dict[str, Any]:
         import torch
 
-        if any(len(values) < 1 for values in self._contact_history.values()):
+        if any(len(self._contact_history[key]) < 1 for key in self._contact_input_keys):
             raise RuntimeError("Contact WM state history is empty")
         device = _model_device(self.pinn)
         history = {
-            key: np.stack(tuple(values), axis=0) for key, values in self._contact_history.items()
+            key: np.stack(tuple(self._contact_history[key]), axis=0)
+            for key in self._contact_input_keys
         }
         inputs = {
             key: self._normalize_pinn_input(
@@ -468,10 +483,12 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
         nested = output.get("state_pred")
         state_pred = nested if isinstance(nested, Mapping) else {}
         result: dict[str, Any] = {}
-        for key in ("q", "dq", "delta_q", "tau"):
+        for key in ("q", "tau", "dq", "delta_q"):
             value = state_pred.get(key, output.get(f"{key}_pred"))
             if value is None:
-                raise RuntimeError(f"Contact WM prediction is missing {key!r}")
+                if key in {"q", "tau"}:
+                    raise RuntimeError(f"Contact WM prediction is missing {key!r}")
+                continue
             if not torch.is_tensor(value):
                 value = torch.as_tensor(value, dtype=torch.float32, device=device)
             if value.ndim != 3 or value.shape[0] != 1 or value.shape[-1] != 7:
@@ -539,7 +556,7 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
         import torch
 
         arrays: dict[str, np.ndarray] = {}
-        for key in ("q", "dq", "delta_q", "tau"):
+        for key in self._contact_input_keys:
             value = getattr(history, key, None)
             if value is None and isinstance(history, Mapping):
                 value = history.get(key)
@@ -684,10 +701,10 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
         horizon = self._contact_future_horizon
         q = _numpy_vector(sample.q, 7, "sample q")
         dq = np.zeros(7, dtype=np.float64)
-        tau = np.zeros(7, dtype=np.float64)
+        residual = np.zeros(7, dtype=np.float64)
         q_trajectory = np.repeat(q[None], horizon, axis=0)
         dq_trajectory = np.repeat(dq[None], horizon, axis=0)
-        tau_trajectory = np.repeat(tau[None], horizon, axis=0)
+        tau_trajectory = np.repeat(residual[None], horizon, axis=0)
         common = dict(
             action_target=q.copy(),
             dp_action_chunk=None,
@@ -700,7 +717,7 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
             wm_inference_time_s=self._last_wm_inference_time_s,
             joint_position_target=q.copy(),
             joint_velocity_target=dq.copy(),
-            torque_target=tau.copy(),
+            torque_target=residual.copy(),
             contact_state=None,
             control_mode=self._contact_execution_mode,
             joint_position_trajectory=q_trajectory,
@@ -710,30 +727,35 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
         )
         if self._contact_execution_mode == "q":
             return InferenceOutput(
-                tau_command=tau.copy(),
-                tau_unfiltered=tau.copy(),
+                tau_command=residual.copy(),
+                tau_unfiltered=residual.copy(),
                 joint_position_command=q.copy(),
                 **common,
             )
         if self._contact_execution_mode == "mtc":
             kp = np.asarray(self.config.execution.mit_kp, dtype=np.float64)
             kd = np.asarray(self.config.execution.mit_kd, dtype=np.float64)
+            tau_pd = -kd * _numpy_vector(sample.dq, 7, "sample dq")
+            gravity = self._gravity_torque(q)
+            t_ff = self._clip_tau(gravity)
+            tau_total = tau_pd + t_ff
             return InferenceOutput(
-                tau_command=tau.copy(),
-                tau_unfiltered=tau.copy(),
+                tau_command=tau_total.copy(),
+                tau_unfiltered=(tau_pd + gravity).copy(),
                 joint_position_command=None,
                 mit_kp=kp,
                 mit_kd=kd,
-                mtc_tau_qv=tau.copy(),
-                mtc_tau_pred=tau.copy(),
+                mtc_tau_qv=(tau_pd + gravity).copy(),
+                mtc_tau_pred=residual.copy(),
                 mtc_alpha=float(self.config.execution.mtc_alpha),
-                **common,
+                **{**common, "torque_target": t_ff.copy()},
             )
+        t_ff = self._clip_tau(self._gravity_torque(q))
         return InferenceOutput(
-            tau_command=tau.copy(),
-            tau_unfiltered=tau.copy(),
+            tau_command=t_ff.copy(),
+            tau_unfiltered=t_ff.copy(),
             joint_position_command=None,
-            **common,
+            **{**common, "torque_target": t_ff.copy()},
         )
 
     def _execute_contact_reference(
@@ -752,11 +774,19 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
             q_future,
             dt_s=self._contact_sampling_dt_s,
         )
-        dq_future = self._limit_predicted_velocity(_fit_horizon(reference["dq"], horizon))
+        if "dq" in reference:
+            dq_future = _fit_horizon(reference["dq"], horizon)
+        else:
+            dq_future = self._differentiate_joint_position_trajectory(
+                q_future,
+                sample.q,
+                self._contact_sampling_dt_s,
+            )
+        dq_future = self._limit_predicted_velocity(dq_future)
         dq_future = self._limit_model_velocity_trajectory(dq_future)
         tau_future = _fit_horizon(reference["tau"], horizon)
-        # Contact WM predicts dq but not ddq; keep a finite-difference trajectory for
-        # diagnostics and downstream consumers.
+        # Contact WM may not predict dq/ddq; keep finite-difference diagnostics
+        # from the q reference when dq is absent.
         dt = self._contact_sampling_dt_s
         ddq_future = np.empty_like(dq_future)
         ddq_future[0] = (dq_future[0] - np.asarray(sample.dq, dtype=np.float64)) / dt
@@ -764,10 +794,9 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
             ddq_future[1:] = np.diff(dq_future, axis=0) / dt
         q_trajectory = q_future.copy()
         q_command = q_trajectory[0].copy()
-        # Clip the WM prediction before any MTC blending.  MTC applies the
-        # causal torque filter to the final blended total below; pure ``tau``
-        # mode applies it to this WM total directly.
-        tau_pred = self._clip_tau(tau_future[0])
+        # Contact WM torque is a residual relative to analytical gravity
+        # compensation.  Filter/limit only this residual, never g(q).
+        tau_pred = self._clip_feedback_tau(tau_future[0])
         contact = reference.get("contact_state")
         contact0 = None if contact is None else np.asarray(contact[0]).copy()
         common = dict(
@@ -798,9 +827,19 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
             )
         if self._contact_execution_mode == "mtc":
             assert self.mtc_controller is not None
-            delta_future = _fit_horizon(reference["delta_q"], horizon)
+            delta_future = (
+                _fit_horizon(reference["delta_q"], horizon)
+                if "delta_q" in reference
+                else None
+            )
+            if self.mtc_controller.q_cmd_source == "wm_delta" and delta_future is None:
+                raise RuntimeError(
+                    "execution.mtc_q_cmd_source=wm_delta requires Contact WM "
+                    "delta_q prediction; use wm_state with q/tau-only checkpoints"
+                )
             raw_q_cmd = self.mtc_controller.resolve_q_cmd(
-                q_command, delta_future[0]
+                q_command,
+                None if delta_future is None else delta_future[0],
             )
             safe_q_cmd = self._safe_joint_position_trajectory(
                 sample.q,
@@ -819,21 +858,15 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
                 q_hat=q_command,
                 delta_q_hat=delta_for_control,
             )
-            # Preserve the data-side firmware gains.  The feed-forward is the
-            # residual required so firmware's own PD term completes tau_cmd.
             kp = np.asarray(self.config.execution.mit_kp, dtype=np.float64)
             kd = np.asarray(self.config.execution.mit_kd, dtype=np.float64)
-            # ``maximum_command_torque_nm`` is also the transport limit for
-            # ``t_ff``.  Recompute the effective total after clipping the
-            # residual so diagnostics describe the torque the fixed-gain MIT
-            # command can actually request at this sampled q/dq.
-            requested_total = self._clip_tau(mtc.tau_command)
-            filtered_total = self._filtered_tau(requested_total, sample.tau)
-            t_ff = self._clip_tau(filtered_total - mtc.tau_pd)
-            effective_total = self._clip_tau(mtc.tau_pd + t_ff)
+            scaled_residual = self._clip_feedback_tau(mtc.alpha * mtc.tau_pred)
+            filtered_residual = self._filtered_residual_tau(scaled_residual)
+            t_ff = self._clip_tau(mtc.gravity + filtered_residual)
+            effective_total = mtc.tau_pd + t_ff
             return InferenceOutput(
                 tau_command=effective_total,
-                tau_unfiltered=requested_total.copy(),
+                tau_unfiltered=mtc.tau_command.copy(),
                 joint_position_command=None,
                 mit_kp=kp,
                 mit_kd=kd,
@@ -848,14 +881,35 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
                 },
             )
         if self._contact_execution_mode == "tau":
-            tau_ff = self._filtered_tau(tau_pred, sample.tau)
+            gravity = self._gravity_torque(sample.q)
+            residual = self._filtered_residual_tau(tau_pred)
+            tau_ff = self._clip_tau(gravity + residual)
             return InferenceOutput(
-                tau_command=tau_ff.copy(), tau_unfiltered=tau_pred.copy(),
+                tau_command=tau_ff.copy(), tau_unfiltered=(gravity + tau_pred).copy(),
                 joint_position_command=None,
                 **{**common, "torque_target": tau_ff.copy()},
             )
 
         raise RuntimeError(f"unsupported Contact WM execution mode {self._contact_execution_mode!r}")
+
+    @staticmethod
+    def _differentiate_joint_position_trajectory(
+        q_future: np.ndarray,
+        current_q: np.ndarray,
+        dt_s: float,
+    ) -> np.ndarray:
+        q_values = np.asarray(q_future, dtype=np.float64)
+        if q_values.ndim != 2 or q_values.shape[1] != 7 or q_values.shape[0] < 1:
+            raise ValueError(f"Contact WM q trajectory must be [H,7], got {q_values.shape}")
+        current = _numpy_vector(current_q, 7, "current q")
+        dt = float(dt_s)
+        if not np.isfinite(dt) or dt <= 0.0:
+            raise ValueError("Contact WM sampling dt must be positive and finite")
+        dq = np.empty_like(q_values)
+        dq[0] = (q_values[0] - current) / dt
+        if q_values.shape[0] > 1:
+            dq[1:] = np.diff(q_values, axis=0) / dt
+        return dq
 
     def _limit_predicted_velocity(self, values: np.ndarray) -> np.ndarray:
         limit = np.asarray(self.config.execution.mit_velocity_limit, dtype=np.float64)
@@ -962,6 +1016,51 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
             clipped, dt_s=filter_dt_s, initial_tau=self._clip_tau(initial)
         )
         return self._clip_tau(filtered)
+
+    def _filtered_residual_tau(
+        self,
+        value: np.ndarray,
+        *,
+        dt_s: float | None = None,
+    ) -> np.ndarray:
+        clipped = self._clip_feedback_tau(value)
+        filter_dt_s = self._control_dt_s if dt_s is None else float(dt_s)
+        filtered = self._torque_filter.apply(
+            clipped,
+            dt_s=filter_dt_s,
+            initial_tau=np.zeros(7, dtype=np.float64),
+        )
+        return self._clip_feedback_tau(filtered)
+
+    def _clip_feedback_tau(self, tau: np.ndarray) -> np.ndarray:
+        value = _numpy_vector(tau, 7, "Contact WM residual torque")
+        limit = self.config.execution.mit_feedback_torque_limit
+        if limit is None:
+            return value
+        values = np.asarray(limit, dtype=np.float64)
+        if values.ndim == 0:
+            values = np.repeat(values, 7)
+        values = values.reshape(-1)
+        if values.shape != (7,) or not np.all(np.isfinite(values)) or np.any(values <= 0.0):
+            raise ValueError("execution.mit_feedback_torque_limit must be positive and finite")
+        return np.clip(value, -values, values)
+
+    def _gravity_torque(self, q: np.ndarray) -> np.ndarray:
+        q_value = _numpy_vector(q, 7, "Contact WM gravity q")
+        function = getattr(self.model, "gravity_torque", None)
+        if callable(function):
+            return _numpy_vector(function(q_value), 7, "Contact WM gravity torque")
+        pin = getattr(self.model, "pin", None)
+        pin_model = getattr(self.model, "model", None)
+        pin_data = getattr(self.model, "data", None)
+        if pin is not None and pin_model is not None and pin_data is not None:
+            zeros = np.zeros(7, dtype=np.float64)
+            return _numpy_vector(
+                pin.rnea(pin_model, pin_data, q_value, zeros, zeros),
+                7,
+                "Contact WM gravity torque",
+            )
+        raise RuntimeError("Contact WM requires dynamics model gravity_torque(q)")
 
 
 ContactWorldModelInferencePipeline = ContactWMInferencePipeline

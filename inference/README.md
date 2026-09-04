@@ -223,27 +223,25 @@ python scripts/infer_h5_direct_ik.py \
 `inference/configs/nero_contact_wm.yaml` 默认加载
 `model/carswm/latest.pt`，并使用 `model/dp/pretrained_model-20260901T082955Z-1-001/pretrained_model`
 作为 LeRobot DP。该 Contact WM checkpoint
-必须包含 `model_version: contact_world_model_v2`、`model.inputs: [q, dq, delta_q, tau]`、
-`joint_dim=7` 和 `action_dim=7`。运行时输入为 50 个 100 Hz 的
-`q/dq/delta_q/tau` 历史与 8 个 25 Hz、7 维绝对关节 action token；输出为 32 步 future
-`q/dq/delta_q/tau` 及可选的三阶段 `contact_state_pred`。所有低维输入和输出均按 checkpoint
+必须包含 `model_version: contact_world_model_v2`、`joint_dim=7` 和 `action_dim=7`；
+`model.inputs` 至少要包含 `q` 和 `tau`，可按新版本只保留这两个物理量。运行时输入为
+50 个 100 Hz 的状态历史与 8 个 25 Hz、7 维绝对关节 action token；输出为 32 步 future
+`q/tau` 及可选的 `dq/delta_q/contact_state_pred`。所有低维输入和输出均按 checkpoint
 中的 `normalizer` 处理，`delta_q` 始终由实际 command history 的 `q_cmd - q` 构造。
 
 使用配置时，通过 `execution.mode` 选择三种执行方式：
 
-- `mtc`：计算 `tau_qv = Kp(q_cmd-q)-Kd*dq+g(q)`，再与 WM 第一帧
-  `tau_pred` 融合；`mtc_alpha` 统一表示 WM 总力矩权重，即
-  `tau_cmd=(1-alpha)tau_qv+alpha*tau_pred`。`mtc_q_cmd_source: wm_state`
-  使用 `q_hat`；`wm_delta` 使用 `q_hat + delta_q_hat`。固件继续使用配置的
-  `mit_kp/mit_kd`、零速度目标，`torque_target` 只发送 `tau_cmd - tau_pd`
-  的残差，避免重复叠加固件已经计算的位置/速度反馈。异步 worker 使用同一
-  公式，`q_ref` 按 100 Hz 直接消费。
+- `mtc`：计算 `tau_pd = Kp(q_cmd-q)-Kd*dq`，再把 `g(q)` 和 WM 的
+  `tau_pred` 残差合成 `t_ff = g(q) + tau_pred`；`mtc_alpha` 只缩放 residual。
+  `mtc_q_cmd_source: wm_state` 使用 `q_hat`；`wm_delta` 使用 `q_hat + delta_q_hat`。
+  固件继续使用配置的 `mit_kp/mit_kd`、零速度目标，`torque_target` 发送的是
+  `t_ff`，不会再整体低通总力矩。异步 worker 使用同一语义，`q_ref` 按 100 Hz 直接消费。
 - `q`：对预测 q 做关节限位/单周期步长保护后调用 `command_joint_positions()`。
-- `tau`：仅下发限幅/滤波后的 WM `tau_pred`。硬件使用 MIT 报文作为传输
-  envelope，但 `q/dq` 反馈增益固定为零，因此不会叠加 `kp/kd`、重力或其它控制项。
+- `tau`：下发限幅/滤波后的 `g(q) + WM tau_pred`。硬件使用 MIT 报文作为传输
+  envelope，但 `kp/kd` 设为零，因此不会额外叠加 firmware 的位置/速度反馈。
 
-`execution.mode: mtc` 只发送残差 `torque_target`；
-`tau_command` 是按当前采样的 q/dq 计算出的融合总力矩（触发发送限幅时记录限幅后的值）。
+`execution.mode: mtc` 的 `torque_target` 是 feed-forward 残差加重力；
+`tau_command` 是按当前采样的 q/dq 计算出的总力矩（触发发送限幅时记录限幅后的值）。
 
 最小配置形态如下：
 
@@ -297,8 +295,8 @@ uv run python -m inference.cli --config inference/configs/nero_contact_wm.yaml
 
 仿真分支不会初始化 CAN、相机或真机 runtime。它读取一条 H5 episode，在状态时钟上运行
 同一个 DP/contact-WM pipeline，并把输出交给带七个 torque motor 的 MuJoCo 模型动态积分。
-`q` 是软件 PD 位置伺服，`mtc` 是固定固件增益下的融合总力矩，`tau` 直接使用
-`tau_command`；三种模式都不会直接写 `data.qpos`。
+`q` 是软件 PD 位置伺服，`mtc` 是固定固件增益下的 gravity+residual MIT 控制，`tau`
+直接使用 `tau_command`；三种模式都不会直接写 `data.qpos`。
 
 默认每 10 ms 调一次策略、每 1 ms 做 MuJoCo 子步。Contact WM v2 接收 50 个 100 Hz 的
 q/dq/delta_q/tau 历史和 DP 的 8 个 7 维绝对关节 action token。默认 `recorded` 观测模式用 H5 的 q/dq/ddq/tau
@@ -477,11 +475,12 @@ worker 在 `StateHistoryBuffer` 和 action plan 上做 snapshot，并把推理�
 `timing.report_interval_s` 汇总打印实际控制频率、完整周期最新耗时、PINN/DP
 平均推理耗时。汇总打印不会在每个控制周期执行，减少终端 I/O 对实时性的影响。
 
-`torque_filter` 对最终准备下发的总力矩执行；MTC 不会在 q/v 与 WM 融合前滤波：
+`torque_filter` 只对 WM residual 执行；MTC 不会在 q/v 与 gravity 融合前滤波：
 
 ```text
-MTC: WM tau_ref -> torque clip
-  -> q/v + WM total-torque blend
+MTC: WM tau_ref -> residual clip
+  -> q/v + gravity
+  -> residual filter/limit
   -> causal median spike rejection
   -> first-order low-pass
   -> hard per-axis slew-rate limit
@@ -489,12 +488,12 @@ MTC: WM tau_ref -> torque clip
   -> MIT t_ff residual
 
 tau mode: WM tau_pred
-  -> torque clip
+  -> residual clip
   -> causal median spike rejection
   -> first-order low-pass
   -> hard per-axis slew-rate limit
   -> final torque clip
-  -> MIT t_ff
+  -> MIT t_ff = g(q) + residual
 ```
 
 `median_window` 必须为正奇数；窗口越大会抑制更长尖峰，但也增加相位延迟。

@@ -653,22 +653,48 @@ class NeroInferenceRuntime:
                     dt_s=prediction_dt_s,
                 )[0]
             clip_tau = getattr(pipeline, "_clip_tau", None)
-            if callable(clip_tau):
+            clip_residual = getattr(pipeline, "_clip_feedback_tau", None)
+            filter_residual = getattr(pipeline, "_filtered_residual_tau", None)
+            if callable(clip_residual):
+                tau_ref = clip_residual(tau_ref)
+            elif callable(clip_tau):
                 tau_ref = clip_tau(tau_ref)
-            filter_tau = getattr(pipeline, "_filtered_tau", None)
 
-            def filter_final_tau(value: np.ndarray) -> np.ndarray:
-                """Filter the total torque immediately before MIT transport."""
+            def gravity_torque(q: np.ndarray) -> np.ndarray:
+                gravity_fn = getattr(pipeline, "_gravity_torque", None)
+                if callable(gravity_fn):
+                    gravity = np.asarray(gravity_fn(q), dtype=np.float64).reshape(-1)
+                    if gravity.shape != (7,) or not np.all(np.isfinite(gravity)):
+                        raise ValueError("Contact WM gravity torque must be a finite seven-vector")
+                    return gravity
+                async_mtc = getattr(pipeline, "mtc_controller", None)
+                mtc_gravity_fn = getattr(async_mtc, "_gravity_torque", None)
+                if callable(mtc_gravity_fn):
+                    gravity = np.asarray(mtc_gravity_fn(q), dtype=np.float64).reshape(-1)
+                    if gravity.shape != (7,) or not np.all(np.isfinite(gravity)):
+                        raise ValueError("Contact WM gravity torque must be a finite seven-vector")
+                    return gravity
+                return np.zeros(7, dtype=np.float64)
 
-                if callable(filter_tau):
-                    return filter_tau(
-                        value,
-                        state.tau,
-                        dt_s=prediction_dt_s,
-                    )
+            def filter_residual_tau(value: np.ndarray) -> np.ndarray:
+                """Filter the WM residual; analytical gravity stays direct."""
+
+                residual = np.asarray(value, dtype=np.float64).reshape(-1)
+                if residual.shape != (7,) or not np.all(np.isfinite(residual)):
+                    raise ValueError("Contact WM residual torque must be a finite seven-vector")
+                if callable(filter_residual):
+                    return filter_residual(residual, dt_s=prediction_dt_s)
+                if callable(clip_residual):
+                    residual = clip_residual(residual)
                 if callable(clip_tau):
-                    return clip_tau(value)
-                return np.asarray(value, dtype=np.float64)
+                    return clip_tau(residual)
+                return residual
+
+            def clip_feedforward(value: np.ndarray) -> np.ndarray:
+                feedforward = np.asarray(value, dtype=np.float64).reshape(-1)
+                if callable(clip_tau):
+                    return clip_tau(feedforward)
+                return feedforward
 
             if not wm_enabled:
                 # With the fast WM disabled, DP's absolute-joint action plan
@@ -690,7 +716,9 @@ class NeroInferenceRuntime:
                     self._set_q_cmd(q_ref)
                 return {"q_ref": q_ref, "tau_ref": tau_ref, "tau_cmd": np.zeros(7)}
             if mode == "tau":
-                tau_cmd = filter_final_tau(tau_ref)
+                gravity = gravity_torque(state.q)
+                residual = filter_residual_tau(tau_ref)
+                tau_cmd = clip_feedforward(gravity + residual)
                 if self.command_enabled:
                     self.arm.command_joint_impedance(
                         q=state.q,
@@ -700,12 +728,18 @@ class NeroInferenceRuntime:
                         t_ff=tau_cmd,
                     )
                     self._set_q_cmd(state.q)
-                return {"q_ref": q_ref, "tau_ref": tau_ref, "tau_cmd": tau_cmd}
+                return {
+                    "q_ref": q_ref,
+                    "tau_ref": tau_ref,
+                    "tau_residual": residual,
+                    "gravity": gravity,
+                    "tau_cmd": tau_cmd,
+                    "t_ff": tau_cmd,
+                }
 
-            # MTC is evaluated at the transport rate.  ``alpha`` is the WM
-            # total-torque weight; the complementary q/v candidate includes
-            # gravity.  Firmware receives the same configured gains and only
-            # the residual feed-forward.
+            # MTC is evaluated at the transport rate.  The firmware keeps the
+            # configured q/v gains, while feed-forward carries g(q) plus the
+            # filtered Contact WM residual.
             kp = np.asarray(self.config.execution.mit_kp, dtype=np.float64).reshape(-1)
             kd = np.asarray(self.config.execution.mit_kd, dtype=np.float64).reshape(-1)
             if kp.size == 1:
@@ -726,29 +760,18 @@ class NeroInferenceRuntime:
                 )
                 q_ref = np.asarray(mtc_result.q_cmd, dtype=np.float64)
                 tau_pd = np.asarray(mtc_result.tau_pd, dtype=np.float64)
-                tau_cmd = np.asarray(mtc_result.tau_command, dtype=np.float64)
+                gravity = np.asarray(mtc_result.gravity, dtype=np.float64)
+                residual_unfiltered = np.asarray(
+                    mtc_result.alpha * mtc_result.tau_pred,
+                    dtype=np.float64,
+                )
             else:
                 tau_pd = kp * (q_ref - state.q) - kd * state.dq
-                gravity_fn = getattr(async_mtc, "_gravity_torque", None)
-                gravity = (
-                    np.asarray(gravity_fn(state.q), dtype=np.float64)
-                    if callable(gravity_fn)
-                    else np.zeros(7, dtype=np.float64)
-                )
-                tau_qv = tau_pd + gravity
-                tau_cmd = (1.0 - alpha) * tau_qv + alpha * tau_ref
-            # Clip the WM branch before blending, then filter the final blended
-            # total torque immediately before reconstructing the MIT residual.
-            # ``state.tau`` seeds the causal filter after each pipeline reset;
-            # the asynchronous control cadence is the filter sample period.
-            tau_cmd = filter_final_tau(tau_cmd)
-            t_ff = tau_cmd - tau_pd
-            if callable(clip_tau):
-                # Keep the transport packet within the same per-joint safety
-                # limit as the synchronous Contact WM path, then report the
-                # effective total torque that firmware can actually produce.
-                t_ff = clip_tau(t_ff)
-                tau_cmd = clip_tau(tau_pd + t_ff)
+                gravity = gravity_torque(state.q)
+                residual_unfiltered = alpha * tau_ref
+            residual = filter_residual_tau(residual_unfiltered)
+            t_ff = clip_feedforward(gravity + residual)
+            tau_cmd = tau_pd + t_ff
             if self.command_enabled:
                 self.arm.command_joint_impedance(
                     q=q_ref,
@@ -762,6 +785,8 @@ class NeroInferenceRuntime:
                 "q_ref": q_ref,
                 "tau_ref": tau_ref,
                 "tau_pd": tau_pd,
+                "gravity": gravity,
+                "tau_residual": residual,
                 "tau_cmd": tau_cmd,
                 "t_ff": t_ff,
                 "alpha": alpha,

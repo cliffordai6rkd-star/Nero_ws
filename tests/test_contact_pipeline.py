@@ -112,6 +112,28 @@ class _ContactWM(torch.nn.Module):
         }
 
 
+class _QTauContactWM(_ContactWM):
+    def __init__(self):
+        super().__init__()
+        self._inference_checkpoint_config["model"]["inputs"] = ["q", "tau"]
+
+    def predict(self, inputs, **_kwargs):
+        self.inputs.append(inputs)
+        assert set(inputs) == {
+            "q",
+            "tau",
+            "action",
+            "action_mask",
+        }
+        assert inputs["q"].shape == (1, 5, 7)
+        assert inputs["tau"].shape == (1, 5, 7)
+        assert inputs["action"].shape == (1, 8, 7)
+        assert inputs["action_mask"].shape == (1, 8)
+        q = torch.full((1, 4, 7), 0.1)
+        tau = torch.full((1, 4, 7), 0.2)
+        return {"q_pred": q, "tau_pred": tau}
+
+
 class _Model:
     dof = 7
     position_lower = np.full(7, -2.0)
@@ -267,6 +289,33 @@ def test_contact_pipeline_clamps_mtc_velocity_and_feedback(tmp_path: Path):
     pipeline.close()
 
 
+def test_contact_pipeline_accepts_q_tau_only_wm_outputs(tmp_path: Path):
+    config = replace(
+        _config(tmp_path, "mtc"),
+        execution=replace(
+            _config(tmp_path, "mtc").execution,
+            mtc_q_cmd_source="wm_state",
+            mtc_alpha=1.0,
+        ),
+    )
+    pipeline = ContactWMInferencePipeline(
+        config,
+        dp_model=_DP(),
+        pinn_model=_QTauContactWM(),
+        controller=_Controller(),
+    )
+
+    output = pipeline.step(_sample())
+
+    assert output.control_mode == "mtc"
+    np.testing.assert_allclose(output.q_target, 0.1, atol=1.0e-6)
+    np.testing.assert_allclose(output.dq_target, 0.0, atol=1.0e-6)
+    np.testing.assert_allclose(output.joint_velocity_trajectory[0], 2.0, atol=1.0e-6)
+    np.testing.assert_allclose(output.torque_target, 0.2, atol=1.0e-6)
+    np.testing.assert_allclose(output.tau_command, 0.3, atol=1.0e-6)
+    pipeline.close()
+
+
 def test_contact_pipeline_reports_configured_mtc_gains(tmp_path: Path):
     config = _config(tmp_path, "mtc")
     config = replace(
@@ -301,7 +350,7 @@ def test_contact_pipeline_reports_configured_mtc_gains(tmp_path: Path):
     pipeline.close()
 
 
-def test_contact_pipeline_clips_mtc_total_torque(
+def test_contact_pipeline_clips_mtc_feedforward_torque(
     tmp_path: Path,
 ):
     config = _config(tmp_path, "mtc")
@@ -321,13 +370,21 @@ def test_contact_pipeline_clips_mtc_total_torque(
         pinn_model=_ContactWM(),
         controller=_Controller(),
     )
-    output = pipeline.step(_sample())
+    sample = _sample()
+    output = pipeline.step(sample)
+    firmware_feedback = output.mit_kp * (output.q_target - sample.q) + output.mit_kd * (
+        output.dq_target - sample.dq
+    )
     assert np.max(np.abs(output.tau_target)) <= 0.2 + 1.0e-10
-    assert np.max(np.abs(output.tau_command)) <= 0.2 + 1.0e-10
+    np.testing.assert_allclose(
+        output.tau_command,
+        firmware_feedback + output.tau_target,
+        atol=1.0e-10,
+    )
     pipeline.close()
 
 
-def test_contact_mtc_filters_final_blended_torque(tmp_path: Path):
+def test_contact_mtc_filters_residual_without_delaying_qv_gravity(tmp_path: Path):
     config = replace(
         _config(tmp_path, "mtc"),
         torque_filter=TorqueFilterConfig(
@@ -345,11 +402,11 @@ def test_contact_mtc_filters_final_blended_torque(tmp_path: Path):
     )
     output = pipeline.step(_sample())
 
-    # q/v and WM each contribute 0.1 before filtering.  The filter must see
-    # their blended total (0.15), not WM tau (0.2) on its own.
+    # q/v contributes 0.1 immediately. Only the WM residual is low-pass filtered,
+    # so analytical gravity/PD are not delayed from zero.
     filter_alpha = 1.0 - np.exp(-2.0 * np.pi * 1.0 * 0.01)
-    expected_total = 0.15 * filter_alpha
-    np.testing.assert_allclose(output.tau_unfiltered, 0.15, atol=1.0e-8)
-    np.testing.assert_allclose(output.tau_command, expected_total, atol=1.0e-8)
-    np.testing.assert_allclose(output.tau_target, expected_total - 0.1, atol=1.0e-8)
+    expected_residual = 0.2 * filter_alpha
+    np.testing.assert_allclose(output.tau_unfiltered, 0.3, atol=1.0e-8)
+    np.testing.assert_allclose(output.tau_command, 0.1 + expected_residual, atol=1.0e-8)
+    np.testing.assert_allclose(output.tau_target, expected_residual, atol=1.0e-8)
     pipeline.close()

@@ -47,13 +47,12 @@ class ExecutionConfig:
     mit_kp: float | tuple[float, ...] = (0.0,) * 7
     mit_kd: float | tuple[float, ...] = (0.0,) * 7
     # Optional clamps applied only to the reconstructed MIT velocity target
-    # and the feedback contribution.  A scalar broadcasts to all joints.
+    # and the WM residual contribution.  A scalar broadcasts to all joints.
     mit_velocity_limit: float | tuple[float, ...] = 5.0
     mit_feedback_torque_limit: float | tuple[float, ...] | None = None
-    # Multi-target controller (MTC) blends a data-style q/v/gravity torque
-    # candidate with the WM-predicted total torque.  ``mtc_alpha`` is the WM
-    # weight; the q/v candidate receives ``1 - mtc_alpha``.
-    mtc_alpha: float = 0.5
+    # Multi-target controller (MTC) keeps firmware q/v feedback active and
+    # sends g(q) plus ``mtc_alpha`` times the WM residual as feed-forward.
+    mtc_alpha: float = 1.0
     # ``wm_state`` uses q_hat; ``wm_delta`` reconstructs q_cmd_hat as
     # q_hat + delta_q_hat.  ``q_hat`` and ``q_cmd_hat`` are accepted aliases.
     mtc_q_cmd_source: str = "wm_delta"

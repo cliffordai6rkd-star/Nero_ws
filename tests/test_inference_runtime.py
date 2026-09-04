@@ -11,6 +11,7 @@ import pytest
 from inference.config import (
     CheckpointConfig,
     ArchitectureConfig,
+    ExecutionConfig,
     InferenceConfig,
     ObservationProtectionConfig,
     PredictorConfig,
@@ -19,6 +20,7 @@ from inference.config import (
     load_inference_config,
     resolve_camera_key,
 )
+from inference.async_fast_slow import StateSample, WMTarget
 from inference.runtime import NeroInferenceRuntime, _checkpoint_image_keys_if_available
 from inference.control.nero import NeroPipelineOutputController
 from nero_collection.arms.base import ArmState
@@ -216,6 +218,39 @@ class _Pipeline:
         self.closed = True
 
 
+class _AsyncContactPipeline(_Pipeline):
+    def __init__(self):
+        super().__init__()
+        self.mtc_controller = None
+        self.filtered_residuals = []
+
+    def _safe_joint_position_trajectory(self, _q, q_ref, *, dt_s):
+        del dt_s
+        return np.asarray(q_ref, dtype=np.float64)
+
+    def _clip_feedback_tau(self, value):
+        return np.asarray(value, dtype=np.float64)
+
+    def _filtered_residual_tau(self, value, *, dt_s=None):
+        del dt_s
+        residual = np.asarray(value, dtype=np.float64)
+        self.filtered_residuals.append(residual.copy())
+        return residual
+
+    def _clip_tau(self, value):
+        return np.asarray(value, dtype=np.float64)
+
+    def _gravity_torque(self, q):
+        return np.asarray(q, dtype=np.float64) + 0.3
+
+    def predict_contact_reference(self, history, action):
+        del history, action
+        return {
+            "q_ref": np.zeros((32, 7), dtype=np.float64),
+            "tau_ref": np.zeros((32, 7), dtype=np.float64),
+        }
+
+
 def test_wm_tau_output_uses_zero_firmware_gains() -> None:
     """Direct WM torque mode must not add runtime damping or PD feedback."""
 
@@ -244,6 +279,74 @@ def test_wm_tau_output_uses_zero_firmware_gains() -> None:
     np.testing.assert_allclose(command["kp"], np.zeros(7))
     np.testing.assert_allclose(command["kd"], np.zeros(7))
     np.testing.assert_allclose(command["t_ff"], output.tau_command)
+
+
+def test_timestamped_contact_mtc_sends_gravity_when_wm_residual_is_zero() -> None:
+    arm = _Arm()
+    pipeline = _AsyncContactPipeline()
+    base = _config()
+    config = replace(
+        base,
+        architecture=ArchitectureConfig(
+            enabled=True,
+            policy_type="lerobotdp",
+            world_model_type="contact_wm",
+        ),
+        predictor=replace(
+            base.predictor,
+            enabled=True,
+            mode="contact_world_model",
+            inference_mode="asynchronous",
+        ),
+        action="joint",
+        execution=ExecutionConfig(
+            mode="mtc",
+            mit_kp=(2.0,) * 7,
+            mit_kd=(0.5,) * 7,
+            mtc_alpha=1.0,
+            mtc_q_cmd_source="wm_state",
+        ),
+    )
+    runtime = NeroInferenceRuntime(
+        config,
+        backend="mock",
+        command_enabled=True,
+        pipeline=pipeline,
+        arm=arm,
+        cameras=_Cameras(),
+        online_tau_ext=_TauExt(),
+        wrench_estimator=_Wrench(),
+    )
+    async_runtime = runtime._build_timestamp_async_runtime(
+        prediction_horizon=32,
+        prediction_dt_s=0.01,
+        action_step_s=0.04,
+    )
+    state = StateSample(
+        timestamp_s=1.0,
+        q=np.full(7, 0.2),
+        dq=np.full(7, 0.1),
+        delta_q=np.zeros(7),
+        tau=np.zeros(7),
+        q_cmd=np.full(7, 0.2),
+    )
+    target = WMTarget(
+        timestamp_s=1.0,
+        q_ref=np.full(7, 0.25),
+        tau_ref=np.zeros(7),
+    )
+
+    output = async_runtime.control_worker.control_fn(state, target, 1.0)
+
+    command = arm.commands[-1]
+    tau_pd = 2.0 * (0.25 - 0.2) - 0.5 * 0.1
+    gravity = np.full(7, 0.5)
+    np.testing.assert_allclose(command["q"], 0.25)
+    np.testing.assert_allclose(command["kp"], 2.0)
+    np.testing.assert_allclose(command["kd"], 0.5)
+    np.testing.assert_allclose(command["t_ff"], gravity)
+    np.testing.assert_allclose(output["tau_residual"], 0.0)
+    np.testing.assert_allclose(output["tau_cmd"], tau_pd + gravity)
 
 
 def _config() -> InferenceConfig:
