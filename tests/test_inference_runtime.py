@@ -795,6 +795,10 @@ def test_runtime_computes_wrench_and_requires_explicit_command_enable() -> None:
     assert output is not None
     assert len(pipeline.inputs) == 1
     assert arm.commands == []
+    assert arm.reset_commands == []
+    assert arm.follower_mode_count == 0
+    assert not arm.enabled
+    assert arm.disable_count == 0
     assert pipeline.closed
 
 
@@ -1253,6 +1257,38 @@ def test_runtime_single_step_starts_paused() -> None:
     assert len(pipeline.inputs) == 1
     assert arm.enabled
     assert arm.disable_count == 0
+
+
+def test_timestamped_dp_only_runtime_ignores_absent_wm_worker() -> None:
+    """A disabled predictor leaves wm_worker=None and must remain runnable."""
+
+    runtime = NeroInferenceRuntime.__new__(NeroInferenceRuntime)
+    active_worker = SimpleNamespace(fault=None, _name="active-worker")
+    runtime._async_runtime = SimpleNamespace(
+        dp_worker=active_worker,
+        wm_worker=None,
+        cycles=0,
+        control_worker=SimpleNamespace(
+            fault=None,
+            _name="nero-control-worker",
+            cycles=0,
+            set_manual_mode=lambda _enabled: None,
+        ),
+    )
+    runtime._timestamp_async_enabled = True
+    runtime._started = True
+    runtime.command_enabled = False
+    runtime.config = SimpleNamespace(
+        runtime=SimpleNamespace(maximum_inference_steps=None)
+    )
+    runtime._stop_state_stream = lambda **_kwargs: None
+    runtime._end_episode_state = lambda: None
+    runtime.stop = lambda **_kwargs: None
+    keys = iter((None, "q"))
+
+    cycles = runtime.run(read_key=lambda _timeout: next(keys))
+
+    assert cycles == 0
 
 
 def test_runtime_ctrl_c_resets_and_preserves_follower_enabled_state() -> None:

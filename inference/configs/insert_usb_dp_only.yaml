@@ -1,0 +1,72 @@
+# Insert-USB DP-only deployment.  This keeps the timestamped 100 Hz execution
+# graph but deliberately omits the Contact WM checkpoint and worker.
+dp_checkpoint:
+  path: ../../model/dp/pretrained_model-20260901T082955Z-1-001/pretrained_model
+  dino_model_path: null
+  device: cuda:0
+  use_ema: true
+
+action: joint
+
+architecture:
+  enabled: true
+  policy_type: lerobotdp
+  # The timestamped graph is selected by this architecture family;
+  # predictor.enabled=false below guarantees that no WM is loaded or run.
+  world_model_type: contact_wm
+
+predictor:
+  enabled: false
+  mode: contact_world_model
+  inference_mode: asynchronous
+  action_chunk_mode: all
+  action_condition_fill: chunk
+  action_execution_mode: chunk
+  action_step_s: 0.04
+
+execution:
+  mode: q
+  mtc_alpha: 1.0
+  mtc_q_cmd_source: wm_state
+  mit_kp: [3.0, 3.0, 2.0, 3.5, 2.0, 2.0, 3.0]
+  mit_kd:  [0.1, 0.1, 0.25, 0.25, 0.1, 0.1, 0.1]
+  mit_velocity_limit: [1, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+  mit_feedback_torque_limit: [10, 10, 10, 8, 6, 5, 5]
+
+dp_sampling:
+  method: ddim
+  num_inference_steps: 50
+  use_tau_ext_observation: false
+
+robot:
+  urdf_path: ../../urdf/nero/nero_with_gripper.urdf
+  frame_name: gripper_tcp
+  action_frame_name: link7
+  locked_joint_names: [gripper, gripper_joint1, gripper_joint2]
+
+runtime:
+  collection_config: ../../configs/master_slave_can.yaml
+  arm_pair: main
+  camera: wrist
+  maximum_state_age_s: 0.1
+  maximum_observation_alignment_gap_s: 0.03
+  maximum_inference_steps: 3000
+  command_kd: [0, 0, 0, 0, 0, 0, 0]
+
+observation_protection:
+  enabled: true
+  warmup_duration_s: 2.0
+  wrench_median_window: 5
+  wrench_lowpass_cutoff_hz: 5.0
+
+safety:
+  maximum_action_translation_step_m: 0.05
+  maximum_action_rotation_step_rad: 0.5
+  maximum_target_force_n: 5.0
+  maximum_target_moment_nm: 5.0
+  maximum_command_torque_nm: [16, 16, 16, 16, 15, 10, 10]
+  maximum_joint_position_step_rad: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+
+timing:
+  enabled: true
+  report_interval_s: 1.0

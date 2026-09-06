@@ -64,12 +64,24 @@ class NeroObservationSampler:
     def latest_frames(self) -> dict[str, CameraFrame]:
         return dict(self._latest_frames)
 
-    def sample(self) -> Observation | None:
-        open_loop = bool(self.open_loop())
-        executing = bool(self.open_loop_active())
+    def _poll_camera_frames(self) -> None:
         for frame in self.cameras.poll():
             if frame.camera_name in self.camera_keys:
                 self._latest_frames[frame.camera_name] = frame
+
+    def _camera_ages_s(self, current_us: int) -> dict[str, float]:
+        return {
+            key: max(
+                0.0,
+                (current_us - int(self._latest_frames[key].timestamp_us)) * 1.0e-6,
+            )
+            for key in self.camera_keys
+        }
+
+    def sample(self) -> Observation | None:
+        open_loop = bool(self.open_loop())
+        executing = bool(self.open_loop_active())
+        self._poll_camera_frames()
         primary_frame = self._latest_frames.get(self.primary_camera)
         if primary_frame is None:
             return None
@@ -79,17 +91,27 @@ class NeroObservationSampler:
             return None
 
         current_us = now_us()
-        camera_age_s = max(
-            max(
-                0.0,
-                (current_us - int(self._latest_frames[key].timestamp_us)) * 1.0e-6,
-            )
-            for key in self.camera_keys
-        )
+        camera_ages_s = self._camera_ages_s(current_us)
+        camera_age_s = max(camera_ages_s.values())
         camera_stale = camera_age_s > self.maximum_state_age_s
         if camera_stale and not open_loop:
+            # A slow DP forward can leave the lossy cross-process camera queues
+            # unpolled for about a second.  Their first drained item may be an
+            # old backlog frame even though acquisition is healthy.  Give the
+            # producer one normal freshness window to publish its latest frame;
+            # real acquisition faults still propagate immediately from poll().
+            recovery_deadline_s = time.monotonic() + self.maximum_state_age_s
+            while camera_stale and time.monotonic() < recovery_deadline_s:
+                time.sleep(0.002)
+                self._poll_camera_frames()
+                current_us = now_us()
+                camera_ages_s = self._camera_ages_s(current_us)
+                camera_age_s = max(camera_ages_s.values())
+                camera_stale = camera_age_s > self.maximum_state_age_s
+        if camera_stale and not open_loop:
+            stale_camera = max(camera_ages_s, key=camera_ages_s.__getitem__)
             raise RuntimeError(
-                f"camera {self.primary_camera!r} is stale: age={camera_age_s:.3f}s, "
+                f"camera {stale_camera!r} is stale: age={camera_age_s:.3f}s, "
                 f"limit={self.maximum_state_age_s:.3f}s"
             )
         if camera_stale and open_loop and not executing:

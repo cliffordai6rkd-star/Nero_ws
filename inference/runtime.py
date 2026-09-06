@@ -225,6 +225,12 @@ class NeroInferenceRuntime:
         collection = load_config(config.runtime.collection_config)
         if backend is not None:
             collection = _with_backend(collection, backend)
+        if collection.teleop.backend == "pyagxarm":
+            # USB-CAN kernel names are not stable; bind configured arm
+            # endpoints to the adapters by serial before building the arm.
+            from nero_collection.cli import _resolve_can_interfaces
+
+            collection = _resolve_can_interfaces(collection)
         self.collection = collection
         pair = next(
             (
@@ -241,10 +247,6 @@ class NeroInferenceRuntime:
             )
         self.pair = pair
         self.arm = arm or build_arm(pair.follower, collection.teleop.backend)
-        self.cameras = cameras or CameraManager.from_config(
-            collection.cameras,
-            visualizer=CameraVisualizer.from_config(collection.cameras),
-        )
         if self._modular_mode:
             # The actual modular object may be produced below, once the shared
             # observation sampler exists.  Keep ``self.pipeline`` as a public
@@ -258,6 +260,30 @@ class NeroInferenceRuntime:
             self.pipeline = ContactWMInferencePipeline(config)
         else:
             self.pipeline = NeroInferencePipeline(config)
+        runtime_camera_configs = collection.cameras
+        if self._timestamp_architecture_requested:
+            checkpoint_camera_keys = set(
+                getattr(self.pipeline, "_image_keys", ())
+                or _checkpoint_image_keys_if_available(config.dp_checkpoint.path)
+                or ()
+            )
+            if checkpoint_camera_keys:
+                available = {str(camera.name) for camera in collection.cameras}
+                missing = sorted(checkpoint_camera_keys - available)
+                if missing:
+                    raise ValueError(
+                        "DP checkpoint cameras are missing from collection config: "
+                        f"{missing}"
+                    )
+                runtime_camera_configs = tuple(
+                    camera
+                    for camera in collection.cameras
+                    if str(camera.name) in checkpoint_camera_keys
+                )
+        self.cameras = cameras or CameraManager.from_config(
+            runtime_camera_configs,
+            visualizer=CameraVisualizer.from_config(runtime_camera_configs),
+        )
         self.online_tau_ext = online_tau_ext or OnlineTauExtInference(
             collection.tau_ext_inference,
             collection.tau_ext_inference.inverse_dynamics,
@@ -792,13 +818,7 @@ class NeroInferenceRuntime:
                 "alpha": alpha,
             }
 
-        dp_worker = DPWorker(
-            infer_dp,
-            self.action_plan_buffer,
-            step_s=action_step_s,
-            source=self._sample_async_dp_observation,
-        )
-        wm_worker = None
+        wm_worker: WMWorker | None = None
         if wm_enabled:
             wm_worker = WMWorker(
                 self.state_history_buffer,
@@ -810,7 +830,41 @@ class NeroInferenceRuntime:
                 request_period_s=max(1.0 / 16.0, prediction_dt_s),
                 state_horizon_s=self.state_history_buffer.horizon_s,
                 action_horizon_s=prediction_horizon * prediction_dt_s,
+                auto_request=False,
             )
+
+        def publish_to_wm(plan) -> None:
+            if wm_worker is None:
+                return
+            # The state callback trails the DP completion timestamp by at most
+            # one 100 Hz tick. Wait for that causal boundary before requesting
+            # the exact [plan_start, plan_start+0.32) action window; otherwise
+            # WMWorker clamps to an earlier state and cannot find a complete
+            # action trajectory. Keeping DP paused here also prevents its next
+            # long denoising pass from starving the short WM CUDA forward.
+            deadline = monotonic_time() + prediction_horizon * prediction_dt_s
+            while (
+                self.state_history_buffer.latest_timestamp_s is None
+                or self.state_history_buffer.latest_timestamp_s < plan.start_time_s
+            ):
+                if monotonic_time() >= deadline or wm_worker.fault is not None:
+                    return
+                time.sleep(min(0.001, prediction_dt_s / 4.0))
+            before = wm_worker.inference_count
+            if not wm_worker.request(plan.start_time_s):
+                return
+            while wm_worker.inference_count <= before:
+                if monotonic_time() >= deadline or wm_worker.fault is not None:
+                    return
+                time.sleep(min(0.001, prediction_dt_s / 4.0))
+
+        dp_worker = DPWorker(
+            infer_dp,
+            self.action_plan_buffer,
+            step_s=action_step_s,
+            source=self._sample_async_dp_observation,
+            on_publish=publish_to_wm,
+        )
         control_worker = ControlWorker(
             self.state_history_buffer,
             self.wm_target_buffer,
@@ -862,6 +916,62 @@ class NeroInferenceRuntime:
 
     def _stop_state_stream(self, *, clear: bool = False) -> None:
         if self._async_runtime is not None:
+            plans = self.action_plan_buffer.snapshot()
+            segments = self.wm_target_buffer.snapshot()
+            latest_plan = None if not plans else plans[-1]
+            latest_segment = None if not segments else segments[-1]
+            workers = (
+                self._async_runtime.dp_worker,
+                self._async_runtime.wm_worker,
+                self._async_runtime.control_worker,
+            )
+            if any(worker is not None and worker.running for worker in workers):
+                last_control = self._async_runtime.last_output
+                control_finite = (
+                    None
+                    if not isinstance(last_control, dict)
+                    else all(
+                        np.isfinite(np.asarray(value)).all()
+                        for value in last_control.values()
+                        if isinstance(value, (np.ndarray, list, tuple, int, float))
+                    )
+                )
+                log.info(
+                    "async inference summary control_cycles=%d dp_updates=%d "
+                    "dp_shape=%s dp_step_s=%s dp_finite=%s wm_updates=%s "
+                    "wm_latency_s=%s wm_q_shape=%s wm_tau_shape=%s "
+                    "wm_finite=%s control_finite=%s",
+                    self._async_runtime.cycles,
+                    self._async_runtime.dp_worker.updates,
+                    None if latest_plan is None else latest_plan.values.shape,
+                    None if latest_plan is None else latest_plan.step_s,
+                    (
+                        None
+                        if latest_plan is None
+                        else bool(np.isfinite(latest_plan.values).all())
+                    ),
+                    (
+                        None
+                        if self._async_runtime.wm_worker is None
+                        else self._async_runtime.wm_worker.inference_count
+                    ),
+                    (
+                        None
+                        if self._async_runtime.wm_worker is None
+                        else self._async_runtime.wm_worker.last_latency_s
+                    ),
+                    None if latest_segment is None else latest_segment.q_ref.shape,
+                    None if latest_segment is None else latest_segment.tau_ref.shape,
+                    (
+                        None
+                        if latest_segment is None
+                        else bool(
+                            np.isfinite(latest_segment.q_ref).all()
+                            and np.isfinite(latest_segment.tau_ref).all()
+                        )
+                    ),
+                    control_finite,
+                )
             self._async_runtime.stop()
         if self._continuous_state_stream_enabled:
             self._state_stream.stop()
@@ -879,13 +989,13 @@ class NeroInferenceRuntime:
             return
         self.arm.connect()
         try:
-            self.arm.set_follower_mode()
-            self.arm.enable()
             if self.command_enabled:
+                self.arm.set_follower_mode()
+                self.arm.enable()
                 self._reset_arm_to_rest("startup")
             else:
                 self._wait_for_finite_arm_state()
-            if not self.config.observation_protection.enabled:
+            if self.command_enabled and not self.config.observation_protection.enabled:
                 self._prepare_inference_control_mode()
                 self._inference_control_mode_ready = True
             initial_state = self._wait_for_finite_arm_state()
@@ -912,6 +1022,15 @@ class NeroInferenceRuntime:
                 self.pipeline.reset()
                 self._observation_sampler.reset_episode()
             self._reset_observation_protection()
+            if self._timestamp_async_enabled and self.config.predictor.enabled:
+                warm_up = getattr(self.pipeline, "warm_up_contact_reference", None)
+                if callable(warm_up):
+                    warm_started = time.perf_counter()
+                    warm_up()
+                    log.info(
+                        "Contact WM CUDA warm-up complete in %.3fs (discarded output)",
+                        time.perf_counter() - warm_started,
+                    )
             self._start_state_stream()
             self._started = True
         except BaseException:
@@ -930,9 +1049,9 @@ class NeroInferenceRuntime:
                     )
                 except Exception:
                     log.exception("arm reset failed after inference startup exception")
-            if not recovered:
+            if self.command_enabled and not recovered:
                 self._best_effort_follower_enabled_hold(
-                    allow_position_hold=self.command_enabled,
+                    allow_position_hold=True,
                 )
             self.arm.disconnect()
             try:
@@ -948,6 +1067,10 @@ class NeroInferenceRuntime:
         read_key: Callable[[float], str | None] | None = None,
         single_step: bool = False,
     ) -> int:
+        manual_step = bool(single_step)
+        step_requested = False
+        if self._async_runtime is not None:
+            self._async_runtime.control_worker.set_manual_mode(manual_step)
         if not self._started:
             self.start()
         started_s = time.perf_counter()
@@ -957,8 +1080,6 @@ class NeroInferenceRuntime:
         # In single-step mode the key request remains armed until a complete
         # state/image sample is available. This makes one ``s`` correspond to
         # exactly one pipeline control cycle even when cameras or CAN lag.
-        manual_step = bool(single_step)
-        step_requested = False
         async_cycle_base = 0
         final_reset_succeeded = False
         failed = False
@@ -987,6 +1108,9 @@ class NeroInferenceRuntime:
                 if key in {"s", "S"}:
                     manual_step = True
                     step_requested = True
+                    if self._async_runtime is not None:
+                        self._async_runtime.control_worker.set_manual_mode(True)
+                        self._async_runtime.control_worker.request_step()
                     log.info(
                         "single-step requested; press s for the next control cycle "
                         "or c to resume continuous inference"
@@ -994,6 +1118,8 @@ class NeroInferenceRuntime:
                 elif key in {"c", "C"}:
                     manual_step = False
                     step_requested = False
+                    if self._async_runtime is not None:
+                        self._async_runtime.control_worker.set_manual_mode(False)
                     log.info("continuous inference resumed")
                 if self._timestamp_async_enabled:
                     assert self._async_runtime is not None
@@ -1002,6 +1128,11 @@ class NeroInferenceRuntime:
                         self._async_runtime.wm_worker,
                         self._async_runtime.control_worker,
                     ):
+                        # DP-only timestamped inference intentionally has no
+                        # world-model worker.  Keep monitoring the two active
+                        # workers without dereferencing that optional slot.
+                        if worker is None:
+                            continue
                         fault = worker.fault
                         if fault is not None:
                             raise RuntimeError(
@@ -1583,7 +1714,7 @@ class NeroInferenceRuntime:
             self.cameras.stop()
             self.wrench_plotter.close()
             self.tau_ext_plotter.close()
-            if not preserve_arm_enabled:
+            if self.command_enabled and not preserve_arm_enabled:
                 try:
                     self.arm.disable()
                 except Exception as exc:

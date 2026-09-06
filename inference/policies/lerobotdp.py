@@ -10,6 +10,8 @@ optional LeRobot dependency behind a small adapter and exposes the same
 from __future__ import annotations
 
 import json
+import tempfile
+from dataclasses import fields
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Mapping
@@ -27,6 +29,18 @@ _ACTION_KEYS = (
     "action_prediction",
     "trajectory",
 )
+
+# These fields were added by the Nero LeRobot 0.5 training fork.  They do not
+# alter this checkpoint when they have the exact values below, so an installed
+# LeRobot 0.4 runtime may discard them before decoding the policy config.  Any
+# other unsupported field or value remains a hard compatibility error.
+_SAFE_UNSUPPORTED_CONFIG_VALUES = {
+    "use_peft": False,
+    "resize_shape": None,
+    "crop_ratio": 1.0,
+    "compile_model": False,
+    "compile_mode": "reduce-overhead",
+}
 
 
 def is_lerobot_checkpoint(path: str | Path) -> bool:
@@ -63,9 +77,13 @@ class LeRobotDiffusionPolicy:
         step_s: float | None = None,
         action_semantic: str = "joint",
         action_frame_name: str | None = None,
+        preprocessor: Any | None = None,
+        postprocessor: Any | None = None,
     ) -> None:
         self.model = model
         self.device = device
+        self.preprocessor = preprocessor
+        self.postprocessor = postprocessor
         self.metadata = {} if metadata is None else dict(metadata)
         config = getattr(model, "config", None)
         self.image_keys = self._image_keys(config, self.metadata)
@@ -87,6 +105,11 @@ class LeRobotDiffusionPolicy:
             "action_dim",
         )
         self.action_steps = self.n_action_steps if action_steps is None else int(action_steps)
+        # LeRobot slices its generated horizon at the newest observation.
+        # Export the index explicitly so the Contact WM loader can validate it
+        # against the checkpoint's action_start_offset instead of silently
+        # assuming the two temporal contracts agree.
+        self.action_start_index = self.n_obs_steps - 1
         self.step_s = self._step_from_metadata() if step_s is None else float(step_s)
         self.action_semantic = str(action_semantic).strip().lower()
         self.action_frame_name = action_frame_name
@@ -113,6 +136,7 @@ class LeRobotDiffusionPolicy:
         checkpoint_path: str | Path,
         *,
         device: str = "cuda:0",
+        sampling_method: str | None = None,
         num_inference_steps: int | None = None,
         action_steps: int | None = None,
         step_s: float | None = None,
@@ -126,15 +150,53 @@ class LeRobotDiffusionPolicy:
                 f"config.json and model.safetensors: {root}"
             )
         try:
+            from lerobot.configs.policies import PreTrainedConfig
+            from lerobot.policies.diffusion.configuration_diffusion import (
+                DiffusionConfig,
+            )
             from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
+            from lerobot.policies.factory import make_pre_post_processors
         except ImportError as exc:  # pragma: no cover - depends on deployment extras
             raise RuntimeError(
                 "this checkpoint uses LeRobot Diffusion Policy; install the "
                 "optional dependency with `pip install lerobot==0.4.0`"
             ) from exc
-
         try:
-            model = DiffusionPolicy.from_pretrained(str(root))
+            raw_config = json.loads((root / "config.json").read_text(encoding="utf-8"))
+            supported_fields = {item.name for item in fields(DiffusionConfig)} | {"type"}
+            compatible_config = _compatible_config_payload(
+                raw_config,
+                supported_fields=supported_fields,
+            )
+            if compatible_config == raw_config:
+                policy_config = PreTrainedConfig.from_pretrained(str(root))
+            else:
+                # LeRobot's public loader accepts only a directory.  Keep the
+                # compatibility copy ephemeral; never rewrite the checkpoint.
+                with tempfile.TemporaryDirectory(prefix="nero-lerobot-config-") as tmp:
+                    Path(tmp, "config.json").write_text(
+                        json.dumps(compatible_config),
+                        encoding="utf-8",
+                    )
+                    policy_config = PreTrainedConfig.from_pretrained(tmp)
+            if sampling_method is not None:
+                scheduler_name = str(sampling_method).strip().upper()
+                if scheduler_name not in {"DDIM", "DDPM"}:
+                    raise ValueError("sampling_method must be 'ddim' or 'ddpm'")
+                policy_config.noise_scheduler_type = scheduler_name
+            policy_config.device = device
+            model = DiffusionPolicy.from_pretrained(
+                str(root),
+                config=policy_config,
+                strict=True,
+            )
+            preprocessor, postprocessor = make_pre_post_processors(
+                policy_config,
+                pretrained_path=str(root),
+                preprocessor_overrides={
+                    "device_processor": {"device": device},
+                },
+            )
         except Exception as exc:
             raise RuntimeError(f"failed to load LeRobot DP checkpoint {root}: {exc}") from exc
         if num_inference_steps is not None:
@@ -153,6 +215,9 @@ class LeRobotDiffusionPolicy:
             if callable(mover):
                 mover(device)
         metadata = cls._read_metadata(root)
+        metadata["runtime_noise_scheduler_type"] = str(
+            model.diffusion.noise_scheduler.__class__.__name__
+        )
         return cls(
             model,
             metadata=metadata,
@@ -161,6 +226,8 @@ class LeRobotDiffusionPolicy:
             step_s=step_s,
             action_semantic=action_semantic,
             action_frame_name=action_frame_name,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
         )
 
     def start(self) -> None:
@@ -249,28 +316,57 @@ class LeRobotDiffusionPolicy:
         return {"action": output}
 
     def _predict_chunk(self, model_input: Mapping[str, Any]) -> Any:
+        select_action = getattr(self.model, "select_action", None)
+        if callable(select_action):
+            # LeRobot's own predict_action_chunk() consumes its observation
+            # queues and is not a standalone public entry point.  Calling
+            # select_action() first populates those queues, then drains exactly
+            # the eight actions Nero schedules.
+            value = self._postprocess(self._call_model(select_action, model_input))
+            array = self._extract_values(value)
+            if array.ndim == 3 or (array.ndim == 2 and array.shape[0] > 1):
+                return array
+            if array.ndim == 2:
+                array = array[0]
+            actions = [array.reshape(-1)]
+
+            # A normal LeRobot policy has already generated the remaining
+            # n_action_steps-1 actions and cached them in _queues["action"].
+            # Drain that queue directly: calling select_action repeatedly with
+            # the same frame would also repopulate the observation queue and
+            # destroy the checkpoint's two-frame history for the next DP call.
+            queues = getattr(self.model, "_queues", None)
+            pending = queues.get("action") if isinstance(queues, Mapping) else None
+            while pending is not None and len(actions) < self.action_steps and len(pending):
+                queued = self._postprocess(pending.popleft())
+                queued_array = self._extract_values(queued)
+                if queued_array.ndim == 2:
+                    queued_array = queued_array[0]
+                actions.append(queued_array.reshape(-1))
+
+            # Keep injected test/dummy models source-compatible.  Official
+            # LeRobot DiffusionPolicy always takes the queue path above.
+            while len(actions) < self.action_steps:
+                value = self._postprocess(self._call_model(select_action, model_input))
+                value_array = self._extract_values(value)
+                if value_array.ndim == 2:
+                    value_array = value_array[0]
+                actions.append(value_array.reshape(-1))
+            return np.stack(actions, axis=0)
+
         for name in ("predict_action_chunk", "predict_action"):
             method = getattr(self.model, name, None)
             if callable(method):
-                return self._call_model(method, model_input)
+                return self._postprocess(self._call_model(method, model_input))
+        raise TypeError(
+            "LeRobot DP model must expose select_action(), "
+            "predict_action_chunk(), or predict_action()"
+        )
 
-        select_action = getattr(self.model, "select_action", None)
-        if not callable(select_action):
-            raise TypeError(
-                "LeRobot DP model must expose predict_action_chunk(), "
-                "predict_action(), or select_action()"
-            )
-        actions = []
-        for _ in range(self.action_steps):
-            value = self._call_model(select_action, model_input)
-            array = self._extract_values(value)
-            if array.ndim == 3 or (array.ndim == 2 and array.shape[0] > 1):
-                # Some wrappers return the complete queue on the first call.
-                return value
-            if array.ndim == 2:
-                array = array[0]
-            actions.append(array.reshape(-1))
-        return np.stack(actions, axis=0)
+    def _postprocess(self, value: Any) -> Any:
+        if self.postprocessor is None:
+            return value
+        return self.postprocessor(value)
 
     @staticmethod
     def _call_model(method: Any, model_input: Mapping[str, Any]) -> Any:
@@ -295,10 +391,10 @@ class LeRobotDiffusionPolicy:
             import torch
         except ImportError as exc:  # pragma: no cover - runtime dependency
             raise RuntimeError("LeRobot DP inference requires torch") from exc
+        add_batch_dimension = self.preprocessor is None
+        state = torch.from_numpy(np.asarray(observation.q, dtype=np.float32).copy())
         result: dict[str, Any] = {
-            "observation.state": torch.from_numpy(
-                np.asarray(observation.q, dtype=np.float32).copy()
-            )[None]
+            "observation.state": state[None] if add_batch_dimension else state
         }
         for key in self.image_keys:
             if key not in observation.images:
@@ -338,10 +434,13 @@ class LeRobotDiffusionPolicy:
             # ``select_action`` consumes a one-sample batch.  It owns the
             # temporal queue for ``n_obs_steps`` and therefore receives one
             # current frame here, not a pre-stacked history.
-            result[f"observation.images.{key}"] = torch.from_numpy(
-                np.ascontiguousarray(chw)
-            )[None]
-        return result
+            tensor = torch.from_numpy(np.ascontiguousarray(chw))
+            result[f"observation.images.{key}"] = (
+                tensor[None] if add_batch_dimension else tensor
+            )
+        if self.preprocessor is not None:
+            result = dict(self.preprocessor(result))
+        return self._normalize_model_input(result)
 
     def _normalize_model_input(self, model_input: Mapping[str, Any]) -> dict[str, Any]:
         """Accept both canonical LeRobot keys and legacy bare camera names."""
@@ -464,8 +563,34 @@ class LeRobotDiffusionPolicy:
 
 LeRobotDP = LeRobotDiffusionPolicy
 
+
+def _compatible_config_payload(
+    raw: Mapping[str, Any],
+    *,
+    supported_fields: set[str],
+) -> dict[str, Any]:
+    """Drop only proven no-op fields unsupported by the installed LeRobot."""
+
+    payload = dict(raw)
+    unsupported = sorted(set(payload) - set(supported_fields))
+    invalid = {
+        key: payload[key]
+        for key in unsupported
+        if key not in _SAFE_UNSUPPORTED_CONFIG_VALUES
+        or payload[key] != _SAFE_UNSUPPORTED_CONFIG_VALUES[key]
+    }
+    if invalid:
+        raise ValueError(
+            "LeRobot checkpoint contains unsupported non-noop config fields: "
+            f"{invalid}"
+        )
+    for key in unsupported:
+        payload.pop(key)
+    return payload
+
 __all__ = [
     "LeRobotDiffusionPolicy",
     "LeRobotDP",
+    "_compatible_config_payload",
     "is_lerobot_checkpoint",
 ]

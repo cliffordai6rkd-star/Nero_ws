@@ -6,6 +6,8 @@ import numpy as np
 
 from inference.async_fast_slow import (
     ActionPlanBuffer,
+    ControlWorker,
+    DPWorker,
     StateHistoryBuffer,
     WMTargetBuffer,
     WMWorker,
@@ -42,6 +44,64 @@ def test_action_plan_uses_zoh_on_absolute_timestamps() -> None:
     assert result.values.shape == (32, 7)
     np.testing.assert_allclose(result.values[0], values[0])
     np.testing.assert_allclose(result.values[4], values[1])
+
+
+def test_dp_worker_notifies_after_publishing_complete_plan() -> None:
+    action = ActionPlanBuffer(default_step_s=0.04)
+    published = []
+    worker = DPWorker(
+        lambda _observation: np.zeros((8, 7)),
+        action,
+        on_publish=published.append,
+    )
+    worker.start()
+    worker.submit(object(), timestamp_s=time.monotonic())
+    deadline = time.monotonic() + 1.0
+    while not published and time.monotonic() < deadline:
+        time.sleep(0.005)
+    worker.stop()
+
+    assert worker.updates == 1
+    assert len(published) == 1
+    assert published[0].values.shape == (8, 7)
+    assert action.snapshot()[0] is published[0]
+
+
+def test_control_worker_manual_mode_releases_exactly_one_cycle() -> None:
+    state = StateHistoryBuffer()
+    target = WMTargetBuffer()
+    now = time.monotonic()
+    state.append(now, np.zeros(7), np.zeros(7), tau=np.zeros(7))
+    outputs = []
+    worker = ControlWorker(
+        state,
+        target,
+        lambda sample, reference, timestamp: outputs.append(
+            (sample, reference, timestamp)
+        ),
+        rate_hz=100.0,
+    )
+    worker.set_manual_mode(True)
+    worker.start()
+    time.sleep(0.04)
+    assert worker.cycles == 0
+
+    worker.request_step()
+    deadline = time.monotonic() + 1.0
+    while worker.cycles < 1 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert worker.cycles == 1
+    time.sleep(0.04)
+    assert worker.cycles == 1
+
+    worker.set_manual_mode(False)
+    deadline = time.monotonic() + 1.0
+    while worker.cycles < 2 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    worker.stop()
+
+    assert worker.cycles >= 2
+    assert len(outputs) == worker.cycles
 
 
 def test_wm_worker_drops_expired_prediction_prefix() -> None:
@@ -88,3 +148,4 @@ def test_wm_target_blends_overlapping_segments() -> None:
 
     np.testing.assert_allclose(q_ref, np.full(7, 2.0))
     np.testing.assert_allclose(tau_ref, np.full(7, 4.0))
+    assert len(target.snapshot()) == 2

@@ -70,11 +70,49 @@ def main() -> None:
                 kind="PINN",
                 pinn_mode=config.predictor.mode,
             )
+        dp_model = getattr(dp, "model", None)
+        diffusion = getattr(dp_model, "diffusion", None)
+        scheduler = getattr(diffusion, "noise_scheduler", None)
         print(
             json.dumps(
                 {
                     "dp": type(dp).__qualname__,
                     "pinn": None if pinn is None else type(pinn).__qualname__,
+                    "dp_contract": {
+                        "action_semantic": config.action,
+                        "action_dim": getattr(dp, "action_dim", None),
+                        "horizon": getattr(dp, "horizon", None),
+                        "n_obs_steps": getattr(dp, "n_obs_steps", None),
+                        "n_action_steps": getattr(dp, "n_action_steps", None),
+                        "action_start_index": getattr(dp, "action_start_index", None),
+                        "image_keys": list(getattr(dp, "image_keys", ())),
+                        "image_shapes": getattr(dp, "image_shapes", {}),
+                        "normalizer_restored": bool(
+                            getattr(dp, "preprocessor", None) is not None
+                            and getattr(dp, "postprocessor", None) is not None
+                        ),
+                        "scheduler": None if scheduler is None else type(scheduler).__name__,
+                        "actual_inference_steps": getattr(diffusion, "num_inference_steps", None),
+                    },
+                    "wm_contract": None
+                    if pinn is None
+                    else {
+                        "inputs": list(getattr(pinn, "inputs", ())),
+                        "history_horizon": getattr(pinn, "history_horizon", None),
+                        "prediction_horizon": getattr(pinn, "future_horizon", None),
+                        "action_condition_horizon": getattr(
+                            pinn, "action_condition_horizon", None
+                        ),
+                        "joint_dim": getattr(pinn, "joint_dim", None),
+                        "action_dim": getattr(pinn, "action_dim", None),
+                        "flow_inference_steps": getattr(
+                            pinn, "flow_inference_steps", None
+                        ),
+                        "flow_solver": getattr(pinn, "flow_solver", None),
+                        "normalizer_restored": bool(
+                            getattr(pinn, "_inference_normalizer", None)
+                        ),
+                    },
                     "predictor_enabled": config.predictor.enabled,
                     "predictor_mode": config.predictor.mode,
                     "execution_mode": config.execution.mode,

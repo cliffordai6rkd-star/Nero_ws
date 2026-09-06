@@ -110,6 +110,7 @@ def _prepare_pinn_source() -> None:
 
     candidates = (
         Path(__file__).resolve().parents[2] / "PINN",
+        Path(__file__).resolve().parents[2] / "PINN_LCP",
         Path("/mnt/code/lcx/PINN"),
         Path("/home/rei/mnt/code/lcx/PINN"),
     )
@@ -181,9 +182,19 @@ def restore_checkpoint_model(
                 raw_steps = model_overrides.get("num_inference_steps")
                 if raw_steps is not None:
                     inference_steps = int(raw_steps)
+            sampling_method = None
+            if model_overrides is not None:
+                scheduler_target = str(
+                    model_overrides.get("noise_scheduler._target_", "")
+                )
+                if scheduler_target.endswith("DDIMScheduler"):
+                    sampling_method = "ddim"
+                elif scheduler_target.endswith("DDPMScheduler"):
+                    sampling_method = "ddpm"
             return LeRobotDiffusionPolicy.from_pretrained(
                 checkpoint_path,
                 device=device,
+                sampling_method=sampling_method,
                 num_inference_steps=inference_steps,
             )
     if not checkpoint_path.is_file():
@@ -291,8 +302,8 @@ def restore_checkpoint_model(
                 )
         except ImportError as exc:
             raise CheckpointError(
-                "PINN checkpoint uses a native PINN model, but the PINN package "
-                "is not installed (pip install -e /mnt/code/lcx/PINN)"
+                "Contact WM checkpoint uses the PINN_LCP model package, but "
+                "model.pinn_model is not importable (pip install -e /path/to/PINN_LCP)"
             ) from exc
         model = model_type(dict(cfg))
     else:

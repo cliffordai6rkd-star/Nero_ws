@@ -162,7 +162,7 @@ cameras:
     output_size: [256, 192]
 
   - name: side_2
-    enabled: true
+    enabled: false
     visualize: true
     backend: v4l2
     serial_number: CC1N16202KT

@@ -39,7 +39,9 @@ predictor:
 
 execution:
   # mtc | q | tau
-  mode: mtc
+  # Keep the first hardware deployment on position execution. Switching to
+  # MTC remains an explicit operator decision after q-mode validation.
+  mode: q
   # MTC keeps firmware q/v feedback and sends g(q) plus the Contact WM
   # gravity-relative torque residual. mtc_alpha scales only that residual.
   mtc_alpha: 1.0
@@ -103,8 +105,8 @@ ik:
   joint_position_margin_rad: 0.02
 
 torque_filter:
-  enabled: false
-  median_window: 1
+  enabled: true
+  median_window: 3
   # When enabled, this filters only the WM residual, not analytical gravity.
   lowpass_cutoff_hz: 15.0
   rate_limit_nm_s: [50, 50, 50, 40, 30, 20, 20]

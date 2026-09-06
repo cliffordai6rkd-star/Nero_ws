@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from types import SimpleNamespace
 
 import numpy as np
@@ -7,7 +8,11 @@ import pytest
 
 from inference.core.contracts import Observation
 from inference.policies.dp.adapter import DiffusionPolicyAdapter
-from inference.policies.lerobotdp import LeRobotDiffusionPolicy, is_lerobot_checkpoint
+from inference.policies.lerobotdp import (
+    LeRobotDiffusionPolicy,
+    _compatible_config_payload,
+    is_lerobot_checkpoint,
+)
 
 
 class _FakeLeRobotModel:
@@ -40,6 +45,21 @@ class _FakeLeRobotModel:
 
     def eval(self):
         return self
+
+
+class _QueuedLeRobotModel(_FakeLeRobotModel):
+    """Match LeRobot's select_action queue behavior closely enough to regress it."""
+
+    def __init__(self):
+        super().__init__()
+        self._queues = {"action": deque()}
+
+    def select_action(self, observation):
+        self.seen.append(observation)
+        self._queues["action"].extend(
+            np.full(7, index, dtype=np.float32) for index in range(1, 8)
+        )
+        return np.zeros(7, dtype=np.float32)
 
 
 def _observation() -> Observation:
@@ -122,6 +142,76 @@ def test_legacy_dp_adapter_delegates_native_lerobot_contract():
     result = adapter.predict(_observation())
     assert result is not None
     assert result.values.shape == (8, 7)
+
+
+def test_lerobotdp_applies_checkpoint_pre_and_post_processors():
+    model = _FakeLeRobotModel()
+    seen_raw = []
+
+    def preprocess(value):
+        seen_raw.append(value)
+        return {key: tensor[None] for key, tensor in value.items()}
+
+    def postprocess(value):
+        return np.asarray(value) + 10.0
+
+    policy = LeRobotDiffusionPolicy(
+        model,
+        metadata={"n_obs_steps": 2, "horizon": 16, "n_action_steps": 8},
+        preprocessor=preprocess,
+        postprocessor=postprocess,
+    )
+
+    result = policy.predict(_observation())
+
+    assert tuple(seen_raw[0]["observation.state"].shape) == (7,)
+    assert tuple(seen_raw[0]["observation.images.wrist"].shape) == (3, 192, 256)
+    np.testing.assert_allclose(result.values[:, 0], np.arange(8) + 10.0)
+
+
+def test_lerobotdp_drains_generated_action_queue_without_repeating_observation():
+    model = _QueuedLeRobotModel()
+    policy = LeRobotDiffusionPolicy(
+        model,
+        metadata={"n_obs_steps": 2, "horizon": 16, "n_action_steps": 8},
+        step_s=0.04,
+    )
+
+    result = policy.predict(_observation())
+
+    assert len(model.seen) == 1
+    assert len(model._queues["action"]) == 0
+    assert policy.action_start_index == 1
+    np.testing.assert_allclose(result.values[:, 0], np.arange(8))
+
+
+def test_lerobotdp_compat_config_drops_only_exact_noop_fields():
+    raw = {
+        "type": "diffusion",
+        "horizon": 16,
+        "use_peft": False,
+        "resize_shape": None,
+        "crop_ratio": 1.0,
+        "compile_model": False,
+        "compile_mode": "reduce-overhead",
+    }
+    result = _compatible_config_payload(
+        raw,
+        supported_fields={"type", "horizon"},
+    )
+    assert result == {"type": "diffusion", "horizon": 16}
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("compile_model", True), ("resize_shape", [192, 256]), ("future_field", 1)],
+)
+def test_lerobotdp_compat_config_rejects_non_noop_fields(key, value):
+    with pytest.raises(ValueError, match="unsupported non-noop"):
+        _compatible_config_payload(
+            {"type": "diffusion", key: value},
+            supported_fields={"type"},
+        )
 
 
 def test_is_lerobot_checkpoint_requires_directory_layout(tmp_path):

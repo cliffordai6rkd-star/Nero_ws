@@ -104,6 +104,31 @@ def test_process_camera_source_continuously_publishes_mock_frames() -> None:
         source.stop()
 
 
+def test_process_camera_source_keeps_latest_frame_when_consumer_is_slow() -> None:
+    source = ProcessCameraSource(
+        CameraConfig(
+            name="slow_consumer_mock",
+            backend="mock",
+            width=16,
+            height=12,
+            fps=50.0,
+            startup_timeout_s=0.5,
+        )
+    )
+    source.start()
+    try:
+        # DP inference can leave the camera queue unpolled for about one second.
+        # The next delivery must still be recent instead of the oldest queued
+        # frame, otherwise the runtime raises a false camera-stale fault.
+        time.sleep(0.4)
+        frame = source.poll()
+        assert frame is not None
+        age_s = time.time() - frame.timestamp_us * 1.0e-6
+        assert age_s < 0.15
+    finally:
+        source.stop()
+
+
 def test_mock_camera_keeps_high_resolution_preview_when_policy_is_resized() -> None:
     source = _build_camera(
         CameraConfig(

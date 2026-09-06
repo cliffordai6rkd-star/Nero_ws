@@ -647,6 +647,37 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
             result[f"{key}_ref"] = physical[0].detach().cpu().numpy().astype(np.float64)
         return result
 
+    def warm_up_contact_reference(self) -> None:
+        """Run one discarded WM forward before workers compete for CUDA.
+
+        The first ContactWorldModel call initializes CUDA kernels and is much
+        slower than steady-state inference. Paying that cost before DP starts
+        prevents the first 320 ms prediction horizon from expiring entirely.
+        """
+
+        from inference.async_fast_slow import ActionTrajectory, StateHistorySnapshot
+
+        dt_s = self._contact_sampling_dt_s
+        history_steps = self._contact_history_horizon
+        action_steps = self._contact_future_horizon
+        end_s = history_steps * dt_s
+        history_timestamps = end_s - np.arange(
+            history_steps - 1, -1, -1, dtype=np.float64
+        ) * dt_s
+        zeros_history = np.zeros((history_steps, 7), dtype=np.float64)
+        history = StateHistorySnapshot(
+            history_timestamps,
+            zeros_history,
+            zeros_history,
+            zeros_history,
+            zeros_history,
+        )
+        action = ActionTrajectory(
+            end_s + np.arange(action_steps, dtype=np.float64) * dt_s,
+            np.zeros((action_steps, 7), dtype=np.float64),
+        )
+        self.predict_contact_reference(history, action)
+
     def _contact_action_condition(self, device):
         import torch
 

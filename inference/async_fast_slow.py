@@ -376,6 +376,12 @@ class WMTargetBuffer:
             self._segments.clear()
             self._generation = 0
 
+    def snapshot(self) -> tuple[_TargetSegment, ...]:
+        """Return an immutable view for diagnostics without exposing the lock."""
+
+        with self._lock:
+            return tuple(self._segments)
+
     def append(self, timestamps_s: Any, q_ref: Any, tau_ref: Any) -> int:
         timestamps = np.asarray(timestamps_s, dtype=np.float64).reshape(-1)
         q_values = _trajectory("WM q_ref", q_ref)
@@ -498,6 +504,7 @@ class DPWorker(_LatestWorker):
         step_s: float = 0.04,
         source: Callable[[], Any | None] | None = None,
         result_start_time_fn: Callable[[float, float, Any], float] | None = None,
+        on_publish: Callable[[ActionPlan], None] | None = None,
     ) -> None:
         super().__init__(name="nero-dp-worker")
         self.infer_fn = infer_fn
@@ -505,6 +512,7 @@ class DPWorker(_LatestWorker):
         self.step_s = float(step_s)
         self.source = source
         self.result_start_time_fn = result_start_time_fn
+        self.on_publish = on_publish
         self._pending: Any | None = None
         self._pending_time_s: float | None = None
         self._pending_lock = threading.Lock()
@@ -565,8 +573,14 @@ class DPWorker(_LatestWorker):
             )
             if not np.isfinite(start_time) or start_time < 0.0:
                 raise ValueError("DP action_start_time must be finite and non-negative")
-            self.action_buffer.append(values, start_time_s=start_time, step_s=self.step_s)
+            plan = self.action_buffer.append(
+                values,
+                start_time_s=start_time,
+                step_s=self.step_s,
+            )
             self._updates += 1
+            if self.on_publish is not None:
+                self.on_publish(plan)
 
 
 class WMWorker(_LatestWorker):
@@ -732,6 +746,8 @@ class ControlWorker(_LatestWorker):
         self.period_s = 1.0 / self.rate_hz
         self._cycles = 0
         self._last_output: Any = None
+        self._manual_mode = False
+        self._pending_steps = 0
 
     @property
     def cycles(self) -> int:
@@ -741,9 +757,46 @@ class ControlWorker(_LatestWorker):
     def last_output(self) -> Any:
         return self._last_output
 
+    @property
+    def manual_mode(self) -> bool:
+        with self._condition:
+            return self._manual_mode
+
+    def set_manual_mode(self, enabled: bool) -> None:
+        """Pause or resume control without stopping DP/WM preparation."""
+
+        with self._condition:
+            self._manual_mode = bool(enabled)
+            self._pending_steps = 0
+            self._condition.notify_all()
+
+    def request_step(self) -> None:
+        """Allow exactly one control callback while remaining paused."""
+
+        with self._condition:
+            self._manual_mode = True
+            self._pending_steps += 1
+            self._condition.notify_all()
+
+    def _wait_for_cycle_permission(self) -> bool:
+        with self._condition:
+            while (
+                self._manual_mode
+                and self._pending_steps <= 0
+                and not self._stop_event.is_set()
+            ):
+                self._condition.wait(timeout=0.1)
+            if self._stop_event.is_set():
+                return False
+            if self._manual_mode:
+                self._pending_steps -= 1
+            return True
+
     def _run(self) -> None:
         deadline = monotonic_time()
         while not self._stop_event.is_set():
+            if not self._wait_for_cycle_permission():
+                break
             now = monotonic_time()
             state = self.state_buffer.latest()
             if state is not None:
@@ -762,7 +815,9 @@ class ControlWorker(_LatestWorker):
                         )
                 self._last_output = self.control_fn(state, target, now)
                 self._cycles += 1
-            deadline += self.period_s
+            # Reset the deadline after a manual pause instead of attempting to
+            # catch up every missed 100 Hz cycle in a burst.
+            deadline = max(deadline + self.period_s, now + self.period_s)
             sleep_s = deadline - monotonic_time()
             if sleep_s > 0.0:
                 self._stop_event.wait(sleep_s)

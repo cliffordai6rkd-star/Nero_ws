@@ -105,6 +105,7 @@ class DiffusionPolicy:
             return LeRobotDiffusionPolicy.from_pretrained(
                 checkpoint,
                 device=device,
+                sampling_method=sampling_method,
                 num_inference_steps=num_inference_steps,
                 action_steps=action_steps,
                 step_s=step_s,
