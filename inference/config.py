@@ -114,6 +114,28 @@ class WrenchVisualizationConfig:
 
 
 @dataclass(frozen=True)
+class MujocoVisualizationConfig:
+    """Latest-only real-time kinematic visualization of sampled futures."""
+
+    enabled: bool = False
+    num_future_samples: int = 8
+    mujoco_model_path: Path | None = None
+    ee_site_name: str | None = None
+    ee_body_name: str | None = None
+    robot_joint_names: tuple[str, ...] = tuple(f"joint{i}" for i in range(1, 8))
+    point_size: float = 0.012
+    trajectory_colors: tuple[tuple[float, ...], ...] = ()
+    render_fps: float = 30.0
+    prediction_visualization_hz: float = 8.0
+    observed_q_update_hz: float = 30.0
+    latest_only: bool = True
+    use_fixed_noise_bank: bool = True
+    headless: bool = False
+    flow_steps: int | None = None
+    flow_solver: str | None = None
+
+
+@dataclass(frozen=True)
 class TorqueFilterConfig:
     enabled: bool = True
     median_window: int = 3
@@ -185,6 +207,9 @@ class InferenceConfig:
     timing: TimingConfig = field(default_factory=TimingConfig)
     wrench_visualization: WrenchVisualizationConfig = field(
         default_factory=WrenchVisualizationConfig
+    )
+    mujoco_visualization: MujocoVisualizationConfig = field(
+        default_factory=MujocoVisualizationConfig
     )
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     architecture: ArchitectureConfig = field(default_factory=ArchitectureConfig)
@@ -685,6 +710,41 @@ def load_inference_config(path: str | Path) -> InferenceConfig:
         value = getattr(wrench_visualization, name)
         if not np.isfinite(value) or value <= 0:
             raise ValueError(f"wrench_visualization.{name} must be positive and finite")
+    mujoco_raw = _mapping(raw.get("mujoco_visualization", {}), "mujoco_visualization")
+    _reject_unknown(mujoco_raw, MujocoVisualizationConfig, "mujoco_visualization")
+    mujoco_values = dict(mujoco_raw)
+    if mujoco_values.get("mujoco_model_path") is not None:
+        mujoco_values["mujoco_model_path"] = _required_path(
+            mujoco_values["mujoco_model_path"], base, "mujoco_visualization.mujoco_model_path"
+        )
+    if isinstance(mujoco_values.get("robot_joint_names"), list):
+        mujoco_values["robot_joint_names"] = tuple(str(v) for v in mujoco_values["robot_joint_names"])
+    if isinstance(mujoco_values.get("trajectory_colors"), list):
+        mujoco_values["trajectory_colors"] = tuple(tuple(float(c) for c in color) for color in mujoco_values["trajectory_colors"])
+    if isinstance(mujoco_values.get("flow_solver"), str):
+        mujoco_values["flow_solver"] = mujoco_values["flow_solver"].strip().lower()
+    mujoco_visualization = MujocoVisualizationConfig(**mujoco_values)
+    if not isinstance(mujoco_visualization.enabled, bool):
+        raise ValueError("mujoco_visualization.enabled must be a boolean")
+    if mujoco_visualization.num_future_samples < 1:
+        raise ValueError("mujoco_visualization.num_future_samples must be positive")
+    if mujoco_visualization.mujoco_model_path is None and mujoco_visualization.enabled:
+        raise ValueError("mujoco_visualization.mujoco_model_path is required when enabled")
+    if not mujoco_visualization.ee_site_name and not mujoco_visualization.ee_body_name and mujoco_visualization.enabled:
+        raise ValueError("mujoco_visualization requires ee_site_name or ee_body_name")
+    for name in ("render_fps", "prediction_visualization_hz", "observed_q_update_hz", "point_size"):
+        value = float(getattr(mujoco_visualization, name))
+        if not np.isfinite(value) or value <= 0:
+            raise ValueError(f"mujoco_visualization.{name} must be positive and finite")
+    if len(mujoco_visualization.robot_joint_names) != 7:
+        raise ValueError("mujoco_visualization.robot_joint_names must contain the seven CARS-WM joints in contract order")
+    for color in mujoco_visualization.trajectory_colors:
+        if len(color) not in {3, 4} or not np.isfinite(np.asarray(color, dtype=np.float64)).all() or np.any(np.asarray(color, dtype=np.float64) < 0) or np.any(np.asarray(color, dtype=np.float64) > 1):
+            raise ValueError("mujoco_visualization.trajectory_colors entries must be RGB/RGBA values in [0,1]")
+    if mujoco_visualization.flow_steps is not None and int(mujoco_visualization.flow_steps) < 1:
+        raise ValueError("mujoco_visualization.flow_steps must be positive or null")
+    if mujoco_visualization.flow_solver is not None and str(mujoco_visualization.flow_solver).lower() not in {"euler", "heun"}:
+        raise ValueError("mujoco_visualization.flow_solver must be euler or heun")
     architecture = _dataclass_from_mapping(
         ArchitectureConfig,
         raw.get("architecture", {}),
@@ -732,6 +792,7 @@ def load_inference_config(path: str | Path) -> InferenceConfig:
         observation_protection=observation_protection,
         timing=timing,
         wrench_visualization=wrench_visualization,
+        mujoco_visualization=mujoco_visualization,
         architecture=architecture,
     )
 

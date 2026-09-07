@@ -2,18 +2,32 @@ Metadata-Version: 2.4
 Name: nero-collection
 Version: 0.1.0
 Summary: Nero dual-arm teleoperation data collection.
-Requires-Python: >=3.10
+Requires-Python: <3.11,>=3.10
+Requires-Dist: av<16,>=15
 Requires-Dist: cmeel-tinyxml2<11,>=10; platform_system == "Linux"
 Requires-Dist: cmeel-urdfdom<5,>=4; platform_system == "Linux"
 Requires-Dist: h5py>=3.11
 Requires-Dist: matplotlib>=3.7
 Requires-Dist: mujoco<4,>=3.3
 Requires-Dist: numpy<2.3,>=2.2
-Requires-Dist: opencv-python-headless<4.13,>=4.9
+Requires-Dist: opencv-python<4.13,>=4.9
 Requires-Dist: pin<4,>=3
 Requires-Dist: PyYAML>=6.0
+Requires-Dist: rerun-sdk<0.27,>=0.26
 Requires-Dist: scipy<1.16,>=1.10
-Provides-Extra: tau-other-inference
-Requires-Dist: torch<3,>=2.3; extra == "tau-other-inference"
+Provides-Extra: tau-ext-inference
+Requires-Dist: torch==2.7.1; extra == "tau-ext-inference"
+Provides-Extra: lerobot-dp
+Requires-Dist: lerobot==0.4.0; extra == "lerobot-dp"
+Provides-Extra: inference
+Requires-Dist: torch==2.7.1; extra == "inference"
+Requires-Dist: torchvision==0.22.1; extra == "inference"
+Requires-Dist: torchcodec==0.5; extra == "inference"
+Requires-Dist: lerobot==0.4.0; extra == "inference"
+Provides-Extra: hardware
+Requires-Dist: python-can>=3.3.4; extra == "hardware"
+Requires-Dist: pyAgxArm @ git+https://github.com/agilexrobotics/pyAgxArm.git@799b8412fbe8b9156bc9892d3dbeb2df7e98be71 ; extra == "hardware"
+Provides-Extra: legacy-dp
+Requires-Dist: diffusion-policy[test,training]; extra == "legacy-dp"
 Provides-Extra: gpu-identification
 Requires-Dist: jax[cuda12]==0.6.2; (platform_system == "Linux" and python_version < "3.11") and extra == "gpu-identification"

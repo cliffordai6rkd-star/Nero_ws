@@ -1,10 +1,12 @@
+av<16,>=15
 h5py>=3.11
 matplotlib>=3.7
 mujoco<4,>=3.3
 numpy<2.3,>=2.2
-opencv-python-headless<4.13,>=4.9
+opencv-python<4.13,>=4.9
 pin<4,>=3
 PyYAML>=6.0
+rerun-sdk<0.27,>=0.26
 scipy<1.16,>=1.10
 
 [:platform_system == "Linux"]
@@ -16,5 +18,21 @@ cmeel-urdfdom<5,>=4
 [gpu-identification:platform_system == "Linux" and python_version < "3.11"]
 jax[cuda12]==0.6.2
 
-[tau-other-inference]
-torch<3,>=2.3
+[hardware]
+python-can>=3.3.4
+pyAgxArm @ git+https://github.com/agilexrobotics/pyAgxArm.git@799b8412fbe8b9156bc9892d3dbeb2df7e98be71
+
+[inference]
+torch==2.7.1
+torchvision==0.22.1
+torchcodec==0.5
+lerobot==0.4.0
+
+[legacy-dp]
+diffusion-policy[test,training]
+
+[lerobot-dp]
+lerobot==0.4.0
+
+[tau-ext-inference]
+torch==2.7.1

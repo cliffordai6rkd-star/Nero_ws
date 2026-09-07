@@ -1,3 +1,4 @@
 [console_scripts]
 nero-collect = nero_collection.cli:main
 nero-free-space = calibration.free_space_cli:main
+nero-inference = inference.cli:main

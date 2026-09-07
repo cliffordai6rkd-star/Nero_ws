@@ -15,6 +15,7 @@ from inference.config import (
     ArchitectureConfig,
     ExecutionConfig,
     InferenceConfig,
+    MujocoVisualizationConfig,
     load_inference_config,
 )
 from inference.control.mtc import MTCController, MTCResult
@@ -50,6 +51,12 @@ from inference.h5_observation_stream import (
     load_h5_observation_stream,
 )
 from inference.runtime import NeroInferenceRuntime
+from inference.mujoco_visualization import (
+    MujocoKinematicFK,
+    MujocoKinematicVisualizer,
+    MujocoRealtimeVisualizer,
+    VisualizationPacket,
+)
 from inference.model_inference import (
     DiffusionPolicyInference,
     TAVLAInference,
@@ -107,6 +114,7 @@ __all__ = [
     "ActionChunkScheduler",
     "ControlTarget",
     "InferenceConfig",
+    "MujocoVisualizationConfig",
     "ArchitectureConfig",
     "ComponentRegistry",
     "POLICY_REGISTRY",
@@ -141,6 +149,10 @@ __all__ = [
     "H5ObservationTick",
     "load_h5_observation_stream",
     "NeroInferenceRuntime",
+    "MujocoKinematicFK",
+    "MujocoKinematicVisualizer",
+    "MujocoRealtimeVisualizer",
+    "VisualizationPacket",
     "DiffusionPolicyInference",
     "VLAInference",
     "TAVLAInference",

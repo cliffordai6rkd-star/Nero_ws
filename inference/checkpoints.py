@@ -143,8 +143,8 @@ def restore_checkpoint_model(
 ) -> Any:
     """Instantiate a model solely from checkpoint cfg and restore its weights."""
     pinn_mode = str(pinn_mode).strip().lower().replace("-", "_")
-    # Keep old mode strings source-compatible while making ContactWorldModel
-    # v2 the only WM implementation that can be restored.
+    # Keep old mode strings source-compatible while making the sibling PINN
+    # ContactWorldModel implementation the only WM model that can be restored.
     wm_aliases = {
         "world_model": "contact_world_model",
         "world_model_v3": "contact_world_model",
@@ -317,10 +317,10 @@ def restore_checkpoint_model(
         "contact_wm",
         "contact_wm_opd",
     }:
-        expected_version = getattr(model, "MODEL_VERSION", "contact_world_model_v2")
+        expected_version = getattr(model, "MODEL_VERSION", None)
         if payload.get("model_version") != expected_version:
             raise CheckpointError(
-                "WM checkpoint is not a canonical ContactWorldModel v2 checkpoint: "
+                "WM checkpoint model_version does not match the PINN model implementation: "
                 f"model_version={payload.get('model_version')!r}, "
                 f"expected={expected_version!r}"
             )
@@ -331,6 +331,13 @@ def restore_checkpoint_model(
                 "ContactWorldModel inference requires model.inputs="
                 f"{list(required_inputs)}, got {list(configured_inputs)}"
             )
+        contract = payload.get("carswm_contract")
+        validate_contract = getattr(model, "validate_checkpoint_contract", None)
+        if callable(validate_contract):
+            try:
+                validate_contract(contract)
+            except (TypeError, ValueError) as exc:
+                raise CheckpointError(f"WM checkpoint contract validation failed: {exc}") from exc
         if int(getattr(model, "joint_dim", 7)) != 7 or int(
             getattr(model, "action_dim", 7)
         ) != 7:
@@ -404,6 +411,20 @@ def restore_checkpoint_model(
         checkpoint_config = dict(cfg)
     model._inference_checkpoint_config = checkpoint_config
     model._inference_normalizer = payload.get("normalizer")
+    if kind.upper() == "PINN" and isinstance(model._inference_normalizer, Mapping):
+        try:
+            _prepare_pinn_source()
+            from train.nomalizer import Normalizer
+
+            normalizer_payload = model._inference_normalizer
+            model._inference_normalizer_obj = Normalizer(
+                normalizer_payload.get("stats", {}),
+                eps=float(normalizer_payload.get("eps", 1.0e-6)),
+            )
+        except Exception:
+            # Keep the serialized contract available; the inference adapter
+            # has a numerically identical fallback for minimal deployments.
+            model._inference_normalizer_obj = None
     model.to(torch.device(device))
     model.eval()
     return model

@@ -1,4 +1,4 @@
-"""Inference pipeline for the native PINN Contact World Model v2.
+"""Inference pipeline for the native PINN CARS-WM v3 Contact World Model.
 
 The model condition is a checkpoint-declared subset of the Contact WM state
 history, plus an 8-token absolute ee-pose action and mask.  New checkpoints may
@@ -30,7 +30,7 @@ from inference.control.mtc import MTCController
 
 
 class ContactWMInferencePipeline(NeroInferencePipeline):
-    """Run ContactWorldModel v2 at its training rate."""
+    """Run the checkpoint-declared ContactWorldModel at its training rate."""
 
     def __init__(self, config, **kwargs) -> None:
         if not bool(config.predictor.enabled):
@@ -84,16 +84,16 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
 
         model = self.pinn
         model_version = getattr(model, "MODEL_VERSION", None)
-        if model_version is not None and model_version != "contact_world_model_v2":
+        if model_version is not None and model_version != "carswm_v3":
             raise ValueError(
                 "Contact WM checkpoint must expose MODEL_VERSION="
-                "'contact_world_model_v2'"
+                "'carswm_v3'"
             )
 
         checkpoint = getattr(model, "_inference_checkpoint_config", {})
         data_cfg = checkpoint.get("dataloader", {}) if isinstance(checkpoint, Mapping) else {}
         model_cfg = checkpoint.get("model", {}) if isinstance(checkpoint, Mapping) else {}
-        # Contact WM v2 is trained with an absolute end-effector pose action
+        # CARS-WM is trained with an absolute end-effector pose action
         # condition.  The high-level DP action may still be joint-space; it is
         # converted with FK at the boundary below.
         configured_action_key = None
@@ -144,9 +144,12 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
         self._contact_history_horizon = int(
             getattr(model, "history_horizon", data_cfg.get("state_history_horizon", 50))
         )
-        self._contact_future_horizon = int(
-            getattr(model, "future_horizon", data_cfg.get("prediction_horizon", 32))
-        )
+        configured_future_horizon = getattr(model, "future_horizon", None)
+        if configured_future_horizon is None and isinstance(data_cfg, Mapping):
+            configured_future_horizon = data_cfg.get("prediction_horizon")
+        if configured_future_horizon is None:
+            raise ValueError("Contact WM checkpoint must declare future_horizon/prediction_horizon")
+        self._contact_future_horizon = int(configured_future_horizon)
         self._contact_action_horizon = int(
             getattr(
                 model,
@@ -268,6 +271,7 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
         self._contact_previous = None
         self._contact_last_q_cmd = None
         self._contact_next_sample_s = None
+        self._visualization_noise_bank = None
 
     # Keep the inherited continuous-observation bridge, but replace its old
     # q/v/a/wrench state with the four streams used by Contact WM training.
@@ -477,7 +481,7 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
         self._record_wm_inference_timing(perf_counter() - started)
         if not isinstance(output, Mapping):
             raise RuntimeError("Contact WM predict() must return a mapping")
-        # ContactWorldModel v2 returns flat ``<stream>_pred`` tensors. Keep
+        # ContactWorldModel returns flat ``<stream>_pred`` tensors. Keep
         # accepting the historical nested mapping for injected callers, but
         # normalize both forms to one internal state mapping here.
         nested = output.get("state_pred")
@@ -486,7 +490,10 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
         for key in ("q", "tau", "dq", "delta_q"):
             value = state_pred.get(key, output.get(f"{key}_pred"))
             if value is None:
-                if key in {"q", "tau"}:
+                if key == "tau":
+                    result[key] = np.zeros((self._contact_future_horizon, 7), dtype=np.float64)
+                    continue
+                if key == "q":
                     raise RuntimeError(f"Contact WM prediction is missing {key!r}")
                 continue
             if not torch.is_tensor(value):
@@ -628,6 +635,9 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
         for key in ("q", "tau"):
             value = state_pred.get(key, output.get(f"{key}_pred"))
             if value is None:
+                if key == "tau":
+                    result[f"{key}_ref"] = np.zeros((self._contact_future_horizon, 7), dtype=np.float64)
+                    continue
                 raise RuntimeError(f"Contact WM prediction is missing {key!r}")
             if not torch.is_tensor(value):
                 value = torch.as_tensor(value, dtype=torch.float32, device=device)
@@ -645,6 +655,113 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
             if not torch.isfinite(physical).all():
                 raise RuntimeError(f"Contact WM prediction[{key!r}] is non-finite")
             result[f"{key}_ref"] = physical[0].detach().cpu().numpy().astype(np.float64)
+        return result
+
+    def sample_contact_futures(
+        self,
+        history: Any,
+        action: Any,
+        *,
+        num_samples: int,
+        source_noise: Any | None = None,
+        steps: int | None = None,
+        solver: str | None = None,
+        use_fixed_noise_bank: bool = False,
+    ) -> dict[str, np.ndarray]:
+        """Batch-sample CARS-WM futures with one condition encoding pass.
+
+        The PINN model's public ``sample`` method in older checkpoints loops
+        over ``predict`` and therefore re-encodes conditions.  This adapter
+        keeps the checkpoint model definition authoritative while using its
+        ``encode_conditions`` and ``integrate_flow`` primitives to expand the
+        already-encoded memory across the sample dimension.
+        """
+        import torch
+
+        count = int(num_samples)
+        if count < 1:
+            raise ValueError("num_samples must be positive")
+        arrays: dict[str, np.ndarray] = {}
+        for key in self._contact_input_keys:
+            value = getattr(history, key, None)
+            if value is None and isinstance(history, Mapping):
+                value = history.get(key)
+            value = np.asarray(value, dtype=np.float32)
+            if value.shape != (self._contact_history_horizon, 7) or not np.isfinite(value).all():
+                raise ValueError(f"Contact WM history[{key!r}] must be [{self._contact_history_horizon},7], got {value.shape}")
+            arrays[key] = value
+        action_values = np.asarray(getattr(action, "values", action), dtype=np.float32)
+        if action_values.ndim == 3 and action_values.shape[0] == 1:
+            action_values = action_values[0]
+        if action_values.ndim != 2 or action_values.shape[1] != 7 or not np.isfinite(action_values).all():
+            raise ValueError(f"Contact WM action condition must be [T,7], got {action_values.shape}")
+        token_count = self._contact_action_horizon
+        if action_values.shape[0] >= token_count:
+            stride = max(1, int(round(action_values.shape[0] / token_count)))
+            indices = np.minimum(np.arange(token_count) * stride, action_values.shape[0] - 1)
+            action_condition = action_values[indices]
+        else:
+            action_condition = np.repeat(action_values[-1:, :], token_count, axis=0)
+            action_condition[: action_values.shape[0]] = action_values
+        action_condition = self._actions_for_contact_wm(action_condition)
+        device = _model_device(self.pinn)
+        inputs = {
+            key: self._normalize_pinn_input(key, torch.as_tensor(value, dtype=torch.float32, device=device)[None])
+            for key, value in arrays.items()
+        }
+        inputs["action"] = self._normalize_pinn_input(
+            "action", torch.as_tensor(action_condition, dtype=torch.float32, device=device)[None]
+        )
+        inputs["action_mask"] = torch.ones((1, token_count), dtype=torch.bool, device=device)
+        started = perf_counter()
+        _synchronize_model(self.pinn)
+        with torch.inference_mode():
+            encode_started = perf_counter()
+            encoded = self.pinn.encode_conditions(inputs)
+            encode_elapsed = perf_counter() - encode_started
+            reference = inputs[self._contact_input_keys[0]]
+            expanded = {key: value.repeat_interleave(count, dim=0) if torch.is_tensor(value) and value.shape[0] == 1 else value for key, value in encoded.items()}
+            source_shape = (1, count, self._contact_future_horizon, int(getattr(self.pinn, "flow_dim")))
+            if source_noise is None:
+                bank = getattr(self, "_visualization_noise_bank", None)
+                if use_fixed_noise_bank and torch.is_tensor(bank) and tuple(bank.shape) == source_shape:
+                    noise = bank.to(device=device, dtype=reference.dtype)
+                else:
+                    noise = torch.randn(source_shape, device=device, dtype=reference.dtype)
+                    if use_fixed_noise_bank:
+                        self._visualization_noise_bank = noise.detach().cpu()
+            else:
+                noise = torch.as_tensor(source_noise, device=device, dtype=reference.dtype)
+                if tuple(noise.shape) == source_shape[1:]:
+                    noise = noise[None]
+                if tuple(noise.shape) != source_shape:
+                    raise ValueError(f"source_noise must have shape {source_shape[1:]} or {source_shape}, got {tuple(noise.shape)}")
+            flat_noise = noise.reshape(count, self._contact_future_horizon, noise.shape[-1])
+            flow_started = perf_counter()
+            generated = self.pinn.integrate_flow(
+                flat_noise,
+                expanded,
+                steps=steps if steps is not None else self._contact_flow_steps,
+                solver=solver or self._contact_flow_solver,
+            )
+            flow_elapsed = perf_counter() - flow_started
+            decoded = self.pinn._decoded_output(generated, expanded)
+            result = {}
+            for key in ("q", "tau", "dq", "delta_q"):
+                value = decoded.get(f"{key}_pred")
+                if value is None:
+                    continue
+                value = self._denormalize_pinn_output(key, value)
+                result[key] = value.reshape(1, count, self._contact_future_horizon, 7)[0].detach().cpu().numpy().astype(np.float64)
+        _synchronize_model(self.pinn)
+        self._last_batch_sampling_time_s = perf_counter() - started
+        self._last_sampling_timings = {
+            "condition_encoding_s": encode_elapsed,
+            "flow_integration_s": flow_elapsed,
+            "total_s": self._last_batch_sampling_time_s,
+        }
+        if "q" not in result:
+            raise RuntimeError("Contact WM prediction is missing q")
         return result
 
     def warm_up_contact_reference(self) -> None:

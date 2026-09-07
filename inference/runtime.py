@@ -22,6 +22,7 @@ from inference.wrench_mapping import (
     WrenchMappingConfig,
 )
 from inference.wrench_visualization import InferenceWrenchPlotter
+from inference.mujoco_visualization import MujocoKinematicVisualizer
 from inference.diagnostics.tau_ext import TauExtInferencePlotter
 from inference.core.nero_sampler import NeroObservationSampler
 from inference.core.base import InferenceBase
@@ -308,6 +309,9 @@ class NeroInferenceRuntime:
             contact_threshold_n=self._dp_contact_threshold_n,
         )
         self.tau_ext_plotter = tau_ext_plotter or TauExtInferencePlotter(collection)
+        self.mujoco_visualizer = MujocoKinematicVisualizer(config.mujoco_visualization)
+        self._last_visualization_observed_publish_s = -np.inf
+        self._visualization_prediction_id = 0
         self.command_enabled = bool(command_enabled)
         self.robot_controller = NeroPipelineOutputController(
             arm=self.arm,
@@ -464,9 +468,8 @@ class NeroInferenceRuntime:
         contact_history_horizon = int(
             getattr(self.pipeline, "_contact_history_horizon", 50) or 50
         )
-        contact_prediction_horizon = int(
-            getattr(self.pipeline, "_contact_future_horizon", 32) or 32
-        )
+        contact_prediction_horizon_value = getattr(self.pipeline, "_contact_future_horizon", None)
+        contact_prediction_horizon = int(contact_prediction_horizon_value) if contact_prediction_horizon_value is not None else 1
         contact_prediction_dt = float(
             getattr(self.pipeline, "_contact_sampling_dt_s", 0.01) or 0.01
         )
@@ -614,6 +617,11 @@ class NeroInferenceRuntime:
 
     def _on_stream_sample(self, sample: ContinuousInferenceSample) -> None:
         self._last_valid_arm_state_s = time.monotonic()
+        if self.mujoco_visualizer.enabled:
+            now = time.monotonic()
+            if now - self._last_visualization_observed_publish_s >= 1.0 / float(self.config.mujoco_visualization.observed_q_update_hz):
+                self.mujoco_visualizer.publish_observed(sample.timestamp_us * 1.0e-6, sample.q)
+                self._last_visualization_observed_publish_s = now
         if self._timestamp_async_enabled:
             # ``ContinuousInferenceStateStream`` retains its historical wall
             # timestamp for compatibility.  The asynchronous control graph
@@ -659,6 +667,40 @@ class NeroInferenceRuntime:
             return pipeline._dp_policy.predict(observation)
 
         def infer_wm(history, action):
+            sampler = getattr(pipeline, "sample_contact_futures", None)
+            if (
+                callable(sampler)
+                and self.mujoco_visualizer.enabled
+                and callable(getattr(getattr(pipeline, "pinn", None), "encode_conditions", None))
+                and callable(getattr(getattr(pipeline, "pinn", None), "integrate_flow", None))
+            ):
+                sampled = sampler(
+                    history,
+                    action,
+                    num_samples=self.config.mujoco_visualization.num_future_samples,
+                    steps=self.config.mujoco_visualization.flow_steps,
+                    solver=self.config.mujoco_visualization.flow_solver,
+                    use_fixed_noise_bank=self.config.mujoco_visualization.use_fixed_noise_bank,
+                )
+                timings = getattr(pipeline, "_last_sampling_timings", None)
+                if timings is not None and not getattr(self, "_sampling_timing_reported", False):
+                    log.info(
+                        "CARS-WM batch timing: condition_encoding_ms=%.3f flow_integration_N_ms=%.3f total_ms=%.3f",
+                        1e3 * float(timings.get("condition_encoding_s", 0.0)),
+                        1e3 * float(timings.get("flow_integration_s", 0.0)),
+                        1e3 * float(timings.get("total_s", 0.0)),
+                    )
+                    self._sampling_timing_reported = True
+                q_samples = np.asarray(sampled["q"], dtype=np.float64)
+                tau_samples = np.asarray(sampled.get("tau", np.zeros_like(q_samples)), dtype=np.float64)
+                if q_samples.ndim != 3 or q_samples.shape[0] != self.config.mujoco_visualization.num_future_samples:
+                    raise ValueError(f"sampled CARS-WM q must have shape [N,H,7], got {q_samples.shape}")
+                self._visualization_prediction_id += 1
+                self.mujoco_visualizer.publish_prediction(
+                    history.timestamps_s[-1], history.q[-1], q_samples,
+                    prediction_id=self._visualization_prediction_id,
+                )
+                return {"q_ref": q_samples[0], "tau_ref": tau_samples[0]}
             return pipeline.predict_contact_reference(history, action)
 
         def control(state, target: WMTarget | None, timestamp_s: float):
@@ -1010,6 +1052,10 @@ class NeroInferenceRuntime:
             self.cameras.start()
             self.wrench_plotter.start()
             self.tau_ext_plotter.start()
+            try:
+                self.mujoco_visualizer.start()
+            except Exception:
+                log.exception("MuJoCo visualizer failed to start; continuing without visualization")
             self.online_tau_ext.warm_up()
             self._reset_online_tau_ext_episode()
             if self._modular_mode:
@@ -1038,6 +1084,7 @@ class NeroInferenceRuntime:
             self.cameras.stop()
             self.wrench_plotter.close()
             self.tau_ext_plotter.close()
+            self.mujoco_visualizer.close()
             recovered = False
             if self.command_enabled:
                 try:
@@ -1714,6 +1761,7 @@ class NeroInferenceRuntime:
             self.cameras.stop()
             self.wrench_plotter.close()
             self.tau_ext_plotter.close()
+            self.mujoco_visualizer.close()
             if self.command_enabled and not preserve_arm_enabled:
                 try:
                     self.arm.disable()

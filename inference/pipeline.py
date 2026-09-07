@@ -31,8 +31,8 @@ _CONTACT_WORLD_MODEL_MODES = frozenset(
         "contact_world_model_opd",
         "contact_wm",
         "contact_wm_opd",
-        # Compatibility spellings. They all use ContactWorldModel v2; no
-        # separate legacy world-model implementation remains.
+        # Compatibility spellings. They all use the sibling PINN CARS-WM v3;
+        # no separate legacy world-model implementation remains.
         "swm",
         "swm_opd",
         "torque_world_model",
@@ -2315,6 +2315,7 @@ class NeroInferencePipeline:
         inputs[self._pinn_action_key] = future_tensor
 
     def _normalize_pinn_input(self, key: str, value: Any) -> Any:
+        normalizer_object = getattr(self.pinn, "_inference_normalizer_obj", None)
         metadata = getattr(self.pinn, "_inference_normalizer", None)
         config = getattr(self.pinn, "_inference_checkpoint_config", {})
         if not isinstance(metadata, Mapping) or not isinstance(config, Mapping):
@@ -2326,6 +2327,11 @@ class NeroInferencePipeline:
         )
         if key not in normalize_keys:
             return value
+        if normalizer_object is not None:
+            mode = metadata.get("normalize_mode") or config.get("dataloader", {}).get("normalize_mode")
+            method = getattr(normalizer_object, f"{mode}_normalize", None)
+            if callable(method):
+                return method(key, value)
         stats = metadata.get("stats", {}).get(key)
         if not isinstance(stats, Mapping):
             raise RuntimeError(f"PINN checkpoint normalizer is missing stats for {key!r}")
@@ -2348,6 +2354,7 @@ class NeroInferencePipeline:
         raise RuntimeError(f"unsupported PINN normalization mode: {mode!r}")
 
     def _denormalize_pinn_output(self, key: str, value: Any) -> Any:
+        normalizer_object = getattr(self.pinn, "_inference_normalizer_obj", None)
         metadata = getattr(self.pinn, "_inference_normalizer", None)
         config = getattr(self.pinn, "_inference_checkpoint_config", {})
         if not isinstance(metadata, Mapping) or not isinstance(config, Mapping):
@@ -2359,6 +2366,11 @@ class NeroInferencePipeline:
         )
         if key not in normalize_keys:
             return value
+        if normalizer_object is not None:
+            mode = metadata.get("normalize_mode") or config.get("dataloader", {}).get("normalize_mode")
+            method = getattr(normalizer_object, f"{mode}_denormalize", None)
+            if callable(method):
+                return method(key, value)
         stats = metadata.get("stats", {}).get(key)
         if not isinstance(stats, Mapping):
             raise RuntimeError(f"PINN checkpoint normalizer is missing stats for {key!r}")
@@ -2597,7 +2609,7 @@ def _uses_link7_target_gripper_tcp_current_contract(
 ) -> bool:
     """Deprecated compatibility probe for the removed legacy frame split.
 
-    Contact WM v2 uses absolute ee_pose action conditions; no checkpoint gets
+    Contact WM v3 uses absolute ee_pose action conditions; no checkpoint gets
     the historical ``link7``/``gripper_tcp`` override anymore.  Keep the
     symbol importable for downstream diagnostics while making the old special
     case permanently inactive.

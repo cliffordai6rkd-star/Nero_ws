@@ -89,7 +89,7 @@ cameras:
 
 `predictor.enabled` 是执行链路开关：
 
-- `true`：加载 PINN Contact World Model v2，并按 `execution.mode` 选择 MTC、q 或 tau；
+- `true`：加载最新版 PINN CARS-WM v3，并按 `execution.mode` 选择 MTC、q 或 tau；
 - `false`：不加载 `contactworldmodel`，DP action -> IK -> `q`，runtime 通过
   `command_joint_positions()` 下发关节位置。
 
@@ -147,11 +147,11 @@ predictor:
 
 `predictor.action_condition_fill` 控制高频 PINN 如何消费低频 DP action：
 
-- `auto`：Contact WM v2 使用 `chunk`；
+- `auto`：CARS-WM v3 使用 `chunk`；
 - `hold`：DP 新结果安装时锁存当前安全 action，并重复填满整个 PINN future horizon；
 - `chunk`：输入尚未执行的 DP action chunk，长度不足时保持最后一帧补齐。
 
-Contact WM v2 的 action condition 始终取当前尚未执行的 DP chunk，长度不足时重复最后一帧
+CARS-WM v3 的 action condition 始终取当前尚未执行的 DP chunk，长度不足时重复最后一帧
 补齐到 checkpoint 声明的 8 个 token；这与训练时的 direct action padding 语义一致。
 
 `ik` 配置收敛容差、阻尼、迭代步长和关节限位 margin；IK 不收敛时拒绝下发。
@@ -216,16 +216,16 @@ python scripts/infer_h5_direct_ik.py \
 `contactworldmodel`，并通过 `dp_checkpoint.dino_model_path` 使用
 `/mnt/code/lcx/model/dinov3-vitb16-pretrain-lvd1689m` 的本地 backbone，不访问网络。
 
-当前唯一的 WM 推理契约是 PINN `ContactWorldModel v2`。配置支持的规范模式为
+当前唯一的 WM 推理契约是最新版 PINN 的 `ContactWorldModel (carswm_v3)`。配置支持的规范模式为
 `contact_world_model` 和 `contact_world_model_opd`；历史 `swm`、`torque_world_model`、
 `world_model_v3/v4/v5` 字符串只在配置解析时兼容映射到这两个模式，不再实例化旧模型。
 
-`inference/configs/nero_contact_wm.yaml` 默认加载
-`model/carswm/latest.pt`，并使用 `model/dp/pretrained_model-20260901T082955Z-1-001/pretrained_model`
+`inference/configs/nero_contact_wm.yaml` 默认加载父目录 `PINN/outputs/contact_world_model_final/checkpoints/latest.pt`，并使用 `model/dp/pretrained_model-20260901T082955Z-1-001/pretrained_model`
 作为 LeRobot DP。该 Contact WM checkpoint
-必须包含 `model_version: contact_world_model_v2`、`joint_dim=7` 和 `action_dim=7`；
-`model.inputs` 至少要包含 `q` 和 `tau`，可按新版本只保留这两个物理量。运行时输入为
-50 个 100 Hz 的状态历史与 8 个 25 Hz、7 维绝对关节 action token；输出为 32 步 future
+必须包含与模型实现一致的 `model_version: carswm_v3`、`carswm_contract`、`joint_dim=7` 和 `action_dim=7`；
+`model.inputs` 必须是 checkpoint contract 声明的四路 `[q,dq,delta_q,tau]`。运行时输入为
+50 个 100 Hz 的状态历史与 8 个 25 Hz、7 维绝对 ee_pose action token；输出长度由 checkpoint 的
+`future_horizon` 声明（当前模型为 32 步）
 `q/tau` 及可选的 `dq/delta_q/contact_state_pred`。所有低维输入和输出均按 checkpoint
 中的 `normalizer` 处理，`delta_q` 始终由实际 command history 的 `q_cmd - q` 构造。
 
@@ -298,7 +298,7 @@ uv run python -m inference.cli --config inference/configs/nero_contact_wm.yaml
 `q` 是软件 PD 位置伺服，`mtc` 是固定固件增益下的 gravity+residual MIT 控制，`tau`
 直接使用 `tau_command`；三种模式都不会直接写 `data.qpos`。
 
-默认每 10 ms 调一次策略、每 1 ms 做 MuJoCo 子步。Contact WM v2 接收 50 个 100 Hz 的
+默认每 10 ms 调一次策略、每 1 ms 做 MuJoCo 子步。CARS-WM v3 接收 50 个 100 Hz 的
 q/dq/delta_q/tau 历史和 DP 的 8 个 7 维绝对关节 action token。默认 `recorded` 观测模式用 H5 的 q/dq/ddq/tau
 作为策略输入，同时记录仿真状态；要检查闭环漂移可使用 `hybrid_closed_loop`，此时图像和
 wrench 仍来自 H5，而 q/dq/tau 改用仿真上一周期状态。
@@ -343,12 +343,12 @@ Python 环境，代码会明确报告该依赖错误。
 离线 runner 要求 `predictor.inference_mode: open_loop`，这样 DP 在新图像窗口到达时同步
 更新，结果不依赖主机线程调度；只有明确接受非确定性时才传 `--allow-asynchronous`。
 
-Contact WM v2 运行时数据流为：
+CARS-WM v3 运行时数据流为：
 
 ```text
 image + wrench history -> DP checkpoint -> 8-token action (joint or ee_pose)
 joint action -> FK -> 8-token absolute ee_pose
-q/dq/delta_q/tau history + ee_pose action/action_mask -> ContactWorldModel v2
+q/dq/delta_q/tau history + ee_pose action/action_mask -> ContactWorldModel (carswm_v3)
   -> future q/dq/delta_q/tau/contact_state
 future q -> q command (mode=q) or MTC q_cmd
 future tau -> causal torque filter (mode=tau or MTC feed-forward)
@@ -366,7 +366,7 @@ future tau -> causal torque filter (mode=tau or MTC feed-forward)
 `predictor.enabled: false` 时 `contactworldmodel` 可从 YAML 中完全省略。开启 predictor 时，
 Contact WM 的网络参数、输入维度、horizon、action condition 和归一化器必须保存在
 checkpoint 的 `config`/`normalizer` 中，推理配置不会重复声明它们。加载器会在恢复权重前
-校验 v2 版本、四路输入以及 7 维关节/action；旧 V1/V3/V4/V5 或旧 OPD 权重会明确拒绝。
+校验 `carswm_v3` 版本、`carswm_contract`、四路输入以及 7 维关节/action；不匹配的旧权重会明确拒绝。
 
 完整在线观测链为：
 
@@ -453,7 +453,7 @@ normalizer 之前。
 
 - `open_loop` 下 DP 仅在 action 计划完成后同步推理一次；`asynchronous` 下才使用独立
   worker，并且仅在出现新的训练频率 image anchor 时提交，避免对同一观测反复采样。
-- Contact WM v2 独立维护 checkpoint 指定长度的 `q/dq/delta_q/tau` 物理量窗口；
+- CARS-WM v3 独立维护 checkpoint 指定长度的 `q/dq/delta_q/tau` 物理量窗口；
   episode 开头按训练数据的边界规则复制首帧左填充，并按 checkpoint 的 `high_fps` 做固定
   时间网格插值。`delta_q` 在插值时由保持的 `q_cmd` 与插值后的 `q` 重新计算，避免把旧测量
   状态嵌入 command delta。归一化输入和输出严格使用 checkpoint 的 normalizer。
@@ -503,7 +503,7 @@ tau mode: WM tau_pred
 模式为 WM 力矩），`InferenceOutput.tau_command` 是实际准备下发的滤波后输出。
 
 DP checkpoint 需遵循 diffusion-policy workspace 格式，并提供
-`policy.predict_action(obs)["action"]` future chunk 和 `action_target`。Contact WM v2
+`policy.predict_action(obs)["action"]` future chunk 和 `action_target`。CARS-WM v3
 最终接收绝对 `ee_pose=[x,y,z,qx,qy,qz,qw]` action；`action: joint` 时由运行时对每个
 token 做 FK，`action: eepose` 时直接传入。FK 使用 `robot.action_frame_name`；Nero
 采集数据的 `teleop/ee_pose_follower` 标记为 `tcp`，对应当前 URDF 的 `link7`，所以
@@ -515,8 +515,10 @@ PINN checkpoint 支持 `/mnt/code/lcx/PINN` 原生格式
 `checkpoint["config"] + checkpoint["model"] + checkpoint["normalizer"]`。恢复出的
 `ContactWorldModel` 必须提供 `predict(batch, steps, solver)`，返回 flat 的
 `q_pred/dq_pred/delta_q_pred/tau_pred`（以及可选 contact 输出）。
+可视化采样复用同一模型的 `encode_conditions` + `integrate_flow`，一次编码后并行积分 N
+个高斯源；不会在 Python 循环中重复完整条件编码。
 
-Contact WM v2 的输入和输出均带 batch 维。加载器会在恢复 state dict 前验证版本和维度；
+CARS-WM v3 的输入和输出均带 batch 维。加载器会在恢复 state dict 前验证版本、carswm_contract 和维度；
 不符合契约的旧权重不会静默回退到其它模型。
 
 推荐 Contact WM 在线配置：
@@ -528,6 +530,45 @@ predictor:
   action_chunk_mode: first
   action_condition_fill: chunk
 ```
+
+### real-time kinematic visualization of sampled futures
+
+在 `mujoco_visualization` 中设置 `enabled: true` 可启动独立 MuJoCo 进程。该进程只把
+真机关节 q 写入主 `MjData` 并调用 `mj_forward`，预测 q 则使用独立 scratch `MjData`
+做 FK；它不是 MuJoCo physics rollout，也不会向控制器回传数据。队列容量为 1，发布端
+始终 `put_nowait` 覆盖旧 packet，因此渲染、FK 或窗口异常不会阻塞控制线程。
+
+```yaml
+mujoco_visualization:
+  enabled: true
+  num_future_samples: 8
+  mujoco_model_path: ../../calibration/data/excitation_validation.scene.xml
+  ee_body_name: gripper_base
+  robot_joint_names: [joint1, joint2, joint3, joint4, joint5, joint6, joint7]
+  prediction_visualization_hz: 8
+  render_fps: 30
+  observed_q_update_hz: 30
+  latest_only: true
+  use_fixed_noise_bank: true
+  headless: false
+```
+
+离线验证不依赖真机链路，使用 LeRobot v3 episode 的 `action.ee_pose` 标签作为 action
+condition：
+
+```bash
+PYTHONPATH=. python scripts/visualize_wm_lerobotv3.py \
+  --config inference/configs/nero_contact_wm.yaml \
+  --episode /path/to/lerobot_v3_episode \
+  --action-key action.ee_pose --max-steps 300
+```
+
+命令只运行 CARS-WM 异步采样和未来轨迹 FK；MuJoCo 中的机械臂运动学姿态播放
+`q_samples[0,0,:]`（第一条 WM 样本的第一个 future step），录制的 `observation.joint`
+只用于 WM history 和诊断字段，不再驱动显示姿态。N 条完整 WM future 仍作为末端轨迹
+小球显示。输出 JSON 会报告 `[N,H_f,7]` 形状、`display_q_source` 以及批量采样耗时。
+`H_f` 始终从 checkpoint 读取，不在脚本中硬编码。该入口只调用 `mj_forward`，不是
+MuJoCo physics rollout。
 
 Mock 端到端运行（仍会真实加载三个 checkpoint）：
 
