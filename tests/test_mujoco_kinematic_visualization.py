@@ -2,6 +2,7 @@ from dataclasses import replace
 from pathlib import Path
 import queue
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -11,7 +12,12 @@ if PINN_ROOT.is_dir() and str(PINN_ROOT) not in sys.path:
     sys.path.insert(0, str(PINN_ROOT))
 
 from inference.config import load_inference_config
-from inference.mujoco_visualization import MujocoKinematicFK, VisualizationPacket, _put_latest
+from inference.mujoco_visualization import (
+    MujocoKinematicFK,
+    MujocoKinematicVisualizer,
+    VisualizationPacket,
+    _put_latest,
+)
 
 
 def test_contact_wm_batch_sampler_shape_without_repeated_condition_encoding():
@@ -72,6 +78,30 @@ def test_visualization_packet_contract_and_latest_only_queue():
 def test_visualization_packet_rejects_wrong_playback_joint_dimension():
     with pytest.raises(ValueError, match="same joint dimension"):
         VisualizationPacket(1.0, np.zeros(7), playback_q=np.zeros(6))
+
+
+def test_prediction_keeps_newest_observed_pose_and_rejects_old_observation():
+    config = SimpleNamespace(
+        enabled=True,
+        robot_joint_names=tuple(f"joint{i}" for i in range(1, 8)),
+        prediction_visualization_hz=1_000.0,
+    )
+    visualizer = MujocoKinematicVisualizer(config)
+    try:
+        newest = np.full(7, 2.0)
+        visualizer.publish_observed(10.0, newest)
+        visualizer.publish_observed(9.0, np.zeros(7))
+        visualizer.publish_prediction(
+            9.5,
+            np.zeros(7),
+            np.zeros((2, 3, 7)),
+            prediction_id=1,
+        )
+        assert visualizer._latest_observed_timestamp == 10.0
+        np.testing.assert_allclose(visualizer._latest_prediction.observed_q, newest)
+        assert visualizer._latest_prediction.timestamp == 10.0
+    finally:
+        visualizer.close()
 
 
 def test_mujoco_fk_uses_explicit_joint_names_and_scratch_data():

@@ -41,6 +41,7 @@ from inference.async_fast_slow import (
     WMTarget,
     WMTargetBuffer,
     WMWorker,
+    first_valid_prediction_index,
     monotonic_time,
 )
 from nero_collection.arms.factory import build_arm
@@ -616,11 +617,12 @@ class NeroInferenceRuntime:
         self._latest_frames = self._observation_sampler.latest_frames
 
     def _on_stream_sample(self, sample: ContinuousInferenceSample) -> None:
-        self._last_valid_arm_state_s = time.monotonic()
+        callback_time_s = monotonic_time()
+        self._last_valid_arm_state_s = callback_time_s
         if self.mujoco_visualizer.enabled:
-            now = time.monotonic()
+            now = callback_time_s
             if now - self._last_visualization_observed_publish_s >= 1.0 / float(self.config.mujoco_visualization.observed_q_update_hz):
-                self.mujoco_visualizer.publish_observed(sample.timestamp_us * 1.0e-6, sample.q)
+                self.mujoco_visualizer.publish_observed(now, sample.q)
                 self._last_visualization_observed_publish_s = now
         if self._timestamp_async_enabled:
             # ``ContinuousInferenceStateStream`` retains its historical wall
@@ -628,7 +630,7 @@ class NeroInferenceRuntime:
             # uses a monotonic timestamp captured at this callback boundary.
             try:
                 self.state_history_buffer.append(
-                    monotonic_time(),
+                    callback_time_s,
                     sample.q,
                     sample.dq,
                     tau=sample.tau,
@@ -695,11 +697,25 @@ class NeroInferenceRuntime:
                 tau_samples = np.asarray(sampled.get("tau", np.zeros_like(q_samples)), dtype=np.float64)
                 if q_samples.ndim != 3 or q_samples.shape[0] != self.config.mujoco_visualization.num_future_samples:
                     raise ValueError(f"sampled CARS-WM q must have shape [N,H,7], got {q_samples.shape}")
-                self._visualization_prediction_id += 1
-                self.mujoco_visualizer.publish_prediction(
-                    history.timestamps_s[-1], history.q[-1], q_samples,
-                    prediction_id=self._visualization_prediction_id,
+                # Sampling may consume several 10 ms bins.  Drop the same
+                # expired prefix that WMWorker drops before control consumes
+                # the trajectory, otherwise stale points appear behind the
+                # measured end-effector only in the visualization.
+                returned = monotonic_time()
+                first_valid_idx = first_valid_prediction_index(
+                    history.timestamps_s[-1],
+                    returned,
+                    prediction_dt_s,
+                    q_samples.shape[1],
                 )
+                if first_valid_idx < q_samples.shape[1]:
+                    self._visualization_prediction_id += 1
+                    self.mujoco_visualizer.publish_prediction(
+                        returned,
+                        history.q[-1],
+                        q_samples[:, first_valid_idx:, :],
+                        prediction_id=self._visualization_prediction_id,
+                    )
                 return {"q_ref": q_samples[0], "tau_ref": tau_samples[0]}
             return pipeline.predict_contact_reference(history, action)
 

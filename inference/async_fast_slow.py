@@ -28,6 +28,34 @@ def monotonic_time() -> float:
     return time.monotonic()
 
 
+def first_valid_prediction_index(
+    start_time_s: float,
+    returned_time_s: float,
+    prediction_dt_s: float,
+    horizon: int,
+) -> int:
+    """Return the first prediction sample that is still in the future.
+
+    A world-model trajectory is anchored at ``start_time_s`` and sample ``i``
+    represents ``start_time_s + (i + 1) * prediction_dt_s``.  Inference can
+    finish after several of those samples have already elapsed, so consumers
+    must use the same prefix trimming rule for control and visualization.
+    """
+
+    start = float(start_time_s)
+    returned = float(returned_time_s)
+    dt = float(prediction_dt_s)
+    count = int(horizon)
+    if not np.isfinite(start) or not np.isfinite(returned):
+        raise ValueError("prediction timestamps must be finite")
+    if not np.isfinite(dt) or dt <= 0.0:
+        raise ValueError("prediction_dt_s must be positive and finite")
+    if count < 1:
+        raise ValueError("prediction horizon must be positive")
+    age_s = max(0.0, returned - start)
+    return int(np.clip(math.ceil(age_s / dt), 0, count))
+
+
 def _vector(name: str, value: Any, width: int = DOF) -> np.ndarray:
     result = np.asarray(value, dtype=np.float64).reshape(-1)
     if result.shape != (width,) or not np.all(np.isfinite(result)):
@@ -704,8 +732,12 @@ class WMWorker(_LatestWorker):
                     "WM prediction horizon must be "
                     f"{self.prediction_horizon}, got q={q_values.shape[0]} tau={tau_values.shape[0]}"
                 )
-            first_valid_idx = int(math.ceil(max(0.0, returned - t_start) / self.prediction_dt_s))
-            first_valid_idx = int(np.clip(first_valid_idx, 0, self.prediction_horizon))
+            first_valid_idx = first_valid_prediction_index(
+                t_start,
+                returned,
+                self.prediction_dt_s,
+                self.prediction_horizon,
+            )
             if first_valid_idx < self.prediction_horizon:
                 timestamps = t_start + (
                     np.arange(first_valid_idx, self.prediction_horizon, dtype=np.float64) + 1.0
@@ -886,5 +918,6 @@ __all__ = [
     "WMTarget",
     "WMTargetBuffer",
     "WMWorker",
+    "first_valid_prediction_index",
     "monotonic_time",
 ]

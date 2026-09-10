@@ -11,6 +11,7 @@ from inference.async_fast_slow import (
     StateHistoryBuffer,
     WMTargetBuffer,
     WMWorker,
+    first_valid_prediction_index,
 )
 
 
@@ -136,6 +137,12 @@ def test_wm_worker_drops_expired_prediction_prefix() -> None:
     assert len(segments) == 1
     assert segments[0].timestamps_s[0] > t_start + 0.02
     assert segments[0].q_ref[0, 0] >= 21.0
+
+
+def test_first_valid_prediction_index_matches_wm_prefix_trimming() -> None:
+    assert first_valid_prediction_index(10.0, 10.024, 0.01, 32) == 3
+    assert first_valid_prediction_index(10.0, 9.9, 0.01, 32) == 0
+    assert first_valid_prediction_index(10.0, 10.5, 0.01, 32) == 32
 
 
 def test_wm_target_blends_overlapping_segments() -> None:

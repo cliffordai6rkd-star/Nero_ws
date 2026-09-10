@@ -32,6 +32,8 @@ class VisualizationPacket:
 
     def __post_init__(self) -> None:
         self.timestamp = float(self.timestamp)
+        if not np.isfinite(self.timestamp):
+            raise ValueError("visualization packet timestamp must be finite")
         self.observed_q = _joint_vector(self.observed_q, "observed_q")
         if self.predicted_q is not None:
             values = np.asarray(self.predicted_q, dtype=np.float64)
@@ -97,6 +99,7 @@ class MujocoKinematicVisualizer:
         self._queue = self._ctx.Queue(maxsize=1)
         self._process: mp.Process | None = None
         self._latest_observed = np.zeros(len(config.robot_joint_names), dtype=np.float64)
+        self._latest_observed_timestamp = -np.inf
         self._latest_prediction: VisualizationPacket | None = None
         self._prediction_id = -1
         self._last_prediction_publish_s = -np.inf
@@ -116,7 +119,16 @@ class MujocoKinematicVisualizer:
         if not self.enabled:
             return
         try:
-            self._latest_observed = _joint_vector(observed_q, "observed_q")
+            timestamp = float(timestamp)
+            observed = _joint_vector(observed_q, "observed_q")
+            if not np.isfinite(timestamp):
+                raise ValueError("observed visualization timestamp must be finite")
+            # Online callers use the monotonic runtime clock.  A delayed state
+            # callback must not move the displayed robot back in time.
+            if timestamp < self._latest_observed_timestamp:
+                return
+            self._latest_observed = observed
+            self._latest_observed_timestamp = timestamp
             previous = self._latest_prediction
             packet = VisualizationPacket(
                 timestamp,
@@ -149,10 +161,19 @@ class MujocoKinematicVisualizer:
         if now - self._last_prediction_publish_s < period:
             return
         try:
+            timestamp = float(timestamp)
+            if not np.isfinite(timestamp):
+                raise ValueError("prediction visualization timestamp must be finite")
+            predicted = np.asarray(predicted_q, dtype=np.float64)
+            if self._latest_observed_timestamp == -np.inf:
+                # This is only needed for offline callers that publish a
+                # prediction before their first observed packet.
+                self._latest_observed = _joint_vector(observed_q, "observed_q")
+                self._latest_observed_timestamp = timestamp
             packet = VisualizationPacket(
-                timestamp,
-                _joint_vector(observed_q, "observed_q"),
-                np.asarray(predicted_q, dtype=np.float64),
+                max(timestamp, self._latest_observed_timestamp),
+                self._latest_observed.copy(),
+                predicted,
                 None if predicted_ee_position is None else np.asarray(predicted_ee_position, dtype=np.float64),
                 prediction_id,
                 None if playback_q is None else np.asarray(playback_q, dtype=np.float64),
@@ -160,7 +181,6 @@ class MujocoKinematicVisualizer:
         except Exception:
             log.debug("dropping invalid prediction visualization packet", exc_info=True)
             return
-        self._latest_observed = packet.observed_q.copy()
         self._latest_prediction = packet
         self._prediction_id = -1 if prediction_id is None else int(prediction_id)
         self._last_prediction_publish_s = now
@@ -288,6 +308,7 @@ def _visualizer_process(config: Any, sample_queue: Any) -> None:
         latest: VisualizationPacket | None = None
         latest_trajectory = np.empty((0, 0, 3), dtype=np.float64)
         computed_prediction_id: int | None = None
+        latest_packet_timestamp = -np.inf
         timing_reported = False
         fk_timing_reported = False
         next_render = time.monotonic()
@@ -296,6 +317,8 @@ def _visualizer_process(config: Any, sample_queue: Any) -> None:
                 item = sample_queue.get(timeout=0.05)
                 if item is None:
                     break
+                if float(item.timestamp) < latest_packet_timestamp:
+                    continue
                 latest = item
                 # Drain stale packets so rendering is always latest-only.
                 while True:
@@ -305,11 +328,14 @@ def _visualizer_process(config: Any, sample_queue: Any) -> None:
                         break
                     if item is None:
                         return
+                    if float(item.timestamp) < latest_packet_timestamp:
+                        continue
                     latest = item
             except queue.Empty:
                 pass
             if latest is None:
                 continue
+            latest_packet_timestamp = float(latest.timestamp)
             # ``playback_q`` is used only by offline simulation/replay.  The
             # real-time hardware path never sets it and therefore continues
             # to show the measured observed_q pose.

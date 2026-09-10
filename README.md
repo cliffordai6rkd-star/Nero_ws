@@ -125,4 +125,14 @@ uv run python -m inference.cli --config inference/configs/nero_contact_wm.yaml
 标定夹爪零点
 ```
 python scripts/calibrate_gripper.py follower
+
+
+```
+PYTHONPATH=.:../PINN \
+../PINN/.conda-env/bin/python \
+scripts/visualize_wm_lerobotv3.py \
+  --config inference/configs/nero_contact_wm.yaml \
+  --episode runs/swm/insert_usb_lerobot_v3 \
+  --action-key action.ee_pose \
+  --max-steps 3000
 ```
