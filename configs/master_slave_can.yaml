@@ -71,13 +71,13 @@ tau_ext_inference:
     order: 2
 
   # 主臂力反馈来源：tau_other 使用 RNEA+tau_other residual；tau_free 使用自由空间
-  feedback_source: tau_free
+  feedback_source: tau_other
   # 相邻底层源帧超过该间隔时只记录警告；不会按时间间隔补帧或清空模型历史。
   observation_gap_warning_s: 0.06
   maximum_prediction_age_s: 0.06
 
   tau_other:
-    checkpoint_path: model/tau_other/epoch_122_val_loss_0.014045.pt
+    checkpoint_path: model/tau_other/epoch_121_val_loss_0.001129.pt
     # stride = teleop.command.sample_rate_hz / observation_sample_rate_hz = 2。
     observation_sample_rate_hz: 50.0
 
