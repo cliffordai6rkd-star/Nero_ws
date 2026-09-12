@@ -36,8 +36,8 @@ log = logging.getLogger(__name__)
 _DEFAULT_CPU_TORCH_NUM_THREADS = 1
 _MODEL_INPUT_KEYS = frozenset({"q", "dq", "ddq", "delta_q", "tau", "tau_id"})
 _DYNAMICS_INPUT_KEYS = frozenset({"ddq", "tau_id"})
-_TAU_OTHER_TARGET_CONTRACT = "causal_gravity_residual_v1"
-_TAU_OTHER_INPUT_KEYS = ("q", "dq", "delta_q")
+_TAU_OTHER_TARGET_CONTRACT = "causal_rnea_residual_v1"
+_TAU_OTHER_INPUT_KEYS = ("q", "dq", "delta_q", "tau")
 
 
 @dataclass(frozen=True)
@@ -60,6 +60,7 @@ class SequenceCheckpointMetadata:
     target_filter_moving_average_window: int | None = None
     target_filter_median_window: int | None = None
     target_filter_apply_additional_lowpass: bool = False
+    deployment_contract: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -225,6 +226,16 @@ class SequenceTorquePredictor:
             raise RuntimeError(f"{name} checkpoint root must be a mapping")
 
         checkpoint_config = _mapping(checkpoint.get("config"), "checkpoint.config")
+
+        deployment_contract_value = checkpoint.get(
+            "deployment_contract",
+            checkpoint_config.get("deployment_contract", {}),
+        )
+        if not isinstance(deployment_contract_value, Mapping):
+            raise RuntimeError("checkpoint deployment_contract must be a mapping")        
+        deployment_contract = dict(deployment_contract_value)    
+
+
         dataloader_config = _mapping(
             checkpoint_config.get("dataloader"),
             "checkpoint.config.dataloader",
@@ -411,6 +422,7 @@ class SequenceTorquePredictor:
             target_filter_apply_additional_lowpass=(
                 target_filter_apply_additional_lowpass
             ),
+            deployment_contract=deployment_contract,
         )
         self._history: dict[str, deque[Any]] = {}
         self.reset()
@@ -654,6 +666,54 @@ class OnlineTauExtInference:
             self._tau_other_sample_rate_hz,
             model_name="tau_other",
         )
+
+        contract = self.tau_other_predictor.metadata.deployment_contract
+        # Older PINN sequence checkpoints (including epoch_109) do not carry
+        # the deployment contract.  Their source preprocessing is still
+        # restored from the runtime contract below; when present, validate it
+        # strictly against the same settings.
+        if contract and contract.get("version") != "tau_other_online_v1":
+            raise RuntimeError("unsupported tau_other deployment contract")
+
+        source_contract = contract.get("source_preprocessing", {})
+        filter_contract = source_contract.get("filter", {})
+        downsample_contract = source_contract.get("downsample", {})
+
+        if source_contract and not np.isclose(
+            float(source_contract["source_sample_rate_hz"]),
+            self._source_sample_rate_hz,
+        ):
+            raise RuntimeError("source sample rate does not match checkpoint")
+
+        if filter_contract and filter_contract.get("contract") != "causal_variable_dt_butterworth_lowpass_v1":
+            raise RuntimeError("source filter contract does not match checkpoint")
+
+        if filter_contract and tuple(filter_contract["keys"]) != ("q", "dq", "tau", "q_cmd"):
+            raise RuntimeError("source filter keys do not match checkpoint")
+
+        if filter_contract and not np.isclose(
+            float(filter_contract["cutoff_hz"]),
+            config.source_butterworth_filter.cutoff_hz,
+        ):
+            raise RuntimeError("source filter cutoff does not match checkpoint")
+
+        if filter_contract and int(filter_contract["order"]) != config.source_butterworth_filter.order:
+            raise RuntimeError("source filter order does not match checkpoint")
+
+        if downsample_contract and int(downsample_contract["stride"]) != self._tau_other_stride:
+            raise RuntimeError("online stride does not match checkpoint")
+
+        if downsample_contract and int(downsample_contract["phase"]) != 0:
+            raise RuntimeError("online inference supports checkpoint phase 0 only")
+
+        if downsample_contract and not np.isclose(
+            float(downsample_contract["output_sample_rate_hz"]),
+            self._tau_other_sample_rate_hz,
+        ):
+            raise RuntimeError("model observation rate does not match checkpoint")
+
+
+
         self._tau_next_stride = _resolve_observation_stride(
             self._source_sample_rate_hz,
             self._tau_next_sample_rate_hz,
@@ -1014,9 +1074,14 @@ class OnlineTauExtInference:
         self._tau_id = tau_id.copy()
         self._tau_next_tau_id = tau_id.copy()
 
-        tau_measured = source.raw_tau
-        raw_features = _observation_features(source, q=q_value, dq=dq_value)
-        raw_features.pop("tau", None)
+        raw_features = _observation_features(
+            source,
+            q=q_value,
+            dq=dq_value,
+            # The checkpoint is trained with the measured torque at the same
+            # filtered 50 Hz observation as q/dq/delta_q.
+            tau=source.tau,
+        )
         _require_features(raw_features, self.tau_other_predictor.metadata.input_keys, "tau_other")
         features = _apply_feature_filter_bank(
             raw_features,
@@ -1033,7 +1098,10 @@ class OnlineTauExtInference:
             self._tau_ext_cal.fill(0.0)
             return
         self._tau_other_pred = _finite_vector("tau_other_pred", prediction, 7)
-        self._tau_ext_cal_raw = self._tau_g + self._tau_other_pred - tau_measured
+        # The aligned checkpoint predicts tau_other = tau_measured - tau_id.
+        # Expose that residual directly to the force-feedback branch; adding
+        # gravity here would restore the legacy gravity-residual contract.
+        self._tau_ext_cal_raw = self._tau_other_pred.copy()
         self._tau_ext_cal = (
             self.tau_ext_cal_filter.apply(self._tau_ext_cal_raw, timestamp_us)
             if self.tau_ext_cal_filter is not None
@@ -1355,24 +1423,24 @@ def _validate_predictor_contract(
                 "tau_other checkpoint target_contract must be "
                 f"{_TAU_OTHER_TARGET_CONTRACT!r}, got {metadata.target_contract!r}"
             )
-        _validate_gravity_tau_other_contract(metadata)
+        _validate_rnea_tau_other_contract(metadata)
 
 
-def _validate_gravity_tau_other_contract(
+def _validate_rnea_tau_other_contract(
     metadata: SequenceCheckpointMetadata,
 ) -> None:
     target = metadata.derived_target_config
     if not target:
         raise RuntimeError(
-            "causal_gravity_residual_v1 checkpoint is missing "
+            "causal_rnea_residual_v1 checkpoint is missing "
             "derived_target_config"
         )
     required_values = {
         "enabled": True,
         "method": _TAU_OTHER_TARGET_CONTRACT,
         "target_key": metadata.output_key,
-        "ddq_source": "unused",
-        "residual_formula": "tau_other=tau_measured-tau_g",
+        "ddq_source": "causal_state_estimator(q,dq)",
+        "residual_formula": "tau_other=tau_measured-tau_id",
         "measured_tau_source": "observation.torque",
     }
     for key, expected in required_values.items():
@@ -1398,7 +1466,12 @@ def _validate_gravity_tau_other_contract(
     normalized_target_filter = _normalize_checkpoint_filters(
         {
             "tau": {
-                "enabled": bool(raw_operations),
+                # The checkpoint records the historical operation list even
+                # when the filter is disabled; only enabled operations are
+                # part of the online target contract.
+                "enabled": bool(raw_operations) and bool(
+                    metadata.dataloader_filters.get("tau", {}).get("enabled", False)
+                ),
                 "operations": raw_operations,
             }
         }
@@ -1428,7 +1501,33 @@ def _derived_kalman_config(
     metadata: SequenceCheckpointMetadata,
 ) -> CausalKalmanConfig | None:
     if metadata.target_contract == _TAU_OTHER_TARGET_CONTRACT:
-        return None
+        raw = metadata.derived_target_config.get("state_estimator")
+        if not isinstance(raw, Mapping):
+            raise RuntimeError(
+                "causal_rnea_residual_v1 checkpoint requires state_estimator"
+            )
+        fields = (
+            "position_std", "velocity_std", "jerk_std",
+            "initial_position_std", "initial_velocity_std",
+            "initial_acceleration_std",
+        )
+        values = {}
+        for name in fields:
+            value = raw.get(name)
+            if value is None:
+                raise RuntimeError(
+                    f"tau_other checkpoint state_estimator is missing {name!r}"
+                )
+            arr = np.asarray(value, dtype=np.float64).reshape(-1)
+            if arr.size == 1:
+                arr = np.repeat(arr, 7)
+            if arr.size != 7:
+                raise RuntimeError(
+                    f"tau_other checkpoint state_estimator.{name} must have 7 values"
+                )
+            values[name] = tuple(float(x) for x in arr)
+        values["max_gap_s"] = float(raw.get("max_gap_s", 0.1))
+        return CausalKalmanConfig(**values)
     raise RuntimeError(
         "tau_other checkpoint target_contract must be "
         f"{_TAU_OTHER_TARGET_CONTRACT!r}"

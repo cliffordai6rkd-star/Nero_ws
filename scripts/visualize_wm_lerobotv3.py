@@ -2,10 +2,12 @@
 """Replay LeRobot v3 state/action labels through CARS-WM only.
 
 This command intentionally does not construct the real-robot runtime, DP, CAN,
-or a MuJoCo dynamics backend.  It can run a strict feedback-free rollout for
-visualization: every WM query predicts 32 frames, only the first 16 frames are
-committed, and those four predicted streams (q/dq/delta_q/tau) become the next
-50-frame condition.  The MuJoCo process only performs FK and rendering.
+or a MuJoCo dynamics backend.  New checkpoints can run a strict feedback-free
+rollout for visualization: every WM query predicts 32 frames, only a committed
+prefix is retained, and the four predicted streams (q/dq/delta_q/tau) become
+the next 50-frame condition.  Legacy q/tau checkpoints use the original
+independent-window sampler because they do not emit dq and delta_q.  The
+MuJoCo process only performs FK and rendering.
 """
 
 from __future__ import annotations
@@ -129,7 +131,17 @@ def _history_window(arrays: dict[str, np.ndarray], start: int, horizon: int) -> 
     return result
 
 
-def _sample_history(model, history, action_values, samples, noise_bank=None, steps=None, solver=None):
+def _sample_history(
+    model,
+    history,
+    action_values,
+    samples,
+    noise_bank=None,
+    steps=None,
+    solver=None,
+    *,
+    required_outputs=("q", "dq", "delta_q", "tau"),
+):
     import torch
     future = int(model.future_horizon)
     action_horizon = int(model.action_condition_horizon)
@@ -183,10 +195,12 @@ def _sample_history(model, history, action_values, samples, noise_bank=None, ste
             mode = metadata.get("normalize_mode", "gaussian")
             value = getattr(normalizer, f"{mode}_denormalize")(key, value)
         output[key] = value.detach().cpu().numpy().astype(np.float64)
-    if missing:
+    required_outputs = tuple(required_outputs)
+    missing_required = [key for key in required_outputs if key in missing]
+    if missing_required:
         raise RuntimeError(
-            "strict recursive rollout requires checkpoint outputs for "
-            f"q/dq/delta_q/tau; missing {missing}"
+            "checkpoint does not provide the outputs required by this rollout: "
+            f"{missing_required}"
         )
     return output, noise_bank.detach().cpu(), {
         "condition_encoding_ms": encode_ms,
@@ -222,6 +236,16 @@ def recursive_rollout(
         raise ValueError("segment_steps must be in [1, model.future_horizon]")
     if segments < 1:
         raise ValueError("segments must be positive")
+    required_outputs = {"q", "dq", "delta_q", "tau"}
+    declared_outputs = getattr(model, "outputs", None)
+    available_outputs = required_outputs if declared_outputs is None else set(declared_outputs or ())
+    if not required_outputs.issubset(available_outputs):
+        missing = sorted(required_outputs - available_outputs)
+        raise RuntimeError(
+            "strict recursive rollout requires checkpoint outputs for "
+            f"q/dq/delta_q/tau; missing {missing}. "
+            "Use the legacy q/tau visualization path for this checkpoint."
+        )
     if int(start) < history_horizon - 1:
         raise ValueError("start does not have a complete model history")
     history = {
@@ -256,12 +280,25 @@ def recursive_rollout(
 
 
 def sample(model, arrays, start, samples, noise_bank=None, steps=None, solver=None):
-    """Backward-compatible one-segment sample helper."""
+    """Legacy one-segment q/tau checkpoint sampling helper.
+
+    Older CARS-WM checkpoints predict only ``q`` and ``tau``.  They are not
+    recursively reconditionable because they do not emit the ``dq`` and
+    ``delta_q`` streams needed to form the next history window, so replay keeps
+    the original independent-window behavior.
+    """
 
     history = _history_window(arrays, start, int(model.history_horizon))
     action = arrays["action"][start : start + int(model.action_condition_horizon)]
     prediction, noise_bank, timing = _sample_history(
-        model, history, action, samples, noise_bank=noise_bank, steps=steps, solver=solver
+        model,
+        history,
+        action,
+        samples,
+        noise_bank=noise_bank,
+        steps=steps,
+        solver=solver,
+        required_outputs=("q",),
     )
     return prediction["q"], noise_bank, timing
 
@@ -310,12 +347,20 @@ def main(argv=None):
     arrays = _load_parquet(args.episode, args.action_key)
     history = int(model.history_horizon)
     samples = int(viz_cfg.num_future_samples)
+    model_outputs = set(getattr(model, "outputs", ()) or ())
+    legacy_q_tau = model_outputs == {"q", "tau"}
+    if legacy_q_tau and (args.rollout_segment_steps != 1 or args.rollout_segments != 1):
+        logging.warning(
+            "checkpoint outputs only q/tau; ignoring recursive rollout settings "
+            "and using the legacy independent-window sampler"
+        )
     if args.rollout_segment_steps > int(model.future_horizon):
         parser.error(
             "--rollout-segment-steps cannot exceed the checkpoint future horizon "
             f"({int(model.future_horizon)})"
         )
     noise_banks = [None] * int(args.rollout_segments)
+    legacy_noise_bank = None
     timings = []
     stage_timings = []
     fk_timings = []
@@ -326,20 +371,32 @@ def main(argv=None):
         for index in range(
             history - 1,
             min(last_start, history - 1 + args.max_steps),
-            args.rollout_segment_steps,
+            1 if legacy_q_tau else args.rollout_segment_steps,
         ):
             started = time.perf_counter()
-            q, noise_banks, stages = recursive_rollout(
-                model,
-                arrays,
-                index,
-                samples,
-                segment_steps=args.rollout_segment_steps,
-                segments=args.rollout_segments,
-                noise_banks=(noise_banks if viz_cfg.use_fixed_noise_bank else [None] * int(args.rollout_segments)),
-                steps=viz_cfg.flow_steps,
-                solver=viz_cfg.flow_solver,
-            )
+            if legacy_q_tau:
+                q, legacy_noise_bank, stage = sample(
+                    model,
+                    arrays,
+                    index,
+                    samples,
+                    noise_bank=(legacy_noise_bank if viz_cfg.use_fixed_noise_bank else None),
+                    steps=viz_cfg.flow_steps,
+                    solver=viz_cfg.flow_solver,
+                )
+                stages = [stage]
+            else:
+                q, noise_banks, stages = recursive_rollout(
+                    model,
+                    arrays,
+                    index,
+                    samples,
+                    segment_steps=args.rollout_segment_steps,
+                    segments=args.rollout_segments,
+                    noise_banks=(noise_banks if viz_cfg.use_fixed_noise_bank else [None] * int(args.rollout_segments)),
+                    steps=viz_cfg.flow_steps,
+                    solver=viz_cfg.flow_solver,
+                )
             timings.append((time.perf_counter() - started) * 1e3)
             stage_timings.extend(stages)
             fk_started = time.perf_counter()
@@ -353,7 +410,7 @@ def main(argv=None):
             )
     finally:
         viz.close()
-    print(json.dumps({"samples_shape": None if q is None else list(q.shape), "ee_position_shape": None if ee_positions is None else list(ee_positions.shape), "future_horizon": int(model.future_horizon), "rollout_segment_steps": int(args.rollout_segment_steps), "rollout_segments": int(args.rollout_segments), "display_q_source": "wm_recursive_sample_0_step_0", "batch_sampling_ms_mean": float(np.mean(timings)) if timings else None, "condition_encoding_ms": float(np.mean([item["condition_encoding_ms"] for item in stage_timings])) if stage_timings else None, "flow_integration_N_ms": float(np.mean([item["flow_integration_N_ms"] for item in stage_timings])) if stage_timings else None, "fk_NxH_ms": float(np.mean(fk_timings)) if fk_timings else None, "status": "ok"}, ensure_ascii=False))
+    print(json.dumps({"samples_shape": None if q is None else list(q.shape), "ee_position_shape": None if ee_positions is None else list(ee_positions.shape), "future_horizon": int(model.future_horizon), "rollout_segment_steps": int(args.rollout_segment_steps), "rollout_segments": int(args.rollout_segments), "rollout_mode": "legacy_q_tau_independent" if legacy_q_tau else "strict_recursive", "display_q_source": "wm_sample_0_step_0" if legacy_q_tau else "wm_recursive_sample_0_step_0", "batch_sampling_ms_mean": float(np.mean(timings)) if timings else None, "condition_encoding_ms": float(np.mean([item["condition_encoding_ms"] for item in stage_timings])) if stage_timings else None, "flow_integration_N_ms": float(np.mean([item["flow_integration_N_ms"] for item in stage_timings])) if stage_timings else None, "fk_NxH_ms": float(np.mean(fk_timings)) if fk_timings else None, "status": "ok"}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

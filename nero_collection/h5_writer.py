@@ -614,8 +614,8 @@ class EpisodeBuffer:
             (
                 "tau_ext_cal_raw",
                 "tau_ext_cal",
-                "tau_g + tau_other_pred - tau_follower",
-                "online_inverse_dynamics_residual",
+                "tau_other_pred (tau_measured - tau_id)",
+                "online_rnea_residual_prediction",
                 feedback_source == "tau_other",
                 metadata.tau_other,
             ),

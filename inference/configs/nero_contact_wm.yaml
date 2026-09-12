@@ -19,8 +19,8 @@ architecture:
   world_model_type: contact_wm
 
 contactworldmodel:
-  # Joint q/dq/delta_q/tau checkpoint with strict recursive rollout support.
-  path: ../../model/carswm/step_00450000.pt
+  # Legacy CARS-WM checkpoint.  It consumes q/dq/delta_q/tau and predicts q/tau.
+  path: ../../../PINN/outputs/contact_world_model_final/checkpoints/step_00400000.pt
   device: cuda:0
   use_ema: true
 
@@ -121,7 +121,7 @@ wrench_visualization:
 # the arm. Keep enabled=false for unchanged deployment behavior.
 mujoco_visualization:
   enabled: false
-  num_future_samples: 5
+  num_future_samples: 1
   mujoco_model_path: ../../calibration/data/excitation_validation.scene.xml
   ee_body_name: gripper_base
   ee_site_name: null
@@ -129,9 +129,9 @@ mujoco_visualization:
   point_size: 0.005
   trajectory_colors:
     # - [0.10, 0.75, 1.00, 0.80]
-    - [1.00, 0.35, 0.15, 0.80]
+    # - [1.00, 0.35, 0.15, 0.80]
     # - [0.45, 1.00, 0.25, 0.80]
-    # - [0.85, 0.35, 1.00, 0.80]
+    - [0.85, 0.35, 1.00, 0.80]
   render_fps: 100.0
   prediction_visualization_hz: 100
   observed_q_update_hz: 100

@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from scripts.visualize_wm_lerobotv3 import recursive_rollout
+from scripts.visualize_wm_lerobotv3 import recursive_rollout, sample
 
 
 class _RecursiveModel(torch.nn.Module):
@@ -38,6 +38,18 @@ class _RecursiveModel(torch.nn.Module):
         }
 
 
+class _LegacyModel(_RecursiveModel):
+    outputs = ("q", "tau")
+
+    def _decoded_output(self, _flow_state, encoded):
+        batch = encoded["q"].shape[0]
+        device = encoded["q"].device
+        base = encoded["q"][:, -1:, :1]
+        offsets = torch.arange(1, self.future_horizon + 1, device=device).reshape(1, -1, 1)
+        stream = (base + offsets).expand(batch, self.future_horizon, 7)
+        return {"q_pred": stream.clone(), "tau_pred": stream.clone()}
+
+
 def test_recursive_rollout_commits_16_of_32_and_reanchors_actions():
     model = _RecursiveModel()
     count = 100
@@ -66,3 +78,17 @@ def test_recursive_rollout_commits_16_of_32_and_reanchors_actions():
     np.testing.assert_allclose(model.anchor_actions[0][0, 0, 0], arrays["action"][50, 0])
     np.testing.assert_allclose(model.anchor_actions[1][0, 0, 0], arrays["action"][66, 0])
 
+
+def test_legacy_q_tau_sampler_does_not_require_predicted_dq_or_delta_q():
+    model = _LegacyModel()
+    count = 100
+    arrays = {
+        key: np.zeros((count, 7), dtype=np.float64)
+        for key in ("q", "dq", "delta_q", "tau")
+    }
+    arrays["action"] = np.zeros((count, 7), dtype=np.float64)
+    arrays["timestamp"] = np.arange(count, dtype=np.float64)
+    q, _, timing = sample(model, arrays, start=50, samples=1, steps=1, solver="euler")
+
+    assert q.shape == (1, 32, 7)
+    assert timing["flow_integration_N_ms"] >= 0
