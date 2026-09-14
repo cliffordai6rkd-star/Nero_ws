@@ -20,7 +20,7 @@ architecture:
 
 contactworldmodel:
   # Legacy CARS-WM checkpoint.  It consumes q/dq/delta_q/tau and predicts q/tau.
-  path: ../../../PINN/outputs/contact_world_model_final/checkpoints/step_00400000.pt
+  path: ../../../PINN/outputs/cwm_insert_usb_50hz/checkpoints/step_00500000.pt
   device: cuda:0
   use_ema: true
 
@@ -31,11 +31,12 @@ predictor:
   # DP samples a fresh image window, then holds its 8-token action plan while
   # the WM continues to run at the 100 Hz CAN/state rate. Joint actions are
   # converted to ee_pose with FK before entering the WM.
-  inference_mode: asynchronous
+  inference_mode: open_loop
   action_chunk_mode: all
   action_condition_fill: chunk
   action_execution_mode: chunk
-  action_step_s: 0.04
+  # Contact WM consumes the interpolated 100 Hz action sequence.
+  action_step_s: 0.01
 
 execution:
   # mtc | q | tau
@@ -121,26 +122,28 @@ wrench_visualization:
 # the arm. Keep enabled=false for unchanged deployment behavior.
 mujoco_visualization:
   enabled: false
-  num_future_samples: 1
+  num_future_samples: 50
+  execute_steps: 5
+  trajectory_horizon: 16
   mujoco_model_path: ../../calibration/data/excitation_validation.scene.xml
   ee_body_name: gripper_base
   ee_site_name: null
   robot_joint_names: [joint1, joint2, joint3, joint4, joint5, joint6, joint7]
-  point_size: 0.005
-  trajectory_colors:
-    # - [0.10, 0.75, 1.00, 0.80]
-    # - [1.00, 0.35, 0.15, 0.80]
-    # - [0.45, 1.00, 0.25, 0.80]
-    - [0.85, 0.35, 1.00, 0.80]
+  point_size: 0.01
   render_fps: 100.0
-  prediction_visualization_hz: 100
+  prediction_visualization_hz: 20
   observed_q_update_hz: 100
   latest_only: true
   use_fixed_noise_bank: true
   headless: false
-  flow_steps: null
-  flow_solver: null
+  flow_steps: 64
+  flow_solver: heun
 
 timing:
   enabled: true
   report_interval_s: 1.0
+
+# Offline LeRobot WM replay (scripts/visualize_wm_lerobotv3.py).
+# The checkpoint predicts future_horizon frames (typically 32); only the
+# configured execute_steps are committed before the next WM query. At 100 Hz,
+# 8 steps correspond to 80 ms. visualization_horizon only limits drawn points.

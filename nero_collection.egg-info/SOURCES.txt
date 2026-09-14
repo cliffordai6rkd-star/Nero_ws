@@ -153,3 +153,4 @@ tests/test_tau_ext_per_axis_filter.py
 tests/test_tavla_policy.py
 tests/test_torque_command_filter.py
 tests/test_visualize_cameras.py
+tests/test_visualize_wm_lerobotv3.py

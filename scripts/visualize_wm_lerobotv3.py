@@ -141,6 +141,8 @@ def _sample_history(
     solver=None,
     *,
     required_outputs=("q", "dq", "delta_q", "tau"),
+    action_time=None,
+    future_time=None,
 ):
     import torch
     future = int(model.future_horizon)
@@ -165,11 +167,26 @@ def _sample_history(
     actions = torch.as_tensor(actions_np, dtype=torch.float32, device=device)
     inputs["action"] = _normalize(model, "action", actions)
     inputs["action_mask"] = torch.ones((count, action_horizon), dtype=torch.bool, device=device)
+    if action_time is not None:
+        at = torch.as_tensor(np.asarray(action_time, dtype=np.float32), device=device)
+        inputs["action_time"] = at.reshape(1, action_horizon).expand(count, -1)
+    if future_time is not None:
+        ft = torch.as_tensor(np.asarray(future_time, dtype=np.float32), device=device)
+        inputs["future_time"] = ft.reshape(1, future).expand(count, -1)
     with torch.inference_mode():
         encode_started = time.perf_counter()
         encoded = model.encode_conditions(inputs)
         encode_ms = (time.perf_counter() - encode_started) * 1e3
-        encoded = {key: value.repeat_interleave(count, dim=0) if torch.is_tensor(value) and value.shape[0] == 1 else value for key, value in encoded.items()}
+        # Some checkpoints include scalar (0-D) condition metadata alongside
+        # batched tensors.  Accessing ``value.shape[0]`` on those scalars
+        # raises ``IndexError``; only repeat tensors that actually have a
+        # batch dimension.
+        encoded = {
+            key: value.repeat_interleave(count, dim=0)
+            if torch.is_tensor(value) and value.ndim > 0 and value.shape[0] == 1
+            else value
+            for key, value in encoded.items()
+        }
         shape = (count, future, int(model.flow_dim))
         if noise_bank is None:
             noise_bank = torch.randn(shape, device=device)
@@ -289,7 +306,8 @@ def sample(model, arrays, start, samples, noise_bank=None, steps=None, solver=No
     """
 
     history = _history_window(arrays, start, int(model.history_horizon))
-    action = arrays["action"][start : start + int(model.action_condition_horizon)]
+    action = _action_condition(model, arrays["action"], start)
+    action_time, future_time = _relative_times(model, arrays["timestamp"], start)
     prediction, noise_bank, timing = _sample_history(
         model,
         history,
@@ -299,8 +317,31 @@ def sample(model, arrays, start, samples, noise_bank=None, steps=None, solver=No
         steps=steps,
         solver=solver,
         required_outputs=("q",),
+        action_time=action_time, future_time=future_time,
     )
     return prediction["q"], noise_bank, timing
+
+
+def _action_condition(model, actions: np.ndarray, start: int) -> np.ndarray:
+    """Match PINN expert-rate action tokens from a high-rate data stream."""
+    horizon = int(model.action_condition_horizon)
+    # PINN training starts the action chunk one expert token after the state
+    # anchor (action_start_offset=1), so preserve that causal offset here.
+    offset = int(getattr(model, "action_start_offset", 1))
+    indices = int(start) + offset + np.arange(horizon, dtype=np.int64)
+    indices = np.clip(indices, 0, len(actions) - 1)
+    return np.asarray(actions[indices], dtype=np.float64)
+
+
+def _relative_times(model, timestamps: np.ndarray, start: int):
+    """Build the same timestamp-relative grids used by PINN training."""
+    anchor = float(timestamps[int(start)])
+    offset = int(getattr(model, "action_start_offset", 1))
+    ai = int(start) + offset + np.arange(int(model.action_condition_horizon))
+    fi = int(start) + 1 + np.arange(int(model.future_horizon))
+    ai = np.clip(ai, 0, len(timestamps) - 1)
+    fi = np.clip(fi, 0, len(timestamps) - 1)
+    return (timestamps[ai] - anchor) * 1e-9, (timestamps[fi] - anchor) * 1e-9
 
 
 def main(argv=None):
@@ -313,23 +354,33 @@ def main(argv=None):
     parser.add_argument(
         "--rollout-segment-steps",
         type=int,
-        default=16,
+        default=None,
         help="number of predicted high-rate states committed per recursive WM query",
     )
     parser.add_argument(
         "--rollout-segments",
         type=int,
-        default=4,
+        default=None,
         help="number of strict recursive WM segments to visualize",
     )
+    parser.add_argument("--visualization-horizon", type=int, default=None, help="number of predicted trajectory steps to draw (default: full WM horizon)")
     parser.add_argument("--headless", action="store_true", help="run FK without opening a MuJoCo window")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
     if args.max_steps < 1:
         parser.error("--max-steps must be positive")
+    raw = yaml.safe_load(args.config.read_text(encoding="utf-8"))
+    replay_cfg = raw.get("mujoco_visualization", {}) or {}
+    if args.rollout_segment_steps is None:
+        args.rollout_segment_steps = int(replay_cfg.get("execute_steps", 16))
+    if args.rollout_segments is None:
+        args.rollout_segments = 1
+    if args.visualization_horizon is None and replay_cfg.get("trajectory_horizon") is not None:
+        args.visualization_horizon = int(replay_cfg["trajectory_horizon"])
     if args.rollout_segment_steps < 1 or args.rollout_segments < 1:
         parser.error("rollout segment steps and segments must be positive")
-    raw = yaml.safe_load(args.config.read_text(encoding="utf-8"))
+    if args.visualization_horizon is not None and args.visualization_horizon < 1:
+        parser.error("--visualization-horizon must be positive")
     contact = raw.get("contactworldmodel") or raw.get("pinn_checkpoint")
     if not contact:
         raise ValueError("config must declare contactworldmodel/pinn_checkpoint")
@@ -368,11 +419,8 @@ def main(argv=None):
     ee_positions = None
     try:
         last_start = arrays["q"].shape[0] - int(model.action_condition_horizon)
-        for index in range(
-            history - 1,
-            min(last_start, history - 1 + args.max_steps),
-            1 if legacy_q_tau else args.rollout_segment_steps,
-        ):
+        index = history - 1
+        while index < min(last_start, history - 1 + args.max_steps):
             started = time.perf_counter()
             if legacy_q_tau:
                 q, legacy_noise_bank, stage = sample(
@@ -386,31 +434,42 @@ def main(argv=None):
                 )
                 stages = [stage]
             else:
-                q, noise_banks, stages = recursive_rollout(
-                    model,
-                    arrays,
-                    index,
-                    samples,
-                    segment_steps=args.rollout_segment_steps,
-                    segments=args.rollout_segments,
-                    noise_banks=(noise_banks if viz_cfg.use_fixed_noise_bank else [None] * int(args.rollout_segments)),
-                    steps=viz_cfg.flow_steps,
-                    solver=viz_cfg.flow_solver,
+                history_window = _history_window(arrays, index, int(model.history_horizon))
+                action = _action_condition(model, arrays["action"], index)
+                action_time, future_time = _relative_times(model, arrays["timestamp"], index)
+                prediction, noise_bank, stage = _sample_history(
+                    model, history_window, action, samples,
+                    noise_bank=(noise_banks[0] if viz_cfg.use_fixed_noise_bank else None),
+                    steps=viz_cfg.flow_steps, solver=viz_cfg.flow_solver,
+                    action_time=action_time, future_time=future_time,
                 )
+                q = prediction["q"]
+                noise_banks[0] = noise_bank.numpy()
+                stages = [stage]
             timings.append((time.perf_counter() - started) * 1e3)
             stage_timings.extend(stages)
+            # Limit drawn trajectory independently from rollout/execution horizon.
+            draw_q = q if args.visualization_horizon is None else q[:, :args.visualization_horizon, :]
             fk_started = time.perf_counter()
-            ee_positions = fk.predicted_ee_positions(q)
+            ee_positions = fk.predicted_ee_positions(draw_q)
             fk_timings.append((time.perf_counter() - fk_started) * 1e3)
-            viz.publish_prediction(
-                float(arrays["timestamp"][index]), arrays["q"][index], q,
-                prediction_id=index,
-                predicted_ee_position=ee_positions,
-                playback_q=q[0, 0],
-            )
+            execute_count = min(int(args.rollout_segment_steps), int(q.shape[1]))
+            # Play the committed WM prefix at the configured data rate before
+            # taking the next recorded observation for a fresh prediction.
+            period = 1.0 / float(viz_cfg.render_fps)
+            for step in range(execute_count):
+                viz.publish_prediction(
+                    float(arrays["timestamp"][index]) + step * period,
+                    arrays["q"][index], draw_q,
+                    prediction_id=index * 10000 + step,
+                    predicted_ee_position=ee_positions,
+                    playback_q=q[0, step],
+                )
+                time.sleep(period)
+            index += execute_count
     finally:
         viz.close()
-    print(json.dumps({"samples_shape": None if q is None else list(q.shape), "ee_position_shape": None if ee_positions is None else list(ee_positions.shape), "future_horizon": int(model.future_horizon), "rollout_segment_steps": int(args.rollout_segment_steps), "rollout_segments": int(args.rollout_segments), "rollout_mode": "legacy_q_tau_independent" if legacy_q_tau else "strict_recursive", "display_q_source": "wm_sample_0_step_0" if legacy_q_tau else "wm_recursive_sample_0_step_0", "batch_sampling_ms_mean": float(np.mean(timings)) if timings else None, "condition_encoding_ms": float(np.mean([item["condition_encoding_ms"] for item in stage_timings])) if stage_timings else None, "flow_integration_N_ms": float(np.mean([item["flow_integration_N_ms"] for item in stage_timings])) if stage_timings else None, "fk_NxH_ms": float(np.mean(fk_timings)) if fk_timings else None, "status": "ok"}, ensure_ascii=False))
+    print(json.dumps({"samples_shape": None if q is None else list(q.shape), "ee_position_shape": None if ee_positions is None else list(ee_positions.shape), "future_horizon": int(model.future_horizon), "rollout_segment_steps": int(args.rollout_segment_steps), "rollout_segments": int(args.rollout_segments), "visualization_horizon": int(args.visualization_horizon or q.shape[1]) if q is not None else None, "rollout_mode": "legacy_q_tau_independent" if legacy_q_tau else "strict_recursive", "display_q_source": "wm_sample_0_step_0" if legacy_q_tau else "wm_recursive_sample_0_step_0", "batch_sampling_ms_mean": float(np.mean(timings)) if timings else None, "condition_encoding_ms": float(np.mean([item["condition_encoding_ms"] for item in stage_timings])) if stage_timings else None, "flow_integration_N_ms": float(np.mean([item["flow_integration_N_ms"] for item in stage_timings])) if stage_timings else None, "fk_NxH_ms": float(np.mean(fk_timings)) if fk_timings else None, "status": "ok"}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

@@ -20,7 +20,9 @@ class _RecursiveModel(torch.nn.Module):
 
     def encode_conditions(self, inputs):
         self.anchor_actions.append(inputs["action"].detach().cpu().numpy().copy())
-        return inputs
+        # Checkpoints may include scalar condition metadata.  The sampler
+        # should leave 0-D tensors untouched while repeating batched values.
+        return {**inputs, "scalar_metadata": torch.tensor(1.0, device=self.dummy.device)}
 
     def integrate_flow(self, source_noise, encoded, **_kwargs):
         return source_noise

@@ -141,10 +141,15 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
                 "Contact WM ee_pose action_dim must be 7; "
                 f"checkpoint declares {action_dim}"
             )
+        # Keep the runtime buffers on the public (100 Hz) interface.  The
+        # ContactWorldModel itself converts these windows to its checkpoint's
+        # internal rate when ``train.downsample`` is enabled.
         self._contact_history_horizon = int(
-            getattr(model, "history_horizon", data_cfg.get("state_history_horizon", 50))
+            getattr(model, "external_history_horizon", getattr(model, "history_horizon", data_cfg.get("state_history_horizon", 50)))
         )
-        configured_future_horizon = getattr(model, "future_horizon", None)
+        configured_future_horizon = getattr(model, "external_future_horizon", None)
+        if configured_future_horizon is None:
+            configured_future_horizon = getattr(model, "future_horizon", None)
         if configured_future_horizon is None and isinstance(data_cfg, Mapping):
             configured_future_horizon = data_cfg.get("prediction_horizon")
         if configured_future_horizon is None:
@@ -153,7 +158,7 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
         self._contact_action_horizon = int(
             getattr(
                 model,
-                "action_condition_horizon",
+                "external_action_condition_horizon",
                 data_cfg.get("action_condition_horizon", 8),
             )
         )
@@ -253,15 +258,26 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
         # tokens at the same cadence.  A missing value is allowed for injected
         # models and older checkpoints, which then use the Contact WM cadence below.
         dp_step = self.observation_step_s
-        if dp_step is not None and abs(float(dp_step) - expected) > tolerance:
-            raise ValueError(
-                "Contact WM requires DP action cadence to match checkpoint expert_fps: "
-                f"dp={float(dp_step):.9g}s expected={expected:.9g}s"
-            )
+        if dp_step is not None:
+            ratio = float(dp_step) / expected
+            # The upper-level policy may run slower (e.g. 25 Hz) as long as
+            # its trajectory can be expanded to an integer number of 100 Hz
+            # WM action samples.
+            if ratio < 1.0 - tolerance or abs(ratio - round(ratio)) > 1.0e-3:
+                raise ValueError(
+                    "Contact WM requires DP cadence to be an integer multiple "
+                    f"of WM cadence: dp={float(dp_step):.9g}s expected={expected:.9g}s"
+                )
 
     def _action_execution_step_s(self) -> float:
-        """Advance DP/Contact WM action chunks at the checkpoint's expert rate."""
+        """Advance the upper-level plan at its native cadence.
 
+        Contact WM consumes 100 Hz interpolated tokens, while the DP/VLA plan
+        may still contain 25 Hz waypoints.  Execution timing must follow the
+        latter so an 8-point plan spans 320 ms rather than 80 ms.
+        """
+        if self.observation_step_s is not None:
+            return max(float(self.observation_step_s), float(self._contact_action_period_s))
         return float(self._contact_action_period_s)
 
     def reset(self) -> None:
@@ -556,9 +572,9 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
         This is deliberately independent from the legacy ``step`` state.  The
         asynchronous WM worker can therefore run while the DP worker and the
         100 Hz controller continue operating.  ``history`` must expose the
-        four Contact WM streams as ``[50, 7]`` arrays; ``action`` may be a
-        100 Hz ZOH trajectory and is reduced to the checkpoint's eight action
-        tokens at the same 25 Hz cadence used during training.
+        four Contact WM streams as ``[50, 7]`` arrays; ``action`` is converted
+        to the public 100 Hz action horizon. Any checkpoint downsampling is
+        applied inside the ContactWorldModel.
         """
         import torch
 
@@ -576,25 +592,16 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
             arrays[key] = value
 
         # ``action`` is supplied in the DP semantic space (joint or ee_pose).
-        # Convert only after selecting the checkpoint-rate tokens so FK is
-        # evaluated on the exact action samples consumed by the WM.
+        # Keep the action condition on the public external grid. The
+        # checkpoint performs any temporal stride internally.
         action_values = getattr(action, "values", action)
         action_values = np.asarray(action_values, dtype=np.float32)
         if action_values.ndim == 3 and action_values.shape[0] == 1:
             action_values = action_values[0]
         if action_values.ndim != 2 or action_values.shape[1] != 7 or not np.isfinite(action_values).all():
             raise ValueError(f"Contact WM action condition must be [T,7], got {action_values.shape}")
-        # The WM checkpoint was trained with eight 25 Hz action tokens.  The
-        # ActionPlanBuffer supplies a 100 Hz ZOH trajectory, so selecting every
-        # fourth sample preserves the token-at-the-start-of-bin semantics.
         token_count = self._contact_action_horizon
-        if action_values.shape[0] >= token_count:
-            stride = max(1, int(round(action_values.shape[0] / token_count)))
-            indices = np.minimum(np.arange(token_count) * stride, action_values.shape[0] - 1)
-            action_condition = action_values[indices]
-        else:
-            action_condition = np.repeat(action_values[-1:, :], token_count, axis=0)
-            action_condition[: action_values.shape[0]] = action_values
+        action_condition = self._resample_contact_action_condition(action_values)
 
         # The Contact WM checkpoint consumes absolute ee_pose actions.  Keep
         # eepose DP actions unchanged, while converting joint DP actions with
@@ -696,13 +703,7 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
         if action_values.ndim != 2 or action_values.shape[1] != 7 or not np.isfinite(action_values).all():
             raise ValueError(f"Contact WM action condition must be [T,7], got {action_values.shape}")
         token_count = self._contact_action_horizon
-        if action_values.shape[0] >= token_count:
-            stride = max(1, int(round(action_values.shape[0] / token_count)))
-            indices = np.minimum(np.arange(token_count) * stride, action_values.shape[0] - 1)
-            action_condition = action_values[indices]
-        else:
-            action_condition = np.repeat(action_values[-1:, :], token_count, axis=0)
-            action_condition[: action_values.shape[0]] = action_values
+        action_condition = self._resample_contact_action_condition(action_values)
         action_condition = self._actions_for_contact_wm(action_condition)
         device = _model_device(self.pinn)
         inputs = {
@@ -717,42 +718,41 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
         _synchronize_model(self.pinn)
         with torch.inference_mode():
             encode_started = perf_counter()
-            encoded = self.pinn.encode_conditions(inputs)
-            encode_elapsed = perf_counter() - encode_started
             reference = inputs[self._contact_input_keys[0]]
-            expanded = {key: value.repeat_interleave(count, dim=0) if torch.is_tensor(value) and value.shape[0] == 1 else value for key, value in encoded.items()}
-            source_shape = (1, count, self._contact_future_horizon, int(getattr(self.pinn, "flow_dim")))
-            if source_noise is None:
+            noise = None if source_noise is None else torch.as_tensor(source_noise, device=device, dtype=reference.dtype)
+            if noise is None and use_fixed_noise_bank:
                 bank = getattr(self, "_visualization_noise_bank", None)
-                if use_fixed_noise_bank and torch.is_tensor(bank) and tuple(bank.shape) == source_shape:
+                if torch.is_tensor(bank) and tuple(bank.shape) == (1, count, self._contact_future_horizon, int(getattr(self.pinn, "flow_dim"))):
                     noise = bank.to(device=device, dtype=reference.dtype)
-                else:
-                    noise = torch.randn(source_shape, device=device, dtype=reference.dtype)
-                    if use_fixed_noise_bank:
-                        self._visualization_noise_bank = noise.detach().cpu()
-            else:
-                noise = torch.as_tensor(source_noise, device=device, dtype=reference.dtype)
-                if tuple(noise.shape) == source_shape[1:]:
-                    noise = noise[None]
-                if tuple(noise.shape) != source_shape:
-                    raise ValueError(f"source_noise must have shape {source_shape[1:]} or {source_shape}, got {tuple(noise.shape)}")
-            flat_noise = noise.reshape(count, self._contact_future_horizon, noise.shape[-1])
+            if noise is None:
+                noise = torch.randn((1, count, self._contact_future_horizon, int(getattr(self.pinn, "flow_dim"))), device=device, dtype=reference.dtype)
+                if use_fixed_noise_bank:
+                    self._visualization_noise_bank = noise.detach().cpu()
+            if noise.ndim == 3:
+                noise = noise[None]
+            if noise.ndim != 4 or noise.shape[0] != 1 or noise.shape[1] != count or noise.shape[2] != self._contact_future_horizon:
+                raise ValueError("source_noise must have shape [K,T,D] or [1,K,T,D] on the external grid")
             flow_started = perf_counter()
-            generated = self.pinn.integrate_flow(
-                flat_noise,
-                expanded,
+            sampled = self.pinn.sample(
+                inputs,
+                num_samples=count,
                 steps=steps if steps is not None else self._contact_flow_steps,
                 solver=solver or self._contact_flow_solver,
+                source_noise=noise,
             )
+            encode_elapsed = 0.0
             flow_elapsed = perf_counter() - flow_started
-            decoded = self.pinn._decoded_output(generated, expanded)
             result = {}
             for key in ("q", "tau", "dq", "delta_q"):
-                value = decoded.get(f"{key}_pred")
+                value = sampled.get(f"{key}_pred")
                 if value is None:
                     continue
                 value = self._denormalize_pinn_output(key, value)
-                result[key] = value.reshape(1, count, self._contact_future_horizon, 7)[0].detach().cpu().numpy().astype(np.float64)
+                result[key] = value[:, :, :self._contact_future_horizon].detach().cpu().numpy().astype(np.float64)[0]
+            for key in ("contact_logits", "contact_probability", "contact_state_pred"):
+                value = sampled.get(key)
+                if value is not None:
+                    result[key] = value[:, :, :self._contact_future_horizon].detach().cpu().numpy().astype(np.float64)[0]
         _synchronize_model(self.pinn)
         self._last_batch_sampling_time_s = perf_counter() - started
         self._last_sampling_timings = {
@@ -813,12 +813,7 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
             source = source[None]
         if source.ndim != 2 or source.shape[1] != 7:
             raise RuntimeError(f"Contact WM DP action must be [H,7], got {source.shape}")
-        valid = min(source.shape[0], self._contact_action_horizon)
-        values = np.repeat(source[-1:, :], self._contact_action_horizon, axis=0)
-        values[:valid] = source[:valid]
-        # Training pads/holds the direct action chunk and marks every token
-        # valid.  Keep that contract even during startup when only one DP
-        # action is available.
+        values = self._resample_contact_action_condition(source)
         mask = np.ones(self._contact_action_horizon, dtype=np.float32)
         values = self._actions_for_contact_wm(values)
         return (
@@ -843,6 +838,28 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
                 "Contact WM ee_pose action conversion returned an invalid [T,7] array"
             )
         return converted
+
+    def _resample_contact_action_condition(self, actions: np.ndarray) -> np.ndarray:
+        """Map any external action plan to the checkpoint's 100 Hz horizon.
+
+        Training consumes a contiguous high-rate action window.  Keep the
+        same interpolation rule for every inference entry point, including
+        short DP chunks, instead of zero-order padding only the tail.
+        """
+        values = np.asarray(actions, dtype=np.float32)
+        if values.ndim != 2 or values.shape[1] != 7 or values.shape[0] < 1:
+            raise ValueError(f"Contact WM action condition must be [T,7], got {values.shape}")
+        target = self._contact_action_horizon
+        if values.shape[0] == target:
+            return values.copy()
+        if values.shape[0] == 1:
+            return np.repeat(values, target, axis=0)
+        source_axis = np.linspace(0.0, 1.0, values.shape[0])
+        target_axis = np.linspace(0.0, 1.0, target)
+        return np.stack([
+            np.interp(target_axis, source_axis, values[:, dim])
+            for dim in range(values.shape[1])
+        ], axis=1).astype(np.float32, copy=False)
 
     def _idle_contact_output(self, sample: InferenceInput, dp_updated: bool) -> InferenceOutput:
         """Hold the measured state while waiting for the first DP action."""

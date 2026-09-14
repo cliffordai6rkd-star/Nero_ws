@@ -133,6 +133,9 @@ class MujocoVisualizationConfig:
     headless: bool = False
     flow_steps: int | None = None
     flow_solver: str | None = None
+    # Offline WM data inference controls.
+    execute_steps: int = 16
+    trajectory_horizon: int | None = None
 
 
 @dataclass(frozen=True)
@@ -728,6 +731,10 @@ def load_inference_config(path: str | Path) -> InferenceConfig:
         raise ValueError("mujoco_visualization.enabled must be a boolean")
     if mujoco_visualization.num_future_samples < 1:
         raise ValueError("mujoco_visualization.num_future_samples must be positive")
+    if int(mujoco_visualization.execute_steps) < 1:
+        raise ValueError("mujoco_visualization.execute_steps must be positive")
+    if mujoco_visualization.trajectory_horizon is not None and int(mujoco_visualization.trajectory_horizon) < 1:
+        raise ValueError("mujoco_visualization.trajectory_horizon must be positive or null")
     if mujoco_visualization.mujoco_model_path is None and mujoco_visualization.enabled:
         raise ValueError("mujoco_visualization.mujoco_model_path is required when enabled")
     if not mujoco_visualization.ee_site_name and not mujoco_visualization.ee_body_name and mujoco_visualization.enabled:

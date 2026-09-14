@@ -274,8 +274,18 @@ def _draw(viewer: Any, mujoco: Any, observed_position: np.ndarray, trajectories:
         capacity = len(scene.geoms)
         identity = np.eye(3, dtype=np.float64).reshape(-1)
         colors = config.trajectory_colors or ()
+        # Generate one stable-but-random-looking color per sample when no
+        # palette is configured. The seed keeps colors unchanged across
+        # renders while avoiding a config-maintained color list.
+        generated_colors = []
+        if not colors:
+            rng = np.random.default_rng(20260912)
+            generated_colors = [
+                (*rng.uniform(0.25, 0.95, size=3).tolist(), 0.42)
+                for _ in range(len(trajectories))
+            ]
         for sample_index, trajectory in enumerate(trajectories):
-            color = tuple(colors[sample_index % len(colors)]) if colors else ((sample_index * 0.37) % 1.0, 0.75, 0.95, 0.8)
+            color = tuple(colors[sample_index % len(colors)]) if colors else generated_colors[sample_index]
             if len(color) == 3:
                 color = (*color, 0.8)
             for step_index, position in enumerate(trajectory):
