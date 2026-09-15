@@ -20,7 +20,8 @@ architecture:
 
 contactworldmodel:
   # Legacy CARS-WM checkpoint.  It consumes q/dq/delta_q/tau and predicts q/tau.
-  path: ../../../PINN/outputs/cwm_all_50hz/checkpoints/step_00500000.pt
+  # path: ../../../PINN/outputs/cwm_insert_usb_50hz/checkpoints/step_003000000.pt
+  path: ../../../PINN/outputs/cwm_all_100hz/checkpoints/step_00400000.pt
   device: cuda:0
   use_ema: true
 
@@ -123,7 +124,7 @@ wrench_visualization:
 mujoco_visualization:
   enabled: false
   num_future_samples: 30
-  execute_steps: 2
+  execute_steps: 10
   trajectory_horizon: 16
   mujoco_model_path: ../../calibration/data/excitation_validation.scene.xml
   ee_body_name: gripper_base

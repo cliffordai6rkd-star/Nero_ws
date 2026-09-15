@@ -478,13 +478,23 @@ def main(argv=None):
                 solver=viz_cfg.flow_solver,
             )
             stages = [stage]
-            timings.append((time.perf_counter() - started) * 1e3)
+            inference_ms = (time.perf_counter() - started) * 1e3
+            timings.append(inference_ms)
             stage_timings.extend(stages)
             # Limit drawn trajectory independently from rollout/execution horizon.
             draw_q = q if args.visualization_horizon is None else q[:, :args.visualization_horizon, :]
             fk_started = time.perf_counter()
             ee_positions = fk.predicted_ee_positions(draw_q)
-            fk_timings.append((time.perf_counter() - fk_started) * 1e3)
+            fk_ms = (time.perf_counter() - fk_started) * 1e3
+            fk_timings.append(fk_ms)
+            logging.info(
+                "WM step index=%d total_ms=%.3f encode_ms=%.3f flow_ms=%.3f fk_ms=%.3f",
+                index,
+                inference_ms,
+                float(stage.get("condition_encoding_ms", float("nan"))),
+                float(stage.get("flow_integration_N_ms", float("nan"))),
+                fk_ms,
+            )
             internal_execute_count, execute_count = _execution_step_counts(
                 model, args.rollout_segment_steps, q.shape[1]
             )
