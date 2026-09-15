@@ -65,6 +65,9 @@
                       <body name="gripper_base" pos="0 0 0.006">
                         <inertial pos="-0.000183807 8.05033e-05 0.0321437" quat="0.999976 9.08444e-05 0.00689649 0.000788512" mass="0.45" diaginertia="0.000929442 0.000714469 0.000394318" />
                         <geom type="mesh" mesh="gripper_base" name="gripper_base_collision_0" />
+                        <!-- Visualization frame 5 cm along the gripper-local
+                             +Z from the fingertip midpoint. -->
+                        <site name="gripper_fingertip_center" pos="0 0 0.1545" size="0.015" rgba="0.15 0.25 0.35 0.8" />
                         <body name="gripper_link" />
                         <body name="gripper_link1" pos="0 0 0.138" quat="1.89469e-08 1.89469e-08 0.707107 0.707107">
                           <inertial pos="0.000651232 -0.049193 0.00972259" quat="0.477798 0.572974 -0.518028 0.418398" mass="0.025" diaginertia="7.74531e-05 7.36783e-05 5.0886e-06" />

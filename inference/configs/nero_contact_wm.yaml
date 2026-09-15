@@ -122,21 +122,21 @@ wrench_visualization:
 # the arm. Keep enabled=false for unchanged deployment behavior.
 mujoco_visualization:
   enabled: false
-  num_future_samples: 50
-  execute_steps: 5
-  trajectory_horizon: 16
+  num_future_samples: 1000
+  execute_steps: 1
+  trajectory_horizon: 1
   mujoco_model_path: ../../calibration/data/excitation_validation.scene.xml
   ee_body_name: gripper_base
-  ee_site_name: null
+  ee_site_name: gripper_fingertip_center
   robot_joint_names: [joint1, joint2, joint3, joint4, joint5, joint6, joint7]
-  point_size: 0.01
+  point_size: 0.005
   render_fps: 100.0
-  prediction_visualization_hz: 20
+  prediction_visualization_hz: 100
   observed_q_update_hz: 100
   latest_only: true
   use_fixed_noise_bank: true
   headless: false
-  flow_steps: 64
+  flow_steps: 8
   flow_solver: heun
 
 timing:
@@ -145,5 +145,6 @@ timing:
 
 # Offline LeRobot WM replay (scripts/visualize_wm_lerobotv3.py).
 # The checkpoint predicts future_horizon frames (typically 32); only the
-# configured execute_steps are committed before the next WM query. At 100 Hz,
-# 8 steps correspond to 80 ms. visualization_horizon only limits drawn points.
+# configured execute_steps are checkpoint-internal WM tokens. With
+# downsample=true each token expands to two 100 Hz replay frames, so 4 tokens
+# correspond to 8 data rows (80 ms). visualization_horizon only limits points.

@@ -273,31 +273,35 @@ def _draw(viewer: Any, mujoco: Any, observed_position: np.ndarray, trajectories:
         scene.ngeom = 0
         capacity = len(scene.geoms)
         identity = np.eye(3, dtype=np.float64).reshape(-1)
-        colors = config.trajectory_colors or ()
-        # Generate one stable-but-random-looking color per sample when no
-        # palette is configured. The seed keeps colors unchanged across
-        # renders while avoiding a config-maintained color list.
-        generated_colors = []
-        if not colors:
-            rng = np.random.default_rng(20260912)
-            generated_colors = [
-                (*rng.uniform(0.25, 0.95, size=3).tolist(), 0.42)
-                for _ in range(len(trajectories))
-            ]
-        for sample_index, trajectory in enumerate(trajectories):
-            color = tuple(colors[sample_index % len(colors)]) if colors else generated_colors[sample_index]
-            if len(color) == 3:
-                color = (*color, 0.8)
+        # Use one shared translucent yellow for every predicted sample so the
+        # cloud reads as a single WM prediction distribution.
+        trajectory_color = np.asarray((1.0, 0.85, 0.05, 0.45), dtype=np.float32)
+        for trajectory in trajectories:
             for step_index, position in enumerate(trajectory):
                 if scene.ngeom >= capacity:
                     return
-                alpha = float(color[3]) * (1.0 - 0.55 * step_index / max(1, trajectory.shape[0] - 1))
-                rgba = np.asarray((*color[:3], alpha), dtype=np.float32)
+                rgba = trajectory_color
                 size = np.full(3, float(config.point_size) * (1.0 - 0.35 * step_index / max(1, trajectory.shape[0] - 1)))
                 mujoco.mjv_initGeom(scene.geoms[scene.ngeom], mujoco.mjtGeom.mjGEOM_SPHERE, size, position, identity, rgba)
                 scene.ngeom += 1
         if scene.ngeom < capacity:
-            mujoco.mjv_initGeom(scene.geoms[scene.ngeom], mujoco.mjtGeom.mjGEOM_SPHERE, np.full(3, float(config.point_size) * 1.25), observed_position, identity, np.asarray((1.0, 1.0, 1.0, 1.0), dtype=np.float32))
+            # Mark the current displayed TCP pose separately from the sampled
+            # future points: a translucent red box remains easy to distinguish
+            # while still showing the trajectory behind it.
+            # Keep the current-observation marker visible when trajectory
+            # points are configured very small.  ``point_size`` controls only
+            # the predicted samples; the marker has a practical lower bound.
+            marker_edge = max(float(config.point_size) * 2.5, 0.012)
+            marker_size = np.full(3, marker_edge)
+            marker_rgba = np.asarray((1.0, 0.05, 0.05, 0.55), dtype=np.float32)
+            mujoco.mjv_initGeom(
+                scene.geoms[scene.ngeom],
+                mujoco.mjtGeom.mjGEOM_BOX,
+                marker_size,
+                observed_position,
+                identity,
+                marker_rgba,
+            )
             scene.ngeom += 1
 
 
@@ -375,7 +379,15 @@ def _visualizer_process(config: Any, sample_queue: Any) -> None:
             if viewer is not None and time.monotonic() >= next_render:
                 render_started = time.perf_counter()
                 display_q = latest.playback_q if latest.playback_q is not None else latest.observed_q
-                _draw(viewer, mujoco, _forward_position(mujoco, model, display_data, addresses, display_q, ee_id, ee_kind), latest_trajectory, config)
+                # Keep the reference marker tied to the measured/recorded
+                # observation.  Offline replay may display a predicted
+                # playback_q on the robot, but comparing the WM trajectory to
+                # that moving pose would hide its offset from the true anchor.
+                observed_position = _forward_position(
+                    mujoco, model, scratch_data, addresses,
+                    latest.observed_q, ee_id, ee_kind,
+                )
+                _draw(viewer, mujoco, observed_position, latest_trajectory, config)
                 viewer.sync()
                 render_elapsed_ms = (time.perf_counter() - render_started) * 1e3
                 if not timing_reported:

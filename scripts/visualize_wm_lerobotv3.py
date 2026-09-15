@@ -147,6 +147,8 @@ def _sample_history(
     import torch
     future = int(model.future_horizon)
     action_horizon = int(model.action_condition_horizon)
+    stride = int(getattr(model, "temporal_stride", 1))
+    external_history = int(getattr(model, "external_history_horizon", int(model.history_horizon) * stride))
     device = next(model.parameters()).device
     count = int(samples)
     if count < 1:
@@ -154,6 +156,11 @@ def _sample_history(
     inputs = {}
     for key in model.inputs:
         values = np.asarray(history[key], dtype=np.float64)
+        if stride > 1:
+            if values.ndim == 2 and values.shape[0] == external_history:
+                values = values[::stride]
+            elif values.ndim == 3 and values.shape[1] == external_history:
+                values = values[:, ::stride]
         if values.ndim == 2:
             values = np.repeat(values[None], count, axis=0)
         if values.shape != (count, int(model.history_horizon), 7):
@@ -211,7 +218,10 @@ def _sample_history(
         if normalizer is not None and key in (metadata.get("normalize_lowdim_keys") or ()):
             mode = metadata.get("normalize_mode", "gaussian")
             value = getattr(normalizer, f"{mode}_denormalize")(key, value)
-        output[key] = value.detach().cpu().numpy().astype(np.float64)
+        value = value.detach().cpu().numpy().astype(np.float64)
+        if stride > 1:
+            value = np.repeat(value, stride, axis=1)
+        output[key] = value
     required_outputs = tuple(required_outputs)
     missing_required = [key for key in required_outputs if key in missing]
     if missing_required:
@@ -245,8 +255,9 @@ def recursive_rollout(
     rows; its tail is held when the episode has no more action rows.
     """
 
-    history_horizon = int(model.history_horizon)
-    future_horizon = int(model.future_horizon)
+    stride = int(getattr(model, "temporal_stride", 1))
+    history_horizon = int(getattr(model, "external_history_horizon", int(model.history_horizon) * stride))
+    future_horizon = int(getattr(model, "external_future_horizon", int(model.future_horizon) * stride))
     segment_steps = int(segment_steps)
     segments = int(segments)
     if segment_steps < 1 or segment_steps > future_horizon:
@@ -277,7 +288,11 @@ def recursive_rollout(
     timings = []
     for segment_index in range(segments):
         action_start = int(start) + segment_index * segment_steps
-        action = arrays["action"][action_start : action_start + int(model.action_condition_horizon)]
+        action = (
+            _action_condition(model, arrays["action"], action_start)
+            if stride > 1
+            else arrays["action"][action_start : action_start + int(model.action_condition_horizon)]
+        )
         prediction, noise_bank, timing = _sample_history(
             model,
             history,
@@ -297,15 +312,11 @@ def recursive_rollout(
 
 
 def sample(model, arrays, start, samples, noise_bank=None, steps=None, solver=None):
-    """Legacy one-segment q/tau checkpoint sampling helper.
+    """Sample one WM window from the recorded external-rate history."""
 
-    Older CARS-WM checkpoints predict only ``q`` and ``tau``.  They are not
-    recursively reconditionable because they do not emit the ``dq`` and
-    ``delta_q`` streams needed to form the next history window, so replay keeps
-    the original independent-window behavior.
-    """
-
-    history = _history_window(arrays, start, int(model.history_horizon))
+    stride = int(getattr(model, "temporal_stride", 1))
+    history_horizon = int(getattr(model, "external_history_horizon", int(model.history_horizon) * stride))
+    history = _history_window(arrays, start, history_horizon)
     action = _action_condition(model, arrays["action"], start)
     action_time, future_time = _relative_times(model, arrays["timestamp"], start)
     prediction, noise_bank, timing = _sample_history(
@@ -324,24 +335,39 @@ def sample(model, arrays, start, samples, noise_bank=None, steps=None, solver=No
 
 def _action_condition(model, actions: np.ndarray, start: int) -> np.ndarray:
     """Match PINN expert-rate action tokens from a high-rate data stream."""
-    horizon = int(model.action_condition_horizon)
+    stride = int(getattr(model, "temporal_stride", 1))
+    horizon = int(getattr(model, "external_action_condition_horizon", int(model.action_condition_horizon) * stride))
     # PINN training starts the action chunk one expert token after the state
     # anchor (action_start_offset=1), so preserve that causal offset here.
     offset = int(getattr(model, "action_start_offset", 1))
     indices = int(start) + offset + np.arange(horizon, dtype=np.int64)
     indices = np.clip(indices, 0, len(actions) - 1)
-    return np.asarray(actions[indices], dtype=np.float64)
+    values = np.asarray(actions[indices], dtype=np.float64)
+    return values[::stride] if stride > 1 else values
 
 
 def _relative_times(model, timestamps: np.ndarray, start: int):
     """Build the same timestamp-relative grids used by PINN training."""
     anchor = float(timestamps[int(start)])
     offset = int(getattr(model, "action_start_offset", 1))
-    ai = int(start) + offset + np.arange(int(model.action_condition_horizon))
-    fi = int(start) + 1 + np.arange(int(model.future_horizon))
+    stride = int(getattr(model, "temporal_stride", 1))
+    action_horizon = int(getattr(model, "external_action_condition_horizon", int(model.action_condition_horizon) * stride))
+    future_horizon = int(getattr(model, "external_future_horizon", int(model.future_horizon) * stride))
+    ai = int(start) + offset + np.arange(action_horizon)
+    fi = int(start) + 1 + np.arange(future_horizon)
     ai = np.clip(ai, 0, len(timestamps) - 1)
     fi = np.clip(fi, 0, len(timestamps) - 1)
-    return (timestamps[ai] - anchor) * 1e-9, (timestamps[fi] - anchor) * 1e-9
+    return ((timestamps[ai] - anchor) * 1e-9)[::stride], ((timestamps[fi] - anchor) * 1e-9)[::stride]
+
+
+def _execution_step_counts(model, requested_steps: int, available_external: int) -> tuple[int, int]:
+    """Convert internal WM execution tokens to external-rate replay frames."""
+    stride = int(getattr(model, "temporal_stride", 1))
+    if stride < 1:
+        raise ValueError(f"model temporal_stride must be positive, got {stride}")
+    internal = min(int(requested_steps), int(getattr(model, "future_horizon")))
+    external = min(internal * stride, int(available_external))
+    return internal, external
 
 
 def main(argv=None):
@@ -396,56 +422,39 @@ def main(argv=None):
     viz.start()
     fk = MujocoKinematicFK(viz_cfg)
     arrays = _load_parquet(args.episode, args.action_key)
-    history = int(model.history_horizon)
+    temporal_stride = int(getattr(model, "temporal_stride", 1))
+    history = int(getattr(model, "external_history_horizon", int(model.history_horizon) * temporal_stride))
     samples = int(viz_cfg.num_future_samples)
-    model_outputs = set(getattr(model, "outputs", ()) or ())
-    legacy_q_tau = model_outputs == {"q", "tau"}
-    if legacy_q_tau and (args.rollout_segment_steps != 1 or args.rollout_segments != 1):
-        logging.warning(
-            "checkpoint outputs only q/tau; ignoring recursive rollout settings "
-            "and using the legacy independent-window sampler"
-        )
     if args.rollout_segment_steps > int(model.future_horizon):
         parser.error(
             "--rollout-segment-steps cannot exceed the checkpoint future horizon "
-            f"({int(model.future_horizon)})"
+            f"({int(model.future_horizon)} internal tokens)"
         )
-    noise_banks = [None] * int(args.rollout_segments)
-    legacy_noise_bank = None
+    noise_bank = None
     timings = []
     stage_timings = []
     fk_timings = []
     q = None
     ee_positions = None
+    previous_playback_last_q = None
     try:
-        last_start = arrays["q"].shape[0] - int(model.action_condition_horizon)
+        external_action_horizon = int(
+            getattr(model, "external_action_condition_horizon", int(model.action_condition_horizon) * temporal_stride)
+        )
+        last_start = arrays["q"].shape[0] - external_action_horizon
         index = history - 1
         while index < min(last_start, history - 1 + args.max_steps):
             started = time.perf_counter()
-            if legacy_q_tau:
-                q, legacy_noise_bank, stage = sample(
-                    model,
-                    arrays,
-                    index,
-                    samples,
-                    noise_bank=(legacy_noise_bank if viz_cfg.use_fixed_noise_bank else None),
-                    steps=viz_cfg.flow_steps,
-                    solver=viz_cfg.flow_solver,
-                )
-                stages = [stage]
-            else:
-                history_window = _history_window(arrays, index, int(model.history_horizon))
-                action = _action_condition(model, arrays["action"], index)
-                action_time, future_time = _relative_times(model, arrays["timestamp"], index)
-                prediction, noise_bank, stage = _sample_history(
-                    model, history_window, action, samples,
-                    noise_bank=(noise_banks[0] if viz_cfg.use_fixed_noise_bank else None),
-                    steps=viz_cfg.flow_steps, solver=viz_cfg.flow_solver,
-                    action_time=action_time, future_time=future_time,
-                )
-                q = prediction["q"]
-                noise_banks[0] = noise_bank.numpy()
-                stages = [stage]
+            q, noise_bank, stage = sample(
+                model,
+                arrays,
+                index,
+                samples,
+                noise_bank=(noise_bank if viz_cfg.use_fixed_noise_bank else None),
+                steps=viz_cfg.flow_steps,
+                solver=viz_cfg.flow_solver,
+            )
+            stages = [stage]
             timings.append((time.perf_counter() - started) * 1e3)
             stage_timings.extend(stages)
             # Limit drawn trajectory independently from rollout/execution horizon.
@@ -453,10 +462,34 @@ def main(argv=None):
             fk_started = time.perf_counter()
             ee_positions = fk.predicted_ee_positions(draw_q)
             fk_timings.append((time.perf_counter() - fk_started) * 1e3)
-            execute_count = min(int(args.rollout_segment_steps), int(q.shape[1]))
+            internal_execute_count, execute_count = _execution_step_counts(
+                model, args.rollout_segment_steps, q.shape[1]
+            )
+            current_first_q = np.asarray(q[0, 0], dtype=np.float64)
+            current_last_q = np.asarray(q[0, execute_count - 1], dtype=np.float64)
+            boundary_jump = (
+                None
+                if previous_playback_last_q is None
+                else float(np.linalg.norm(current_first_q - previous_playback_last_q))
+            )
+            logging.debug(
+                "WM window index=%d execute_internal=%d execute_external=%d physical_ms=%.1f boundary_jump_rad=%s",
+                index,
+                internal_execute_count,
+                execute_count,
+                1000.0 * execute_count / float(viz_cfg.render_fps),
+                "n/a" if boundary_jump is None else f"{boundary_jump:.6f}",
+            )
             # Play the committed WM prefix at the configured data rate before
             # taking the next recorded observation for a fresh prediction.
             period = 1.0 / float(viz_cfg.render_fps)
+            # Refresh the visualizer's observed-state cache once per WM loop.
+            # publish_prediction intentionally uses that cache (rather than
+            # its positional observed_q argument) so online delayed packets
+            # cannot overwrite a newer observation.
+            viz.publish_observed(
+                float(arrays["timestamp"][index]), arrays["q"][index]
+            )
             for step in range(execute_count):
                 viz.publish_prediction(
                     float(arrays["timestamp"][index]) + step * period,
@@ -466,10 +499,11 @@ def main(argv=None):
                     playback_q=q[0, step],
                 )
                 time.sleep(period)
+            previous_playback_last_q = current_last_q
             index += execute_count
     finally:
         viz.close()
-    print(json.dumps({"samples_shape": None if q is None else list(q.shape), "ee_position_shape": None if ee_positions is None else list(ee_positions.shape), "future_horizon": int(model.future_horizon), "rollout_segment_steps": int(args.rollout_segment_steps), "rollout_segments": int(args.rollout_segments), "visualization_horizon": int(args.visualization_horizon or q.shape[1]) if q is not None else None, "rollout_mode": "legacy_q_tau_independent" if legacy_q_tau else "strict_recursive", "display_q_source": "wm_sample_0_step_0" if legacy_q_tau else "wm_recursive_sample_0_step_0", "batch_sampling_ms_mean": float(np.mean(timings)) if timings else None, "condition_encoding_ms": float(np.mean([item["condition_encoding_ms"] for item in stage_timings])) if stage_timings else None, "flow_integration_N_ms": float(np.mean([item["flow_integration_N_ms"] for item in stage_timings])) if stage_timings else None, "fk_NxH_ms": float(np.mean(fk_timings)) if fk_timings else None, "status": "ok"}, ensure_ascii=False))
+    print(json.dumps({"samples_shape": None if q is None else list(q.shape), "ee_position_shape": None if ee_positions is None else list(ee_positions.shape), "future_horizon": int(model.future_horizon), "external_future_horizon": int(getattr(model, "external_future_horizon", q.shape[1] if q is not None else model.future_horizon)), "rollout_segment_steps": int(args.rollout_segment_steps), "rollout_segments": int(args.rollout_segments), "visualization_horizon": int(args.visualization_horizon or q.shape[1]) if q is not None else None, "rollout_mode": "independent_recorded_history", "display_q_source": "wm_sample_0_step_0", "batch_sampling_ms_mean": float(np.mean(timings)) if timings else None, "condition_encoding_ms": float(np.mean([item["condition_encoding_ms"] for item in stage_timings])) if stage_timings else None, "flow_integration_N_ms": float(np.mean([item["flow_integration_N_ms"] for item in stage_timings])) if stage_timings else None, "fk_NxH_ms": float(np.mean(fk_timings)) if fk_timings else None, "status": "ok"}, ensure_ascii=False))
 
 
 if __name__ == "__main__":
