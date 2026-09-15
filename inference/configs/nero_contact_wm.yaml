@@ -20,7 +20,7 @@ architecture:
 
 contactworldmodel:
   # Legacy CARS-WM checkpoint.  It consumes q/dq/delta_q/tau and predicts q/tau.
-  path: ../../../PINN/outputs/cwm_insert_usb_50hz/checkpoints/step_00500000.pt
+  path: ../../../PINN/outputs/cwm_all_50hz/checkpoints/step_00500000.pt
   device: cuda:0
   use_ema: true
 
@@ -122,21 +122,21 @@ wrench_visualization:
 # the arm. Keep enabled=false for unchanged deployment behavior.
 mujoco_visualization:
   enabled: false
-  num_future_samples: 1000
-  execute_steps: 1
-  trajectory_horizon: 1
+  num_future_samples: 30
+  execute_steps: 2
+  trajectory_horizon: 16
   mujoco_model_path: ../../calibration/data/excitation_validation.scene.xml
   ee_body_name: gripper_base
   ee_site_name: gripper_fingertip_center
   robot_joint_names: [joint1, joint2, joint3, joint4, joint5, joint6, joint7]
-  point_size: 0.005
+  point_size: 0.001
   render_fps: 100.0
   prediction_visualization_hz: 100
   observed_q_update_hz: 100
   latest_only: true
   use_fixed_noise_bank: true
   headless: false
-  flow_steps: 8
+  flow_steps: 32
   flow_solver: heun
 
 timing:

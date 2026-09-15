@@ -43,7 +43,7 @@ from inference.mujoco_visualization import MujocoKinematicFK, MujocoKinematicVis
 from inference.async_fast_slow import StateHistorySnapshot, ActionTrajectory
 
 
-def _load_parquet(source: Path, action_key: str) -> dict[str, np.ndarray]:
+def _load_parquet(source: Path, action_key: str, episode_index: int | None = None) -> dict[str, np.ndarray]:
     try:
         import pyarrow.parquet as pq
     except Exception as exc:
@@ -65,12 +65,26 @@ def _load_parquet(source: Path, action_key: str) -> dict[str, np.ndarray]:
     missing = sorted(required - names)
     if missing:
         raise ValueError(f"dataset is missing required WM fields: {missing}")
+    if "timing.action_index" not in names and "timing.action_anchor_timestamp_ns" not in names:
+        raise ValueError("dataset requires timing.action_index or timing.action_anchor_timestamp_ns")
+    if "episode_index" in names:
+        episodes = np.asarray(table["episode_index"].to_pylist())
+        unique = np.unique(episodes)
+        if episode_index is None and len(unique) != 1:
+            raise ValueError("dataset contains multiple episodes; pass --episode-index explicitly")
+        if episode_index is not None:
+            mask = episodes == episode_index
+            if not np.any(mask):
+                raise ValueError(f"episode-index {episode_index} not present in dataset")
+            table = table.filter(__import__("pyarrow").array(mask))
+    elif episode_index is not None:
+        raise ValueError("dataset has no episode_index field; cannot select requested episode")
     def col(name, width=None):
         value = np.asarray(table[name].to_pylist(), dtype=np.float64)
         if width is not None:
             value = value.reshape(-1, width)
         return value
-    tau_name = "observation.tau_f" if "observation.tau_f" in names else "observation.torque"
+    tau_name = "observation.torque"
     return {
         "q": col("observation.joint", 7),
         "dq": col("observation.velocity", 7),
@@ -78,6 +92,11 @@ def _load_parquet(source: Path, action_key: str) -> dict[str, np.ndarray]:
         "delta_q": col("observation.delta_q", 7),
         "action": col(action_key, 7),
         "timestamp": col("timestamp").reshape(-1),
+        "action_index": (col("timing.action_index").reshape(-1).astype(np.int64)
+                         if "timing.action_index" in names else
+                         np.searchsorted(col("timestamp").reshape(-1), col("timing.action_anchor_timestamp_ns").reshape(-1))),
+        "action_anchor_timestamp_ns": (col("timing.action_anchor_timestamp_ns").reshape(-1)
+                                        if "timing.action_anchor_timestamp_ns" in names else col("timestamp").reshape(-1)),
     }
 
 
@@ -288,11 +307,7 @@ def recursive_rollout(
     timings = []
     for segment_index in range(segments):
         action_start = int(start) + segment_index * segment_steps
-        action = (
-            _action_condition(model, arrays["action"], action_start)
-            if stride > 1
-            else arrays["action"][action_start : action_start + int(model.action_condition_horizon)]
-        )
+        action = _action_condition(model, arrays["action"], action_start, arrays.get("action_index"))
         prediction, noise_bank, timing = _sample_history(
             model,
             history,
@@ -317,7 +332,7 @@ def sample(model, arrays, start, samples, noise_bank=None, steps=None, solver=No
     stride = int(getattr(model, "temporal_stride", 1))
     history_horizon = int(getattr(model, "external_history_horizon", int(model.history_horizon) * stride))
     history = _history_window(arrays, start, history_horizon)
-    action = _action_condition(model, arrays["action"], start)
+    action = _action_condition(model, arrays["action"], start, arrays.get("action_index"))
     action_time, future_time = _relative_times(model, arrays["timestamp"], start)
     prediction, noise_bank, timing = _sample_history(
         model,
@@ -333,16 +348,22 @@ def sample(model, arrays, start, samples, noise_bank=None, steps=None, solver=No
     return prediction["q"], noise_bank, timing
 
 
-def _action_condition(model, actions: np.ndarray, start: int) -> np.ndarray:
+def _action_condition(model, actions: np.ndarray, start: int, action_indices: np.ndarray | None = None) -> np.ndarray:
     """Match PINN expert-rate action tokens from a high-rate data stream."""
     stride = int(getattr(model, "temporal_stride", 1))
     horizon = int(getattr(model, "external_action_condition_horizon", int(model.action_condition_horizon) * stride))
     # PINN training starts the action chunk one expert token after the state
     # anchor (action_start_offset=1), so preserve that causal offset here.
     offset = int(getattr(model, "action_start_offset", 1))
-    indices = int(start) + offset + np.arange(horizon, dtype=np.int64)
-    indices = np.clip(indices, 0, len(actions) - 1)
-    values = np.asarray(actions[indices], dtype=np.float64)
+    if action_indices is None:
+        raise ValueError("timing.action_index is required for action alignment")
+    anchor = int(action_indices[int(start)])
+    token_ids = anchor + offset + np.arange(horizon, dtype=np.int64)
+    # Resolve token ids against the recorded timing index; this preserves
+    # irregular low-rate action cadence and never substitutes state stride.
+    positions = np.searchsorted(np.asarray(action_indices, dtype=np.int64), token_ids, side="left")
+    positions = np.clip(positions, 0, len(actions) - 1)
+    values = np.asarray(actions[positions], dtype=np.float64)
     return values[::stride] if stride > 1 else values
 
 
@@ -377,6 +398,8 @@ def main(argv=None):
     parser.add_argument("--episode", required=True, type=Path)
     parser.add_argument("--action-key", default="action.ee_pose")
     parser.add_argument("--max-steps", type=int, default=300)
+    parser.add_argument("--episode-index", type=int, default=None,
+                        help="episode id when the parquet contains multiple episodes")
     parser.add_argument(
         "--rollout-segment-steps",
         type=int,
@@ -421,7 +444,7 @@ def main(argv=None):
     viz = MujocoKinematicVisualizer(viz_cfg)
     viz.start()
     fk = MujocoKinematicFK(viz_cfg)
-    arrays = _load_parquet(args.episode, args.action_key)
+    arrays = _load_parquet(args.episode, args.action_key, args.episode_index)
     temporal_stride = int(getattr(model, "temporal_stride", 1))
     history = int(getattr(model, "external_history_horizon", int(model.history_horizon) * temporal_stride))
     samples = int(viz_cfg.num_future_samples)

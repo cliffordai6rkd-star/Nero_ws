@@ -273,9 +273,9 @@ def _draw(viewer: Any, mujoco: Any, observed_position: np.ndarray, trajectories:
         scene.ngeom = 0
         capacity = len(scene.geoms)
         identity = np.eye(3, dtype=np.float64).reshape(-1)
-        # Use one shared translucent yellow for every predicted sample so the
-        # cloud reads as a single WM prediction distribution.
-        trajectory_color = np.asarray((1.0, 0.85, 0.05, 0.45), dtype=np.float32)
+        # Use a highly transparent light green for the displayed q prediction
+        # samples so the cloud remains visible without obscuring the robot.
+        trajectory_color = np.asarray((0.55, 0.5, 0.65, 1.0), dtype=np.float32)
         for trajectory in trajectories:
             for step_index, position in enumerate(trajectory):
                 if scene.ngeom >= capacity:
@@ -293,7 +293,7 @@ def _draw(viewer: Any, mujoco: Any, observed_position: np.ndarray, trajectories:
             # the predicted samples; the marker has a practical lower bound.
             marker_edge = max(float(config.point_size) * 2.5, 0.012)
             marker_size = np.full(3, marker_edge)
-            marker_rgba = np.asarray((1.0, 0.05, 0.05, 0.55), dtype=np.float32)
+            marker_rgba = np.asarray((1.0, 0.0, 0.0, 0.28), dtype=np.float32)
             mujoco.mjv_initGeom(
                 scene.geoms[scene.ngeom],
                 mujoco.mjtGeom.mjGEOM_BOX,
