@@ -1,0 +1,86 @@
+# Independent configuration. Paths are relative to THIS file; no DP checkpoint.
+pi0:
+  host: localhost
+  port: 8000
+  prompt: insert the USB connector
+  action_hz: 25
+  consume_steps: 50
+  output_key: actions
+  quaternion_tolerance: 0.15
+  interface:
+    # Replace with the ACTUAL Nero EE-pose LoRA TrainConfig name on the server.
+    training_config: null
+    state_key: state
+    prompt_key: prompt
+    images: {side: images/side, wrist: images/wrist}
+    state_semantic: observation.ee_pose
+    action_semantic: action.ee_pose
+    coordinate_frame: link7
+    representation: xyz_quaternion
+    quaternion_order: xyzw
+    image_format: uint8_hwc_rgb
+    output_space: physical_absolute
+    action_hz: 25
+wm:
+  pinn_root: ../../../PINN
+  checkpoint: ../../../PINN/outputs/cwm_insert_usb_100hz_80step/checkpoints/latest.pt
+  device: cuda:0
+  use_ema: true
+  num_samples: 1
+  selected_sample: 0
+  flow_steps: 8
+  solver: heun
+  preprocessing:
+    # Recorded evidence, not the possibly changed conversion YAML. Read-only.
+    timeline: ../../runs/swm/insert_usb_lerobot_v3/meta/world_model_timeline.json
+    source_h5: ../../runs/insert_usb/episode_0189_20260822_161110.h5
+control:
+  hz: 100
+  execute_steps: 20  # external commands, always 200 ms; model horizon unchanged
+  maximum_steps: 3000
+  maximum_state_age_s: 0.1
+  maximum_camera_age_s: 0.3
+calibration:
+  warmup_samples: 3
+  minimum_samples: 10
+  wm_seconds: 1.0
+  pi_seconds: 1.0
+  wm_margin_s: 0.02
+  pi_margin_s: 0.08
+  request_timeout_s: 30.0
+hardware:
+  backend: pyagx
+  endpoint:
+    name: follower
+    channel: can0
+    interface: socketcan
+    firmware: V120
+  # Match the installed robot URDF; tighter limits may be configured.
+  q_min: [-2.70526, -1.74, -2.75, -1.01, -2.75, -0.73, -1.5707963]
+  q_max: [2.70526, 1.74, 2.75, 2.14, 2.75, 0.95, 1.5707963]
+  maximum_step_rad: [0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02]
+cameras:
+  - name: side
+    backend: v4l2
+    device: /dev/video0
+    width: 640
+    height: 480
+    fps: 25
+    visualize: true
+  - name: wrist
+    backend: v4l2
+    device: /dev/video2
+    width: 640
+    height: 480
+    fps: 25
+    visualize: true
+mujoco:
+  enabled: true
+  headless: false
+  mujoco_model_path: ../../calibration/data/excitation_validation.scene.xml
+  robot_joint_names: [joint1, joint2, joint3, joint4, joint5, joint6, joint7]
+  ee_body_name: link7
+  ee_site_name: null
+  render_fps: 25
+  prediction_visualization_hz: 100
+  point_size: 0.003
