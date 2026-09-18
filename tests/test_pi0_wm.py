@@ -2,13 +2,14 @@ from pathlib import Path
 import sys
 import threading
 import time
+import types
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from inference.pi0_wm.core import Execution, Plans, MissingActions, Request, Result, Schedule, Worker, pi_trigger
-from inference.pi0_wm.wm import CausalChain, History, WMAdapter
+from inference.pi0_wm.wm import CausalChain, History, WMAdapter, checkpoint_preprocessing
 from inference.pi0_wm.config import load_config
 
 
@@ -142,6 +143,111 @@ def test_config_independent_of_dp_and_explicit_modes():
     assert config['wm']['num_samples'] == 1
     assert 'dp_checkpoint' not in config
     assert config['pi0']['consume_steps'] == 50
+    assert 'preprocessing' not in config['wm']
+
+
+def test_checkpoint_preprocessing_has_no_offline_metadata_dependency():
+    data = {'dq_source': 'hardware'}
+    filters = {
+        key: {'enabled': False, 'operations': [], 'dataset_preprocessed_operations': []}
+        for key in ('q', 'dq', 'delta_q', 'tau')
+    }
+    assert checkpoint_preprocessing(data, filters) == ('hardware', {})
+
+
+def test_wm_adapter_initializes_without_offline_preprocessing_paths(monkeypatch, tmp_path):
+    import torch
+
+    class FakeModel:
+        inputs = ('q',)
+        predicted_state_streams = ('q',)
+
+        def __init__(self, config):
+            self.config = config
+
+        def validate_checkpoint(self, payload):
+            return {
+                'external_history_horizon': 1, 'external_future_horizon': 1,
+                'external_action_horizon': 1, 'input_state_streams': ['q'],
+                'predicted_continuous_streams': ['q'], 'joint_dim': 7,
+                'action': {'dimension': 7, 'start_offset': 0,
+                           'type': 'absolute_ee_pose',
+                           'representation': 'xyz_quaternion',
+                           'quaternion_order': 'xyzw',
+                           'quaternion_sign': 'canonical_w_nonnegative',
+                           'coordinate_frame': 'link7',
+                           'absolute_or_relative': 'absolute',
+                           'inference_delay_s': 0.0},
+                'external_state_rate_hz': 100, 'action_rate_hz': 25,
+                'flow': {'steps': 1, 'solver': 'euler'},
+            }
+
+        def load_state_dict(self, state, strict=True):
+            return None
+
+        def to(self, device):
+            return self
+
+        def eval(self):
+            return self
+
+    class FakeNormalizer:
+        def __init__(self, stats, eps):
+            pass
+
+    modules = {
+        'model': types.ModuleType('model'),
+        'model.pinn_model': types.ModuleType('model.pinn_model'),
+        'model.pinn_model.contact_world_model': types.ModuleType('model.pinn_model.contact_world_model'),
+        'train': types.ModuleType('train'),
+        'train.nomalizer': types.ModuleType('train.nomalizer'),
+        'data_process': types.ModuleType('data_process'),
+        'data_process.causal_data_filter': types.ModuleType('data_process.causal_data_filter'),
+    }
+    modules['model.pinn_model.contact_world_model'].ContactWorldModel = FakeModel
+    modules['train.nomalizer'].Normalizer = FakeNormalizer
+    modules['data_process.causal_data_filter'].normalize_dataloader_filters = lambda data: {}
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    cfg = {
+        'dataloader': {'dq_source': 'hardware', 'normalize_mode': 'gaussian',
+                       'normalize_lowdim_keys': [], 'filters': {}},
+        'train': {'ema': {'enabled': False}},
+    }
+    payload = {'config': cfg, 'model': {}, 'normalizer': {'stats': {}},
+               'dataloader_filters': {}, 'sample_rate_hz': 100}
+    monkeypatch.setattr(torch, 'load', lambda *args, **kwargs: payload)
+    from inference.pi0_wm.wm import WMAdapter
+
+    adapter = WMAdapter({'pinn_root': str(tmp_path), 'checkpoint': 'missing.pt',
+                         'use_ema': False, 'device': 'cpu', 'num_samples': 1,
+                         'flow_steps': 1, 'solver': 'euler'}, 100, 25)
+    assert adapter.dq_source == 'hardware'
+    assert adapter.operations == {}
+
+
+def test_checkpoint_preprocessing_restores_only_pending_causal_operations():
+    data = {'dq_source': 'backward_difference'}
+    filters = {
+        'q': {'enabled': True,
+              'operations': [{'type': 'lowpass', 'cutoff_hz': 15.0, 'order': 2}],
+              'dataset_preprocessed_operations':
+                  [{'type': 'lowpass', 'cutoff_hz': 15.0, 'order': 2}]},
+        'dq': {'enabled': True,
+               'operations': [{'type': 'lowpass', 'cutoff_hz': 15.0}],
+               'dataset_preprocessed_operations': []},
+    }
+    source, operations = checkpoint_preprocessing(data, filters)
+    assert source == 'backward_difference'
+    assert operations == {'dq': [{'type': 'lowpass', 'cutoff_hz': 15.0}]}
+
+
+def test_unknown_checkpoint_dq_source_fails_closed():
+    with pytest.raises(ValueError, match='dq source'):
+        checkpoint_preprocessing({}, {})
+    with pytest.raises(ValueError, match='unsupported checkpoint dq source'):
+        checkpoint_preprocessing({'dq_source': 'unknown'}, {})
 
 
 def test_position_limits_record_only_successful_sent_command():

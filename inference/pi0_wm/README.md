@@ -44,23 +44,25 @@ EE pose 是 base→link7 的 `xyz + quaternion_xyzw`（米，四元数规范为 
 server 用官方 `create_trained_policy()` 从 checkpoint/assets 恢复 normalization，执行训练的输入和逆输出变换。
 机器人只接收物理绝对 EE action，再用 WM 自己的 normalizer 归一化。
 
-WM 预处理不能简单把 `source_already_filtered` 理解为硬件已滤波。
-实现读取 `wm.preprocessing.source_h5` 的原始字段属性和 `timeline` 的实际导出滤波记录，
-然后追加 checkpoint 中**未在数据集执行**的训练滤波，保持连续因果状态。
-当前示例数据：
+边缘端不需要训练 episode 的 H5 文件，也不需要
+`world_model_timeline.json`。实时 history 完全由机械臂反馈构造：`q` 是当前关节位置，
+`dq` 是当前反馈的电机速度或 checkpoint 明确声明的因果 backward difference，`tau` 是实测
+电机力矩，`delta_q` 是最近一次成功下发并保持的 q_cmd 减当前 q。`held` 只在命令成功后更新，
+因此不会把预测值误当成实际命令。
 
-| 模态 | 实际处理 |
-| --- | --- |
-| q | H5 原始反馈，无滤波；训练已声明预处理，因此不额外追加 |
-| dq | SDK 电机速度，PyAgxArm 已修正关节符号；导出 20 Hz 一阶因果低通，再训练 15 Hz 一阶低通 |
-| delta_q | 当时实际成功下发并保持的限幅后 q_cmd − q；当前数据无额外滤波 |
-| τ | 实测电机力矩；导出 20 Hz 一阶低通，再训练 15 Hz 一阶低通 |
+预处理契约来自 checkpoint 保存的 `dataloader` 配置和
+`normalize_dataloader_filters(data)`。数据集创建时已经执行的
+`dataset_preprocessed_operations` 不会重复执行；checkpoint 声明的剩余因果操作会在实时
+history 上连续执行。如果 checkpoint 明确声明 q、dq、delta_q、tau 没有训练滤波，运行时
+`operations` 为空，原始实时值直接进入 history。dq 来源也必须由 checkpoint/data config
+明确声明为硬件电机速度或 backward difference；来源缺失或含义不明会拒绝启动，硬件侧已经
+完成的符号修正不会再次取负。更换 checkpoint 后必须重新检查其 dataloader/filter 和 dq
+source 配置。
 
-这也说明当前转换元数据与 YAML 中“q/delta_q 已做 15 Hz 二阶滤波”的声明不一致；
-部署复现实际进入训练的数据，不凭声明新增滤波。硬件 dq 已修正符号，不能再次取负。
-显式 `backward_difference` 来源可用因果后向差分；其它未知/非因果差分、原始 H5 已滤波等来源拒绝启动。
-切换数据/checkpoint 时必须提供对应的 H5/导出元信息，不能借用此例的预处理证据。
-这里检查所指定 H5 的属性；未逐一审计训练集所有 episode 的来源属性。
+当前本地 `cwm_insert_usb_100hz_80step` checkpoint 的 dataloader 声明 q、delta_q 已在数据集
+阶段完成 15 Hz 二阶低通，dq、tau 需要实时执行 15 Hz 一阶低通；因此部署 operations 只包含
+dq/tau 的一阶低通。该 checkpoint 当前没有保存 `dq_source` 字段，按上述安全策略会拒绝启动，
+需要使用带有明确 `dq_source: hardware` 或 `dq_source: backward_difference` 声明的 checkpoint。
 
 真实下发初始化沿用 follower + enable 的位置命令链路，保持当前姿态，不自动回 rest 位。
 q 范围来自 Nero URDF，单步限幅默认 0.02 rad；`held` 只在命令成功后更新。

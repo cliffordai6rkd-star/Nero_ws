@@ -15,8 +15,6 @@ def load_config(path):
     wm = config['wm']
     for key in ('checkpoint', 'pinn_root'):
         wm[key] = resolve(wm[key])
-    for key in ('timeline', 'source_h5'):
-        wm['preprocessing'][key] = resolve(wm['preprocessing'][key])
     config['mujoco']['mujoco_model_path'] = resolve(config['mujoco']['mujoco_model_path'])
     control, pi, cal = config['control'], config['pi0'], config['calibration']
     def positive(value, name, integer=False):

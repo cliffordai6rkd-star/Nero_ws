@@ -1,8 +1,7 @@
-"""Current PINN public sampler and recorded-data preprocessing, independent of DP."""
+"""Current PINN public sampler and checkpoint-defined preprocessing, independent of DP."""
 from __future__ import annotations
 
 from collections import deque
-import json
 import logging
 from pathlib import Path
 import sys
@@ -41,65 +40,78 @@ class CausalChain:
         return value.astype(np.float32)
 
 
-def recorded_preprocessing(config, data_config, normalized_filters):
-    """Use export metadata plus ONLY pending training operations.
+def _declared_dq_source(data_config):
+    """Return the explicitly declared source of the checkpoint's dq stream.
 
-    A checkpoint's source_already_filtered flag describes the dataset, not
-    raw hardware. The actual exported features, including deliberately skipped
-    training operations, are authoritative. Unknown raw processing fails closed.
+    The deployment cannot infer this from a feature name or from the current
+    robot adapter.  Training must record either hardware motor velocity or a
+    causal backward difference in the checkpoint dataloader configuration.
     """
-    import h5py
-    timeline_path = Path(config['timeline'])
-    timeline = json.loads(timeline_path.read_text())
-    if timeline['mode'] != 'raw_lowdim_action_hold':
-        raise ValueError('only raw_lowdim_action_hold dataset conversion is supported')
-    if (float(timeline['nominal_lerobot_fps']) != float(data_config['high_fps']) or
-            float(timeline['action_fps']) != float(data_config['expert_fps'])):
-        raise ValueError('export timeline rates disagree with checkpoint')
-    columns = {'q': 'observation.joint', 'dq': 'observation.velocity',
-               'tau': 'observation.torque', 'delta_q': 'observation.delta_q'}
-    paths = {'q': 'teleop/q_follower', 'dq': 'teleop/dq_follower',
-             'tau': 'teleop/tau_follower', 'q_cmd': 'teleop/q_cmd'}
-    with h5py.File(config['source_h5'], 'r') as source:
-        attrs = {key: dict(source[path].attrs) for key, path in paths.items()}
-    for key, meta in attrs.items():
-        if meta.get('lowpass', False) or int(meta.get('median_window', 1)) != 1:
-            raise ValueError(f'raw H5 {key} has preprocessing not implemented by this deployment profile')
-    method = attrs['dq'].get('derivative_method')
-    if method == 'sign_corrected_official_motor_velocity_unfiltered':
-        from nero_collection.coordinates import NERO_V120_MOTOR_VELOCITY_TO_JOINT_SIGN
-        recorded_sign = json.loads(attrs['dq'].get('coordinate_sign_correction_json', 'null'))
-        if recorded_sign != list(NERO_V120_MOTOR_VELOCITY_TO_JOINT_SIGN):
-            raise ValueError('recorded dq coordinate signs differ from the hardware adapter')
-        dq_source = 'hardware'  # PyAgxArm already applies the same coordinate sign.
-    elif method == 'backward_difference':
-        dq_source = 'backward_difference'
-    else:
-        raise ValueError(f'unsupported recorded dq derivation {method!r}; require exact causal source contract')
-    if attrs['q_cmd'].get('command_semantics') != 'causal_zoh_at_state_sample':
-        raise ValueError('recorded q_cmd must mean last successfully issued held command')
-    if attrs['tau'].get('processing_method') != 'nearest_motor_sample_unfiltered':
-        raise ValueError('tau must be measured motor torque, not external/gravity-relative torque')
+    declarations = []
+    for key in ('dq_source', 'velocity_source', 'dq_derivation', 'derivative_method'):
+        if key in data_config:
+            declarations.append((key, data_config[key]))
+    for parent in ('state_sources', 'sources', 'features'):
+        value = data_config.get(parent)
+        if isinstance(value, dict):
+            for key in ('dq', 'velocity', 'observation.velocity'):
+                if key in value:
+                    declarations.append((f'{parent}.{key}', value[key]))
+    if not declarations:
+        raise ValueError('checkpoint dataloader does not declare dq source')
+
+    aliases = {
+        'hardware': 'hardware',
+        'hardware_motor_velocity': 'hardware',
+        'motor_velocity': 'hardware',
+        'measured_motor_velocity': 'hardware',
+        'official_motor_velocity': 'hardware',
+        'sign_corrected_official_motor_velocity_unfiltered': 'hardware',
+        'backward_difference': 'backward_difference',
+        'backward-difference': 'backward_difference',
+        'q_backward_difference': 'backward_difference',
+    }
+    resolved = []
+    for key, value in declarations:
+        if not isinstance(value, str):
+            raise ValueError(f'checkpoint dq source {key} must be a string')
+        source = aliases.get(value.strip().lower())
+        if source is None:
+            raise ValueError(f'unsupported checkpoint dq source {value!r}')
+        resolved.append(source)
+    if len(set(resolved)) != 1:
+        raise ValueError(f'checkpoint dq source declarations disagree: {declarations}')
+    return resolved[0]
+
+
+def checkpoint_preprocessing(data_config, normalized_filters):
+    """Restore only causal operations that the checkpoint expects at runtime.
+
+    Operations already applied while creating the training dataset are not
+    repeated.  No offline episode metadata is consulted.
+    """
+    dq_source = _declared_dq_source(data_config)
     operations = {}
-    for key, column in columns.items():
-        ops = []
-        spec = timeline.get('feature_filters', {}).get(column, {})
-        if spec.get('enabled'):
-            if spec.get('contract') != 'causal_variable_dt_one_pole_cascade_v1' or not spec.get('causal'):
-                raise ValueError(f'unsupported export filter: {column}: {spec}')
-            ops.append({'type': 'lowpass', 'cutoff_hz': spec['cutoff_hz'], 'order': spec['order']})
-        spec = normalized_filters.get(key, {})
-        if spec.get('enabled'):
-            prefix = len(spec['dataset_preprocessed_operations'])
-            ops.extend(spec['operations'][prefix:])
-        operations[key] = ops
-    log.info('preprocessing evidence H5=%s timeline=%s dq=%s actual chains=%s',
-             config['source_h5'], timeline_path, dq_source, operations)
+    for key, spec in normalized_filters.items():
+        if not spec.get('enabled'):
+            continue
+        prefix = len(spec['dataset_preprocessed_operations'])
+        pending = list(spec['operations'][prefix:])
+        if pending:
+            operations[key] = pending
+    log.info('checkpoint preprocessing dq_source=%s operations=%s', dq_source, operations)
     return dq_source, operations
+
+
+# Kept as a narrow compatibility name for callers that used the old helper;
+# it no longer reads any recorded episode metadata.
+recorded_preprocessing = checkpoint_preprocessing
 
 
 class History:
     def __init__(self, horizon, hz, operations, dq_source='hardware'):
+        if dq_source not in ('hardware', 'backward_difference'):
+            raise ValueError(f'unsupported dq source {dq_source!r}')
         self.rows = deque(maxlen=horizon)
         self.horizon = horizon
         self.hz = hz
@@ -123,7 +135,11 @@ class History:
                'delta_q': np.asarray(held_command) - q}
         if any(np.shape(v) != (7,) or not np.isfinite(v).all() for v in raw.values()):
             raise ValueError('invalid measured state/held command; refusing WM history')
-        self.rows.append({k: self.filters[k].apply(v, dt) for k, v in raw.items()})
+        if any(self.filters[k].stages for k in raw):
+            row = {k: self.filters[k].apply(v, dt) for k, v in raw.items()}
+        else:
+            row = {k: np.asarray(v, dtype=np.float32).copy() for k, v in raw.items()}
+        self.rows.append(row)
         self.previous_q, self.last_time, self.anchor = q.copy(), now, step
 
     @property
@@ -206,7 +222,7 @@ class WMAdapter:
             raise ValueError('saved sample_rate_hz disagrees with external control rate')
         if n.get('normalize_lowdim_keys', self.normalize_keys) != self.normalize_keys:
             raise ValueError('normalizer keys disagree with checkpoint data config')
-        self.dq_source, self.operations = recorded_preprocessing(config['preprocessing'], data, filters)
+        self.dq_source, self.operations = checkpoint_preprocessing(data, filters)
         log.info('WM restored %s weights=%s device=%s samples=%s flow_steps=%s solver=%s contract=%s',
                  config['checkpoint'], weights_key, self.device, self.num_samples,
                  self.steps or self.contract['flow']['steps'], self.solver or self.contract['flow']['solver'], self.contract)

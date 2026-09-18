@@ -31,10 +31,6 @@ wm:
   selected_sample: 0
   flow_steps: 32
   solver: heun
-  preprocessing:
-    # Recorded evidence, not the possibly changed conversion YAML. Read-only.
-    timeline: ../../runs/swm/insert_usb_lerobot_v3/meta/world_model_timeline.json
-    source_h5: ../../runs/insert_usb/episode_0189_20260822_161110.h5
 control:
   hz: 100
   execute_steps: 20  # external commands, always 200 ms; model horizon unchanged
