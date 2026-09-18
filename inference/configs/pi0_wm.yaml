@@ -2,7 +2,7 @@
 pi0:
   host: localhost
   port: 8000
-  prompt: insert the USB connector
+  prompt: insert the USB into the port"
   action_hz: 25
   consume_steps: 50
   output_key: actions
@@ -22,13 +22,14 @@ pi0:
     output_space: physical_absolute
     action_hz: 25
 wm:
+  # PINN repo path and checkpont path 
   pinn_root: ../../../PINN
   checkpoint: ../../../PINN/outputs/cwm_insert_usb_100hz_80step/checkpoints/latest.pt
   device: cuda:0
   use_ema: true
   num_samples: 1
   selected_sample: 0
-  flow_steps: 8
+  flow_steps: 32
   solver: heun
   preprocessing:
     # Recorded evidence, not the possibly changed conversion YAML. Read-only.
@@ -81,6 +82,6 @@ mujoco:
   robot_joint_names: [joint1, joint2, joint3, joint4, joint5, joint6, joint7]
   ee_body_name: link7
   ee_site_name: null
-  render_fps: 25
+  render_fps: 50
   prediction_visualization_hz: 100
   point_size: 0.003
