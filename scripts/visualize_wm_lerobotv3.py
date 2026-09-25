@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay LeRobot v3 state/action labels through CARS-WM only.
+"""Replay LeRobot v3 state/action labels through a state world model.
 
 This command intentionally does not construct the real-robot runtime, DP, CAN,
 or a MuJoCo dynamics backend.  New checkpoints can run a strict feedback-free
@@ -176,10 +176,12 @@ def _sample_history(
     for key in model.inputs:
         values = np.asarray(history[key], dtype=np.float64)
         if stride > 1:
+            # Retain the current anchor, as in model.prepare_batch().
+            offset = stride - 1
             if values.ndim == 2 and values.shape[0] == external_history:
-                values = values[::stride]
+                values = values[offset::stride]
             elif values.ndim == 3 and values.shape[1] == external_history:
-                values = values[:, ::stride]
+                values = values[:, offset::stride]
         if values.ndim == 2:
             values = np.repeat(values[None], count, axis=0)
         if values.shape != (count, int(model.history_horizon), 7):
@@ -213,17 +215,24 @@ def _sample_history(
             else value
             for key, value in encoded.items()
         }
-        shape = (count, future, int(model.flow_dim))
-        if noise_bank is None:
-            noise_bank = torch.randn(shape, device=device)
+        decode = getattr(model, "predict_from_conditions", None)
+        if callable(decode):
+            flow_started = time.perf_counter()
+            decoded = decode(encoded)
+            flow_ms = (time.perf_counter() - flow_started) * 1e3
+            noise_bank = None
         else:
-            noise_bank = torch.as_tensor(noise_bank, dtype=torch.float32, device=device)
-            if tuple(noise_bank.shape) != shape:
-                raise ValueError(f"noise_bank must have shape {shape}, got {tuple(noise_bank.shape)}")
-        flow_started = time.perf_counter()
-        generated = model.integrate_flow(noise_bank, encoded, steps=steps, solver=solver)
-        flow_ms = (time.perf_counter() - flow_started) * 1e3
-        decoded = model._decoded_output(generated, encoded)
+            shape = (count, future, int(model.flow_dim))
+            if noise_bank is None:
+                noise_bank = torch.randn(shape, device=device)
+            else:
+                noise_bank = torch.as_tensor(noise_bank, dtype=torch.float32, device=device)
+                if tuple(noise_bank.shape) != shape:
+                    raise ValueError(f"noise_bank must have shape {shape}, got {tuple(noise_bank.shape)}")
+            flow_started = time.perf_counter()
+            generated = model.integrate_flow(noise_bank, encoded, steps=steps, solver=solver)
+            flow_ms = (time.perf_counter() - flow_started) * 1e3
+            decoded = model._decoded_output(generated, encoded)
     normalizer = getattr(model, "_inference_normalizer_obj", None)
     metadata = getattr(model, "_inference_normalizer", None) or {}
     output = {}
@@ -248,7 +257,7 @@ def _sample_history(
             "checkpoint does not provide the outputs required by this rollout: "
             f"{missing_required}"
         )
-    return output, noise_bank.detach().cpu(), {
+    return output, None if noise_bank is None else noise_bank.detach().cpu(), {
         "condition_encoding_ms": encode_ms,
         "flow_integration_N_ms": flow_ms,
     }
@@ -317,7 +326,7 @@ def recursive_rollout(
             steps=steps,
             solver=solver,
         )
-        noise_banks[segment_index] = noise_bank.numpy()
+        noise_banks[segment_index] = None if noise_bank is None else noise_bank.numpy()
         committed = {key: prediction[key][:, :segment_steps, :] for key in ("q", "dq", "delta_q", "tau")}
         trajectory_parts.append(committed["q"])
         timings.append(timing)
@@ -364,7 +373,9 @@ def _action_condition(model, actions: np.ndarray, start: int, action_indices: np
     positions = np.searchsorted(np.asarray(action_indices, dtype=np.int64), token_ids, side="left")
     positions = np.clip(positions, 0, len(actions) - 1)
     values = np.asarray(actions[positions], dtype=np.float64)
-    return values[::stride] if stride > 1 else values
+    # Current WMs downsample states only; older files also strided actions.
+    action_stride = horizon // int(model.action_condition_horizon)
+    return values[::action_stride]
 
 
 def _relative_times(model, timestamps: np.ndarray, start: int):
@@ -378,7 +389,8 @@ def _relative_times(model, timestamps: np.ndarray, start: int):
     fi = int(start) + 1 + np.arange(future_horizon)
     ai = np.clip(ai, 0, len(timestamps) - 1)
     fi = np.clip(fi, 0, len(timestamps) - 1)
-    return ((timestamps[ai] - anchor) * 1e-9)[::stride], ((timestamps[fi] - anchor) * 1e-9)[::stride]
+    action_stride = action_horizon // int(model.action_condition_horizon)
+    return ((timestamps[ai] - anchor) * 1e-9)[::action_stride], ((timestamps[fi] - anchor) * 1e-9)[::stride]
 
 
 def _execution_step_counts(model, requested_steps: int, available_external: int) -> tuple[int, int]:

@@ -82,6 +82,10 @@ class CameraVisualizer:
         )
         self._dispatch_thread: threading.Thread | None = None
         self._failure_logged = False
+        self._contact_phase = mp.get_context('spawn').Value('i', -1)
+
+    def set_contact_phase(self, phase: int | None) -> None:
+        self._contact_phase.value = -1 if phase is None else int(phase)
 
     @classmethod
     def from_config(cls, configs: tuple[CameraConfig, ...]) -> "CameraVisualizer":
@@ -106,7 +110,7 @@ class CameraVisualizer:
             process_queue = context.Queue(maxsize=max(2, 2 * len(self.camera_names)))
             process = context.Process(
                 target=_camera_visualizer_worker,
-                args=(tuple(sorted(self.camera_names)), process_queue),
+                args=(tuple(sorted(self.camera_names)), process_queue, self._contact_phase),
                 name="camera-visualizer",
                 daemon=True,
             )
@@ -213,9 +217,25 @@ class CameraVisualizer:
             log.warning("%s; continuing without camera preview", message)
 
 
+def _draw_contact_phase(preview, phase, cv2):
+    # GUI-only overlay: policy frames and recorded images remain untouched.
+    labels = {0: 'free motion', 1: 'alignment', 2: 'contact'}
+    if phase not in labels:
+        return
+    label = labels[phase]
+    font, scale, thickness = cv2.FONT_HERSHEY_SIMPLEX, 0.65, 1
+    (width, height), _ = cv2.getTextSize(label, font, scale, thickness)
+    if width > preview.shape[1] - 16:
+        scale *= max(1, preview.shape[1] - 16) / width
+        (width, height), _ = cv2.getTextSize(label, font, scale, thickness)
+    cv2.putText(preview, label, (max(0, preview.shape[1] - width - 8), height + 8),
+                font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+
 def _camera_visualizer_worker(
     camera_names: tuple[str, ...],
     frame_queue,
+    contact_phase=None,
 ) -> None:
     """Own all GUI calls in a child process and render one labeled camera grid."""
     # OpenCV's Qt build can select Wayland even when only its xcb plugin is
@@ -260,6 +280,8 @@ def _camera_visualizer_worker(
                     latest_frames,
                     cv2,
                 )
+                if contact_phase is not None:
+                    _draw_contact_phase(preview, contact_phase.value, cv2)
                 if not window_open:
                     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
                     height, width = preview.shape[:2]

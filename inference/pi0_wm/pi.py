@@ -18,13 +18,6 @@ def ee_pose(matrix):
     return np.r_[matrix[:3, 3], quat].astype(np.float32)
 
 
-def put_nested(target, path, value):
-    keys = path.split('/')
-    for key in keys[:-1]:
-        target = target.setdefault(key, {})
-    target[keys[-1]] = value
-
-
 class PiClient:
     def __init__(self, config):
         self.config = config
@@ -37,6 +30,12 @@ class PiClient:
             self.policy = WebsocketClientPolicy(host=self.config['host'], port=self.config['port'])
             actual = self.policy.get_server_metadata().get('pi0_wm')
             expected = self.config['interface']
+            if actual is None:
+                raise ValueError(
+                    'pi0 server metadata is missing pi0_wm; restart the OpenPI server '
+                    'with scripts/serve_pi0_wm.py --config <synced pi0_wm.yaml> '
+                    '--train-config <actual TrainConfig name> --checkpoint <trained checkpoint directory>'
+                )
             if actual != expected:
                 raise ValueError(f'pi0 server training interface mismatch: actual={actual}, expected={expected}')
             log.info('pi0 server interface verified: %s', actual)
@@ -55,11 +54,12 @@ class PiClient:
 
 def observation(config, state, frames):
     result = {}
-    put_nested(result, config['interface']['state_key'], ee_pose(state.ee_pose))
-    put_nested(result, config['interface']['prompt_key'], config['prompt'])
+    # OpenPI data transforms consume literal keys, including slashes.
+    result[config['interface']['state_key']] = ee_pose(state.ee_pose)
+    result[config['interface']['prompt_key']] = config['prompt']
     for name, key in config['interface']['images'].items():
         frame = frames[name].frame
         if frame.ndim != 3 or frame.shape[-1] != 3 or frame.dtype != np.uint8:
             raise ValueError(f'camera {name} must supply uint8 HWC RGB')
-        put_nested(result, key, frame.copy())
+        result[key] = frame.copy()
     return result

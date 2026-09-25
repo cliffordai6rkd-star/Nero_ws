@@ -1,8 +1,35 @@
 # π0 LoRA → CaRS-WM → q
 
+## 多轮交互推理
+
+```yaml
+control:
+  inference_runs: 5
+  wait_for_start: true
+```
+
+程序启动先复位到 rest_q，然后等待运行脚本的终端按键（无需回车）：
+
+- s：开始一轮；若当前轮暂停，则从新观测重新规划后恢复本轮。
+- d：暂停推理并在当前位置保持，不复位、不消耗轮数。
+- i：结束当前轮并复位，等待 s 开始下一轮；暂停时也有效。
+- Ctrl+C：退出程序，沿用异常退出的保持逻辑。
+
+每轮最多执行 control.maximum_steps（或 --steps）个控制周期，暂停/校准/复位时间
+不计入；到上限自动结束并复位。完成 inference_runs 轮后退出。空闲时按 i 只复位，
+不消耗轮数。相机在轮间保持运行；首次 s 后进行校准，后续复用校准参数。
+暂停/结束后旧推理结果丢弃，后台任务完成前不会并发启动新的模型任务；恢复会重新填充
+历史和建立 π0 action 计划，不续播过期 chunk。
+无交互终端时须设置 wait_for_start=false、inference_runs=1，使用原单轮自动启动行为。
+
+相机预览右上角以白字显示当前执行的 WM 样本/帧的预测阶段：free motion、alignment、
+contact。alignment 对应模型的 precontact_or_transition 类，不表示独立检测到几何对准。
+暂停、等待有效预测、WM 关闭或模型没有兼容的三阶段输出时隐藏文字。叠字只在 GUI
+进程中进行，不写入 π0 输入或保存图像。模拟 WM 显示 free motion。
+
 独立入口 `scripts/run_pi0_wm.py`，独立配置 `inference/configs/pi0_wm.yaml`。
 不导入旧 DP runtime、TimestampFastSlowRuntime 或 ContactWMInferencePipeline。
-不会加载 DP checkpoint，不实现 MTC、MIT 力矩、WM τ 前馈或 MPC。
+不会加载 DP checkpoint；支持 q 位置控制和可选 MTC/MIT 力矩前馈，不实现 MPC。
 
 ## 文件
 
@@ -20,10 +47,11 @@
 
 ## 计划与执行
 
-- π0 完整返回值保留在机器人端，默认消费前 50 个 25 Hz token。每 4 次外部下发推进一 token。`pi_loop_id/action_step/substep` 与 WM 轮次独立。
-- WM action 从 `floor(control_step/4) + action_start_offset` 起取连续原生 token。尾部可以跨入已返回的新计划；交接固定在旧计划的第 50 个 token 之后，新计划从 token 0 生效，不重复末尾值、不重采样。
-- π0 的固定提前请求点为 `consume - action_horizon - action_start_offset - ceil((峰值耗时+余量)*25)`，额外留出一个边界 token。每个计划仅触发一次正常请求；每个 worker 最多一个在途请求（含未领取的结果），不积压观测。
-- 若 π0 错过交接，新计划在返回后的下一原生 action 边界生效，并记录 gap 和新旧七维参考跳变量。缺少完整 action 窗口时停止发起 WM；有效预测尾部用尽后保持上次实际成功下发的 q。已用于 WM 的计划边界不移动。
+- π0 完整返回值保留，动作 i 的时间锚点固定为请求观测控制步 + i×4。`consume_steps` 是每段最多消费的 token 数，启动校准根据 chunk 长度与推理余量自动缩短，预留过期前缀。
+- WM action 从 `floor(control_step/4) + action_start_offset` 起取原生 token。每个目标 token 根据原始观测锚点选择源动作，非整步相位使用 previous 保持；新计划生效时跳过已过期动作，不把第 0 帧重新标成生效时刻。
+- 提前请求以最后一段已提交计划的结束时间为基准，预留 WM action 窗口和 π0 推理时间。必要时在该计划生效前请求后继，worker 仍最多一个在途请求。
+- 若 π0 迟到，新计划在返回后的下一 action 边界恢复，只使用剩余有效后缀；完全过期则丢弃并重新请求。不补齐或重复尾帧。缺少完整 action 窗口时停止发起 WM，有效预测尾部用尽后保持已下发 q。已用于 WM 的计划边界不移动。
+- 此修复对齐源动作时间，不保证不同随机预测之间自然连续，也不对 chunk 做额外平滑。
 - 启动先预热，再分别测 π0 和 WM。WM 默认测速至少 1 秒且至少 10 个样本；快照准备、线程交付、输出反归一化/CPU 拷贝、GPU 同步、结果可见性均计入。相机预览和 MuJoCo 在测速前启动，采样数/Flow steps/solver/设备不在测速后切换。
 - `P=ceil((WM峰值+margin)*100)`，`T=E-P`。启动输出峰值、P/T/E。`P>E` 或 `P+E>H_external` 直接报错；不自行修改执行长度或模型 horizon。
 - 当前轮执行到 T 时请求下一轮，执行计数继续增长。新结果只能在当前轮已执行 E 步后接管；设 `d=接管控制步-请求快照控制步`，首个命令取 `prediction[d]`，包括推理完成后等待接管的步数。必须 `d+E<=H_external`。
@@ -46,7 +74,7 @@ server 用官方 `create_trained_policy()` 从 checkpoint/assets 恢复 normaliz
 
 边缘端不需要训练 episode 的 H5 文件，也不需要
 `world_model_timeline.json`。实时 history 完全由机械臂反馈构造：`q` 是当前关节位置，
-`dq` 是当前反馈的电机速度或 checkpoint 明确声明的因果 backward difference，`tau` 是实测
+`dq` 固定使用当前硬件反馈的电机速度，`tau` 是实测
 电机力矩，`delta_q` 是最近一次成功下发并保持的 q_cmd 减当前 q。`held` 只在命令成功后更新，
 因此不会把预测值误当成实际命令。
 
@@ -54,17 +82,22 @@ server 用官方 `create_trained_policy()` 从 checkpoint/assets 恢复 normaliz
 `normalize_dataloader_filters(data)`。数据集创建时已经执行的
 `dataset_preprocessed_operations` 不会重复执行；checkpoint 声明的剩余因果操作会在实时
 history 上连续执行。如果 checkpoint 明确声明 q、dq、delta_q、tau 没有训练滤波，运行时
-`operations` 为空，原始实时值直接进入 history。dq 来源也必须由 checkpoint/data config
-明确声明为硬件电机速度或 backward difference；来源缺失或含义不明会拒绝启动，硬件侧已经
-完成的符号修正不会再次取负。更换 checkpoint 后必须重新检查其 dataloader/filter 和 dq
-source 配置。
+`operations` 为空，原始实时值直接进入 history。dq 来源固定为硬件反馈速度，不读取或校验 checkpoint 的 `dq_source` 声明，也不由 q 差分计算。硬件侧已经
+完成的符号修正不会再次取负。更换 checkpoint 后仍需检查其 dataloader/filter 配置。
 
 当前本地 `cwm_insert_usb_100hz_80step` checkpoint 的 dataloader 声明 q、delta_q 已在数据集
 阶段完成 15 Hz 二阶低通，dq、tau 需要实时执行 15 Hz 一阶低通；因此部署 operations 只包含
-dq/tau 的一阶低通。该 checkpoint 当前没有保存 `dq_source` 字段，按上述安全策略会拒绝启动，
-需要使用带有明确 `dq_source: hardware` 或 `dq_source: backward_difference` 声明的 checkpoint。
+dq/tau 的一阶低通。checkpoint 无需保存 `dq_source` 字段。
 
-真实下发初始化沿用 follower + enable 的位置命令链路，保持当前姿态，不自动回 rest 位。
+真实下发初始化沿用 follower + enable 的位置命令链路，随后先复位到
+`hardware.endpoint.rest_q`，复位完成后才开始推理校准。在运行终端按 `i`（无需回车）
+会停止推理调度、复位到同一 `rest_q`，然后退出；校准等待期间也支持此按键。
+复位使用数采的 `move_j` 方式和默认参数：30 Hz 插值、1 rad/s、每步不超过 0.05 rad，
+通过 5 次反馈均值确认误差不超过 0.02 rad，未到位时限时微调。
+Ctrl+C、异常及步数结束仍保持最后成功下发的目标，不自动复位。
+物理 dry-run 不执行启动或按键复位。操作键需要焦点位于启动脚本的终端。
+每次 π0 结果返回时，独立线程打印 `PI0_CHUNK {"q": [...]}`，仅包含此时 WM 最新观测的
+七个关节位置（rad），不打印其他观测量、动作或诊断元数据。
 q 范围来自 Nero URDF，单步限幅默认 0.02 rad；`held` 只在命令成功后更新。
 默认 dry-run 只读取硬件，不 enable、不发送预测命令。真实硬件 dry-run 的初始 held q
 以初始实测 q 为静止保持假设，不能用它验证另一控制器同时运动时的 delta_q 语义。
@@ -111,6 +144,102 @@ export PYTHONPATH="$PWD/../openpi/packages/openpi-client/src${PYTHONPATH:+:$PYTH
 ```
 
 ## 启动命令
+
+WM 可选择顺序开环执行：
+
+```yaml
+wm:
+  enable: true
+  inference_mode: openloop  # prefetch 为原提前请求模式；省略时默认 prefetch。
+```
+
+openloop 每轮使用最新观测推理，结果返回后在下一个可下发时刻从预测第 0 帧执行
+`control.execute_steps` 个 100 Hz 时间步，然后才请求下一轮。推理等待期间保持最后
+位置目标，MTC 前馈按原逻辑退回重力补偿，不继续消费上一轮剩余预测，也不提前请求。
+q/tau 使用同一播放索引。此模式有意将轨迹从接管时刻重放，不使用预取模式的延迟丢帧；
+execute_steps 只需不超过模型预测长度，不要求推理延迟加执行长度落在预测窗口内。
+等待推理受 calibration.request_timeout_s 限制。启动耗时校准仍保留，π0 的独立
+chunk 调度不变。command_hz 较低时，每段保证从一个实际下发时刻开始，其余帧按分频跳过。
+
+这里的开环仅指 WM 段内不重新查询，不是冻结 π0 的时间轴，也不是逐条等候关节到位。
+等待期间 π0 action 时间继续前进；下一轮 WM 选取新的当前 action 窗口，不回放等待期间
+已经过期的 action。每轮播放时长是 execute_steps/100 秒，推理时间另计；例如播放
+100ms、推理80ms，仅约56%的时间在播放。预测16帧而 execute_steps=10 时，其余6帧丢弃。
+
+π0 使用 `pi0.anchor_camera`（默认 wrist）帧的主机时间戳作为 action 原点。
+根据实际采样时刻插值到控制步时间轴，保留不足一帧的相位；状态取该帧时刻之前最近的
+观测，图像时间未被状态历史覆盖时等待下一周期。校准的 π0 延迟预算包含图像已有年龄。
+这修正了“收到请求时刻代替图像时刻”的误差，但主机帧时间不是硬件曝光时间，且没有
+实现两台相机的硬件同步。prefetch 的 WM q_pred[d] 保持下一周期目标语义，不改成 d-1。
+
+`control.hz: 100` 是状态采样、WM 历史和预测索引频率；`control.command_hz: 50`
+单独控制命令下发频率，适用于 q、mtc 及纯 π0 模式。未填写时默认与 hz 相同。
+command_hz 必须为 hz 的整数分频，例如 100/50/25/20/10 Hz。跳过的命令不排队，
+下次下发使用当时对应的预测点；held_q 只在成功下发后更新。execute_steps 仍按
+100 Hz 计数，maximum_step_rad 仍是每次实际下发的限幅，不因降频自动放宽。
+MTC 的速度/加速度和力矩变化率使用实际下发间隔；watchdog_timeout_s 必须大于
+1/command_hz 并留出抖动余量。启动复位、模式切换及退出保持不受此分频限制，复位仍用
+独立的数采复位频率。降低 command_hz 不会降低 WM 推理计算量。
+
+`control.mode` 默认 `q`（位置下发），设为 `mtc` 可启用 WM q/tau 同步 MIT 控制。
+`mtc` 要求 `wm.enable: true` 且模型预测 tau，纯 π0 模式需使用 `q`。参数在
+`control.mtc` 下：逐关节 kp/kd、tau_scale、速度/加速度、前馈/总力矩与变化率限值，
+以及控制周期 watchdog 和重力模型 URDF。标量限值会展开成七关节。
+
+MTC 从同一 WM 结果、样本和延迟索引提取 q/tau。位置参考先做速度/加速度及关节范围
+限制，并按剩余距离提前制动，避免固定目标下的参考超调。目标突然反向或进入保持时，
+不越过/远离目标优先于加速度连续性；速度参考由最终位置参考差分得到。前馈为
+`g(q_measured) + tau_scale * (tau_WM - g(q_WM))`，参考偏离预测时降低残差权重。
+这是预测力矩前馈，不是实测力矩误差闭环。前馈做幅值/变化率限制，同时根据当前反馈
+估算 PD+前馈总力矩，必要时缩小 kp/kd；这不是固件总力矩的硬限幅保证。
+预测耗尽时保持位置并将前馈逐渐退回重力补偿；控制周期超时则退出。启动复位完成后
+进入 MIT，位置参考重新锚定到实测 q，前馈从切模前实测 torque（经过幅值限制）开始，
+通过 `control.mtc.startup_blend_s`（默认 1 秒，必须为正）过渡到模型前馈，且仍受力矩
+变化率限制。反馈力矩无效时拒绝切模；只有下发成功才推进过渡状态。
+`tau_scale=0` 仅关闭预测残差，仍保留完整重力补偿。模型重力与实机的匹配需要单独验证。
+按 i、异常或正常退出时先用最后成功位置目标恢复位置模式，再复位或保持。
+默认 kp/kd 来自数采从臂，tau_scale=0.1 是待实机验证的初始设置，不能视为已验证增益。
+
+只向 MIT 下发力矩可使用以下配置（其余配置保留）：
+
+```yaml
+wm:
+  enable: true
+control:
+  mode: tau
+  command_hz: 100
+  mtc:
+    maximum_tracking_error_rad: 0.25
+    startup_blend_s: 1.0
+```
+
+`tau` 与 `mtc` 共用 `control.mtc` 参数。上位机每个 100 Hz 控制周期读取反馈，
+计算 `kp*(q_ref-q) + kd*(dq_ref-dq) + g(q) + w*tau_scale*(tau_WM-g(q_WM))`。
+其中 w 是参考偏离预测时的残差权重；重力加预测残差先受 feedforward_limit_nm 限制，
+再与 PD 相加。启动过渡、total_torque_limit_nm 和 maximum_torque_rate_nm_s
+均作用于最终完整力矩。MIT 下发的 p_des/v_des/kp/kd 全为零，只有 t_ff 有效。
+WM 的推理周期仍独立，支持 prefetch/openloop；等待预测时保持最后参考并继续反馈控制。
+实测 q 与最终参考偏差超过 maximum_tracking_error_rad、反馈过期或周期超时会进入
+原有退出流程，恢复位置模式。tau 模式拒绝降低 command_hz，以免将上位机反馈环一起降频。
+Python watchdog 无法在进程卡死时执行；固件命令超时保护仍需在实机确认。
+此模式没有实机稳定性验证，mock 仅验证下发协议与流程，不模拟力矩动力学。
+
+`wm.enable` 默认 `true`。设为 `false` 可切换为纯 π0 开环执行：
+
+```yaml
+wm:
+  enable: false
+```
+
+该模式不加载 WM checkpoint、不启动 WM worker，也不进行 WM 校准。π0 仍输出
+`action.ee_pose` 语义的绝对 base→link7 位姿 `[x,y,z,qx,qy,qz,qw]`（默认响应键为 `actions`）。
+后台线程使用 `mujoco.mujoco_model_path` 的机械臂模型进行逐点 IK，首点使用请求时的
+实测关节角作初值，后续点使用前一点的解。该模型仍是必需的，即使可视化已关闭。
+求解限制在模型与硬件共同允许的关节范围内；不收敛则退出，不发送失败解。
+π0+IK 的总耗时计入 π0 校准，继续使用观测锚定的 chunk 时间轴和过期前缀跳过逻辑。
+动作按 25 Hz 更新关节目标，按 command_hz 下发并沿用单步限幅；缺少有效计划时保持上次目标。
+开环指 chunk 内不使用 WM 预测或重新规划；仍读取反馈做状态新鲜度及关节范围检查。
+启动复位、终端按 `i` 复位退出、dry-run 行为与 WM 模式相同。`--mock-wm` 仅适用于 WM 开启时。
 
 在**已安装实际训练配置的 openpi 服务端环境**中，配置文件需与机器人端 interface 一致：
 

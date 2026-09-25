@@ -40,57 +40,12 @@ class CausalChain:
         return value.astype(np.float32)
 
 
-def _declared_dq_source(data_config):
-    """Return the explicitly declared source of the checkpoint's dq stream.
-
-    The deployment cannot infer this from a feature name or from the current
-    robot adapter.  Training must record either hardware motor velocity or a
-    causal backward difference in the checkpoint dataloader configuration.
-    """
-    declarations = []
-    for key in ('dq_source', 'velocity_source', 'dq_derivation', 'derivative_method'):
-        if key in data_config:
-            declarations.append((key, data_config[key]))
-    for parent in ('state_sources', 'sources', 'features'):
-        value = data_config.get(parent)
-        if isinstance(value, dict):
-            for key in ('dq', 'velocity', 'observation.velocity'):
-                if key in value:
-                    declarations.append((f'{parent}.{key}', value[key]))
-    if not declarations:
-        raise ValueError('checkpoint dataloader does not declare dq source')
-
-    aliases = {
-        'hardware': 'hardware',
-        'hardware_motor_velocity': 'hardware',
-        'motor_velocity': 'hardware',
-        'measured_motor_velocity': 'hardware',
-        'official_motor_velocity': 'hardware',
-        'sign_corrected_official_motor_velocity_unfiltered': 'hardware',
-        'backward_difference': 'backward_difference',
-        'backward-difference': 'backward_difference',
-        'q_backward_difference': 'backward_difference',
-    }
-    resolved = []
-    for key, value in declarations:
-        if not isinstance(value, str):
-            raise ValueError(f'checkpoint dq source {key} must be a string')
-        source = aliases.get(value.strip().lower())
-        if source is None:
-            raise ValueError(f'unsupported checkpoint dq source {value!r}')
-        resolved.append(source)
-    if len(set(resolved)) != 1:
-        raise ValueError(f'checkpoint dq source declarations disagree: {declarations}')
-    return resolved[0]
-
-
-def checkpoint_preprocessing(data_config, normalized_filters):
+def checkpoint_preprocessing(normalized_filters):
     """Restore only causal operations that the checkpoint expects at runtime.
 
     Operations already applied while creating the training dataset are not
     repeated.  No offline episode metadata is consulted.
     """
-    dq_source = _declared_dq_source(data_config)
     operations = {}
     for key, spec in normalized_filters.items():
         if not spec.get('enabled'):
@@ -99,8 +54,8 @@ def checkpoint_preprocessing(data_config, normalized_filters):
         pending = list(spec['operations'][prefix:])
         if pending:
             operations[key] = pending
-    log.info('checkpoint preprocessing dq_source=%s operations=%s', dq_source, operations)
-    return dq_source, operations
+    log.info('checkpoint preprocessing operations=%s', operations)
+    return operations
 
 
 # Kept as a narrow compatibility name for callers that used the old helper;
@@ -109,15 +64,11 @@ recorded_preprocessing = checkpoint_preprocessing
 
 
 class History:
-    def __init__(self, horizon, hz, operations, dq_source='hardware'):
-        if dq_source not in ('hardware', 'backward_difference'):
-            raise ValueError(f'unsupported dq source {dq_source!r}')
+    def __init__(self, horizon, hz, operations):
         self.rows = deque(maxlen=horizon)
         self.horizon = horizon
         self.hz = hz
         self.filters = {key: CausalChain(operations.get(key, [])) for key in ('q', 'dq', 'delta_q', 'tau')}
-        self.dq_source = dq_source
-        self.previous_q = None
         self.last_time = None
         self.anchor = -1
 
@@ -128,9 +79,8 @@ class History:
         if not np.isfinite(dt) or dt <= 0:
             raise ValueError('nonpositive history sample interval')
         q = np.asarray(state.q, dtype=np.float32)
+        # Deployment always uses the measured hardware velocity.
         dq = np.asarray(state.dq, dtype=np.float32)
-        if self.dq_source == 'backward_difference':
-            dq = np.zeros_like(q) if self.previous_q is None else (q - self.previous_q) / dt
         raw = {'q': q, 'dq': dq, 'tau': state.torque,
                'delta_q': np.asarray(held_command) - q}
         if any(np.shape(v) != (7,) or not np.isfinite(v).all() for v in raw.values()):
@@ -140,7 +90,7 @@ class History:
         else:
             row = {k: np.asarray(v, dtype=np.float32).copy() for k, v in raw.items()}
         self.rows.append(row)
-        self.previous_q, self.last_time, self.anchor = q.copy(), now, step
+        self.last_time, self.anchor = now, step
 
     @property
     def ready(self):
@@ -167,8 +117,41 @@ class WMAdapter:
 
         payload = torch.load(config['checkpoint'], map_location='cpu', weights_only=False)
         self.cfg = payload.get('config', payload.get('cfg'))
-        self.model = ContactWorldModel(self.cfg)
+        deterministic = payload.get('model_version') == 'deterministic_wm_v1'
+        if deterministic:
+            from model.pinn_model.deterministic_world_model import DeterministicRobotStateWorldModel
+            self.model = DeterministicRobotStateWorldModel(self.cfg)
+        else:
+            self.model = ContactWorldModel(self.cfg)
         self.contract = self.model.validate_checkpoint(payload)
+        if deterministic:
+            # Expose the same deployment metadata after validating either v1
+            # envelope. The deterministic architecture has no flow contract.
+            data = self.cfg.get('dataloader') or {}
+            action = self.cfg.get('action_contract') or {}
+            self.contract = {
+                **self.model.checkpoint_contract(),
+                'external_action_horizon': self.model.external_action_condition_horizon,
+                'input_state_streams': self.model.inputs,
+                'predicted_continuous_streams': self.model.outputs,
+                'contact': {
+                    'classes': (['free', 'precontact_or_transition', 'contact']
+                                if self.model.contact_state_count == 3
+                                and (self.cfg.get('contact_gate') or {}).get('label_mode', 'three_phase') == 'three_phase'
+                                else []),
+                },
+                'action': {
+                    'dimension': self.model.action_dim,
+                    'start_offset': self.model.action_start_offset,
+                    'type': action.get('type', 'absolute_ee_pose'),
+                    'representation': action.get('representation', 'xyz_quaternion'),
+                    'quaternion_order': action.get('quaternion_order', 'xyzw'),
+                    'quaternion_sign': action.get('quaternion_sign', 'canonical_w_nonnegative'),
+                    'coordinate_frame': action.get('coordinate_frame', 'link7'),
+                    'absolute_or_relative': action.get('absolute_or_relative', 'absolute'),
+                    'inference_delay_s': float(data.get('inference_delay_s', 0.0)),
+                },
+            }
         # PINN trainer saves the EMA deployment model under `model` and raw
         # optimizer weights under `model_raw`. Never silently substitute weights.
         ema_trained = (self.cfg.get('train', {}).get('ema') or {}).get('enabled', False)
@@ -222,10 +205,11 @@ class WMAdapter:
             raise ValueError('saved sample_rate_hz disagrees with external control rate')
         if n.get('normalize_lowdim_keys', self.normalize_keys) != self.normalize_keys:
             raise ValueError('normalizer keys disagree with checkpoint data config')
-        self.dq_source, self.operations = checkpoint_preprocessing(data, filters)
+        self.operations = checkpoint_preprocessing(filters)
         log.info('WM restored %s weights=%s device=%s samples=%s flow_steps=%s solver=%s contract=%s',
                  config['checkpoint'], weights_key, self.device, self.num_samples,
-                 self.steps or self.contract['flow']['steps'], self.solver or self.contract['flow']['solver'], self.contract)
+                 self.steps or self.contract.get('flow', {}).get('steps'),
+                 self.solver or self.contract.get('flow', {}).get('solver'), self.contract)
 
     def infer(self, payload):
         import torch
@@ -252,6 +236,13 @@ class WMAdapter:
                 raise ValueError(f'invalid external prediction {key}: {physical[key].shape}')
         if self.device.type == 'cuda':
             torch.cuda.synchronize(self.device)
+        phase = result.get('contact_state_pred')
+        classes = (self.contract.get('contact') or {}).get('classes')
+        if phase is not None and classes == ['free', 'precontact_or_transition', 'contact']:
+            phase = phase[0].squeeze(-1).cpu().numpy()
+            if phase.shape != (self.num_samples, self.future_horizon) or not np.isin(phase, [0, 1, 2]).all():
+                raise ValueError('invalid WM contact phase prediction')
+            physical['contact_phase'] = phase.astype(np.int8)
         return physical
 
 
@@ -261,7 +252,6 @@ class MockWM:
     action_horizon = 20
     offset = 1
     operations = {}
-    dq_source = 'hardware'
 
     def __init__(self, samples=1, latency=0.015):
         self.num_samples, self.latency = samples, latency
@@ -273,4 +263,5 @@ class MockWM:
             raise ValueError('mock WM needs a full native action window')
         time.sleep(self.latency)
         q = np.broadcast_to(history['q'][-1], (self.num_samples, self.future_horizon, 7)).copy()
-        return {'q': q, 'tau': np.zeros_like(q)}
+        return {'q': q, 'tau': np.zeros_like(q),
+                'contact_phase': np.zeros(q.shape[:2], dtype=np.int8)}

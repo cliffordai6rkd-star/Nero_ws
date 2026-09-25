@@ -710,6 +710,10 @@ def test_camera_visualizer_starts_spawn_process(monkeypatch) -> None:
 
     class FakeContext:
         @staticmethod
+        def Value(kind, value):
+            return type('SharedValue', (), {'value': value})()
+
+        @staticmethod
         def Queue(maxsize):
             created["queue_size"] = maxsize
             return FakeQueue()

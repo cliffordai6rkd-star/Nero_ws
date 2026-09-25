@@ -410,3 +410,37 @@ def test_contact_mtc_filters_residual_without_delaying_qv_gravity(tmp_path: Path
     np.testing.assert_allclose(output.tau_command, 0.1 + expected_residual, atol=1.0e-8)
     np.testing.assert_allclose(output.tau_target, expected_residual, atol=1.0e-8)
     pipeline.close()
+
+
+@pytest.mark.parametrize('stride', [1, 2])
+def test_deterministic_world_model_online_sampling(tmp_path, stride):
+    from inference.checkpoints import _prepare_pinn_source
+    _prepare_pinn_source()
+    from model.pinn_model.deterministic_world_model import DeterministicRobotStateWorldModel
+    cfg = {
+        'dataloader': {'state_history_horizon': 6, 'prediction_horizon': 4,
+                       'action_condition_horizon': 8, 'high_fps': 100, 'expert_fps': 25},
+        'model': {'inputs': ['q', 'dq', 'delta_q', 'tau'], 'outputs': ['q', 'tau'],
+                  'hidden_dim': 8, 'attention_heads': 2, 'state_layers': 1,
+                  'action_layers': 1, 'decoder_layers': 1, 'dropout': 0.0},
+        'train': {'downsample': stride},
+    }
+    model = DeterministicRobotStateWorldModel(cfg).eval()
+    model._inference_checkpoint_config = cfg
+    pipeline = ContactWMInferencePipeline(_config(tmp_path, 'q'), dp_model=_DP(),
+                                         pinn_model=model, controller=_Controller())
+    try:
+        history = {key: np.zeros((6, 7), dtype=np.float32) for key in model.inputs}
+        actions = np.zeros((8, 7), dtype=np.float32)
+        actions[:, -1] = 1.0
+        sampled = pipeline.sample_contact_futures(history, actions, num_samples=3,
+                                                  use_fixed_noise_bank=True)
+        assert sampled['q'].shape == (3, 4, 7)
+        assert sampled['contact_probability'].shape == (3, 4, 3)
+        np.testing.assert_array_equal(sampled['q'][0], sampled['q'][1])
+        assert getattr(pipeline, '_visualization_noise_bank', None) is None
+        output = pipeline.step(_sample())
+        assert output.joint_position_command is not None
+        assert np.isfinite(output.joint_position_command).all()
+    finally:
+        pipeline.close()

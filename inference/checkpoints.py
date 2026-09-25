@@ -144,7 +144,7 @@ def restore_checkpoint_model(
     """Instantiate a model solely from checkpoint cfg and restore its weights."""
     pinn_mode = str(pinn_mode).strip().lower().replace("-", "_")
     # Keep old mode strings source-compatible while making the sibling PINN
-    # ContactWorldModel implementation the only WM model that can be restored.
+    # checkpoint version authoritative for selecting the WM architecture.
     wm_aliases = {
         "world_model": "contact_world_model",
         "world_model_v3": "contact_world_model",
@@ -294,7 +294,12 @@ def restore_checkpoint_model(
             }:
                 from model.pinn_model.contact_world_model import ContactWorldModel
 
-                model_type = ContactWorldModel
+                if payload.get("model_version") == "deterministic_wm_v1":
+                    from model.pinn_model.deterministic_world_model import DeterministicRobotStateWorldModel
+
+                    model_type = DeterministicRobotStateWorldModel
+                else:
+                    model_type = ContactWorldModel
             else:
                 raise CheckpointError(
                     "pinn_mode must be 'wrench_gru' or a Contact World Model mode, "
@@ -332,10 +337,14 @@ def restore_checkpoint_model(
                 f"{list(required_inputs)}, got {list(configured_inputs)}"
             )
         contract = payload.get("carswm_contract")
+        validate_checkpoint = getattr(model, "validate_checkpoint", None)
         validate_contract = getattr(model, "validate_checkpoint_contract", None)
-        if callable(validate_contract):
+        if callable(validate_checkpoint) or callable(validate_contract):
             try:
-                validate_contract(contract)
+                if callable(validate_checkpoint):
+                    validate_checkpoint(payload)
+                else:
+                    validate_contract(contract)
             except (TypeError, ValueError) as exc:
                 raise CheckpointError(f"WM checkpoint contract validation failed: {exc}") from exc
         if int(getattr(model, "joint_dim", 7)) != 7 or int(

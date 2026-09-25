@@ -84,10 +84,9 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
 
         model = self.pinn
         model_version = getattr(model, "MODEL_VERSION", None)
-        if model_version is not None and model_version != "carswm_v3":
+        if model_version is not None and model_version not in {"carswm_v3", "carswm_v9", "deterministic_wm_v1"}:
             raise ValueError(
-                "Contact WM checkpoint must expose MODEL_VERSION="
-                "'carswm_v3'"
+                f"Unsupported Contact WM checkpoint MODEL_VERSION={model_version!r}"
             )
 
         checkpoint = getattr(model, "_inference_checkpoint_config", {})
@@ -675,14 +674,7 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
         solver: str | None = None,
         use_fixed_noise_bank: bool = False,
     ) -> dict[str, np.ndarray]:
-        """Batch-sample CARS-WM futures with one condition encoding pass.
-
-        The PINN model's public ``sample`` method in older checkpoints loops
-        over ``predict`` and therefore re-encodes conditions.  This adapter
-        keeps the checkpoint model definition authoritative while using its
-        ``encode_conditions`` and ``integrate_flow`` primitives to expand the
-        already-encoded memory across the sample dimension.
-        """
+        """Sample futures using the checkpoint model's public WM interface."""
         import torch
 
         count = int(num_samples)
@@ -719,18 +711,21 @@ class ContactWMInferencePipeline(NeroInferencePipeline):
         with torch.inference_mode():
             encode_started = perf_counter()
             reference = inputs[self._contact_input_keys[0]]
+            deterministic = bool(getattr(self.pinn, "is_deterministic", False))
             noise = None if source_noise is None else torch.as_tensor(source_noise, device=device, dtype=reference.dtype)
-            if noise is None and use_fixed_noise_bank:
+            if deterministic:
+                noise = None
+            if not deterministic and noise is None and use_fixed_noise_bank:
                 bank = getattr(self, "_visualization_noise_bank", None)
                 if torch.is_tensor(bank) and tuple(bank.shape) == (1, count, self._contact_future_horizon, int(getattr(self.pinn, "flow_dim"))):
                     noise = bank.to(device=device, dtype=reference.dtype)
-            if noise is None:
+            if not deterministic and noise is None:
                 noise = torch.randn((1, count, self._contact_future_horizon, int(getattr(self.pinn, "flow_dim"))), device=device, dtype=reference.dtype)
                 if use_fixed_noise_bank:
                     self._visualization_noise_bank = noise.detach().cpu()
-            if noise.ndim == 3:
+            if noise is not None and noise.ndim == 3:
                 noise = noise[None]
-            if noise.ndim != 4 or noise.shape[0] != 1 or noise.shape[1] != count or noise.shape[2] != self._contact_future_horizon:
+            if noise is not None and (noise.ndim != 4 or noise.shape[0] != 1 or noise.shape[1] != count or noise.shape[2] != self._contact_future_horizon):
                 raise ValueError("source_noise must have shape [K,T,D] or [1,K,T,D] on the external grid")
             flow_started = perf_counter()
             sampled = self.pinn.sample(

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from inference.pi0_wm.core import Execution, Plans, MissingActions, Request, Result, Schedule, Worker, pi_trigger
+from inference.pi0_wm.core import Execution, Plans, MissingActions, Request, Result, Schedule, Worker, aligned_pi_schedule
 from inference.pi0_wm.wm import CausalChain, History, WMAdapter, checkpoint_preprocessing
 from inference.pi0_wm.config import load_config
 
@@ -27,7 +27,7 @@ def test_native_actions_cross_committed_boundary_with_offset_and_substeps():
     plans.add(chunk(), 0, 0, 0)
     with pytest.raises(MissingActions):
         plans.window(4 * 40, 20, 1)
-    plans.add(chunk(50), 50, 1, 100)
+    plans.add(chunk(50), 50, 1, 200)
     for substep in range(4):
         actions, versions = plans.window(4 * 40 + substep, 20, 1)
         np.testing.assert_array_equal(actions[:, 0], np.arange(41, 61))
@@ -42,20 +42,19 @@ def test_native_actions_cross_committed_boundary_with_offset_and_substeps():
 def test_full_response_retained_and_short_response_rejected():
     plans = Plans(30)
     assert plans.add(chunk(), 0, 0, 0).actions.shape[0] == 50
-    with pytest.raises(ValueError, match='exceeds'):
-        Plans(51).add(chunk(), 0, 0, 0)
+    assert Plans(51).add(chunk(), 0, 0, 0).length == 50
 
 
 def test_calibration_schedules_are_external_steps_and_fail_infeasible():
     s = Schedule.calibrate(20, .051, .02, 100, 80)
     assert (s.prefetch_steps, s.trigger_step) == (8, 12)
-    assert pi_trigger(50, 20, 1, .20, .08, 25) == 22
+    assert aligned_pi_schedule(50, 50, 20, 1, .20, .08, 25) == (21, 28)
     with pytest.raises(ValueError, match='single WM'):
         Schedule.calibrate(4, .051, .02, 100, 80)
     with pytest.raises(ValueError, match='horizon'):
         Schedule.calibrate(20, .051, .02, 100, 25)
-    with pytest.raises(ValueError, match='pi0 latency'):
-        pi_trigger(20, 20, 1, .2, .08, 25)
+    with pytest.raises(ValueError, match='too short'):
+        aligned_pi_schedule(5, 50, 20, 1, .2, .08, 25)
 
 
 def test_prefetch_does_not_reset_count_and_takeover_accounts_for_wait():
@@ -146,13 +145,49 @@ def test_config_independent_of_dp_and_explicit_modes():
     assert 'preprocessing' not in config['wm']
 
 
+def test_pi_observation_uses_literal_libero_input_keys():
+    from inference.pi0_wm.pi import observation
+
+    config = load_config(Path(__file__).parents[1] / 'inference/configs/pi0_wm.yaml')
+    frames = {name: SimpleNamespace(frame=np.zeros((192, 256, 3), dtype=np.uint8))
+              for name in ('side', 'wrist')}
+    payload = observation(config['pi0'], SimpleNamespace(ee_pose=np.eye(4)), frames)
+    assert set(payload) == {'observation/state', 'observation/image',
+                            'observation/wrist_image', 'prompt'}
+    np.testing.assert_array_equal(payload['observation/state'], [0, 0, 0, 0, 0, 0, 1])
+    assert payload['observation/image'].shape == (192, 256, 3)
+    assert not np.shares_memory(payload['observation/image'], frames['side'].frame)
+
+
+def test_pi_missing_server_metadata_reports_server_startup_fix(monkeypatch):
+    from inference.pi0_wm.pi import PiClient
+
+    module = types.ModuleType('openpi_client.websocket_client_policy')
+    module.WebsocketClientPolicy = lambda **kwargs: SimpleNamespace(get_server_metadata=lambda: {})
+    monkeypatch.setitem(sys.modules, 'openpi_client.websocket_client_policy', module)
+    client = PiClient({'host': 'localhost', 'port': 8000, 'interface': {}})
+    with pytest.raises(ValueError, match='metadata is missing pi0_wm.*serve_pi0_wm.py'):
+        client.infer({})
+
+
+def test_worker_final_error_includes_original_cause():
+    worker = Worker('pi0', lambda value: value)
+    error = ValueError('missing pi0_wm metadata')
+    worker.results.put(Result(Request(0, 0, (), None, time.perf_counter()), None, 0, error))
+    try:
+        with pytest.raises(RuntimeError, match='pi0 request 0 failed: ValueError: missing pi0_wm metadata') as caught:
+            worker.poll()
+        assert caught.value.__cause__ is error
+    finally:
+        worker.close()
+
+
 def test_checkpoint_preprocessing_has_no_offline_metadata_dependency():
-    data = {'dq_source': 'hardware'}
     filters = {
         key: {'enabled': False, 'operations': [], 'dataset_preprocessed_operations': []}
         for key in ('q', 'dq', 'delta_q', 'tau')
     }
-    assert checkpoint_preprocessing(data, filters) == ('hardware', {})
+    assert checkpoint_preprocessing(filters) == {}
 
 
 def test_wm_adapter_initializes_without_offline_preprocessing_paths(monkeypatch, tmp_path):
@@ -211,7 +246,7 @@ def test_wm_adapter_initializes_without_offline_preprocessing_paths(monkeypatch,
         monkeypatch.setitem(sys.modules, name, module)
 
     cfg = {
-        'dataloader': {'dq_source': 'hardware', 'normalize_mode': 'gaussian',
+        'dataloader': {'normalize_mode': 'gaussian',
                        'normalize_lowdim_keys': [], 'filters': {}},
         'train': {'ema': {'enabled': False}},
     }
@@ -223,12 +258,10 @@ def test_wm_adapter_initializes_without_offline_preprocessing_paths(monkeypatch,
     adapter = WMAdapter({'pinn_root': str(tmp_path), 'checkpoint': 'missing.pt',
                          'use_ema': False, 'device': 'cpu', 'num_samples': 1,
                          'flow_steps': 1, 'solver': 'euler'}, 100, 25)
-    assert adapter.dq_source == 'hardware'
     assert adapter.operations == {}
 
 
 def test_checkpoint_preprocessing_restores_only_pending_causal_operations():
-    data = {'dq_source': 'backward_difference'}
     filters = {
         'q': {'enabled': True,
               'operations': [{'type': 'lowpass', 'cutoff_hz': 15.0, 'order': 2}],
@@ -238,16 +271,16 @@ def test_checkpoint_preprocessing_restores_only_pending_causal_operations():
                'operations': [{'type': 'lowpass', 'cutoff_hz': 15.0}],
                'dataset_preprocessed_operations': []},
     }
-    source, operations = checkpoint_preprocessing(data, filters)
-    assert source == 'backward_difference'
+    operations = checkpoint_preprocessing(filters)
     assert operations == {'dq': [{'type': 'lowpass', 'cutoff_hz': 15.0}]}
 
 
-def test_unknown_checkpoint_dq_source_fails_closed():
-    with pytest.raises(ValueError, match='dq source'):
-        checkpoint_preprocessing({}, {})
-    with pytest.raises(ValueError, match='unsupported checkpoint dq source'):
-        checkpoint_preprocessing({'dq_source': 'unknown'}, {})
+def test_history_uses_hardware_velocity_even_when_position_changes():
+    history = History(2, 100, {})
+    for step in range(2):
+        state = SimpleNamespace(q=np.full(7, step), dq=np.full(7, 0.25), torque=np.zeros(7))
+        history.append(step, state, state.q, 1 + step * .01)
+    np.testing.assert_allclose(history.snapshot()['dq'], .25)
 
 
 def test_position_limits_record_only_successful_sent_command():
@@ -315,6 +348,7 @@ def test_actual_current_model_stride_keeps_all_action_tokens_and_expands_once():
     model = ContactWorldModel(config).eval()
     adapter = WMAdapter.__new__(WMAdapter)
     adapter.model, adapter.device = model, torch.device('cpu')
+    adapter.contract = model.checkpoint_contract()
     adapter.num_samples, adapter.steps, adapter.solver = 2, 1, 'euler'
     adapter.history_horizon, adapter.action_horizon, adapter.future_horizon = 12, 5, 8
     adapter.inputs, adapter.outputs = model.inputs, model.predicted_state_streams
@@ -332,3 +366,19 @@ def test_actual_current_model_stride_keeps_all_action_tokens_and_expands_once():
     for x in seen:
         np.testing.assert_array_equal(x[0, :, 0], np.arange(5))
     np.testing.assert_array_equal(output['q'][:, ::2], output['q'][:, 1::2])
+
+
+def test_pi_chunk_diagnostic_logs_only_latest_q():
+    from inference.pi0_wm.runtime import Runtime
+    runtime = Runtime.__new__(Runtime)
+    runtime.history = History(2, 100, {})
+    for step in (139, 140):
+        state = SimpleNamespace(q=np.full(7, step), dq=np.zeros(7), torque=np.zeros(7))
+        runtime.history.append(step, state, np.zeros(7), 1 + step * .01)
+    output = []
+    runtime.diagnostics = SimpleNamespace(emit=output.append)
+    runtime.log_pi_chunk()
+    assert set(output[0]) == {'q'}
+    np.testing.assert_array_equal(output[0]['q'], np.full(7, 140))
+    runtime.history.rows[-1]['q'][:] = -1
+    np.testing.assert_array_equal(output[0]['q'], np.full(7, 140))

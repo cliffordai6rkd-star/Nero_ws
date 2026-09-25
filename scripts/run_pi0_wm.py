@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independent pi0 -> CaRS-WM -> position-only deployment."""
+"""Independent pi0/WM inference with keyboard-controlled trials."""
 from pathlib import Path
 import argparse
 import logging
@@ -19,7 +19,7 @@ def main():
     parser.add_argument('--mock', action='store_true', help='mock pi0, WM, arm, cameras; no hardware opened')
     parser.add_argument('--mock-wm', action='store_true', help='mock only WM, for websocket integration tests')
     parser.add_argument('--headless', action='store_true', help='MuJoCo FK without viewer, no camera windows')
-    parser.add_argument('--steps', type=int, help='number of external control steps after calibration')
+    parser.add_argument('--steps', type=int, help='maximum execution steps per trial; pauses do not count')
     parser.add_argument('--verbose', action='store_true')
     args = parser.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format='%(asctime)s %(levelname)s %(message)s')

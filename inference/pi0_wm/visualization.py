@@ -37,7 +37,8 @@ class Visualizer(MujocoKinematicVisualizer):
         def pack(result):
             if result is None:
                 return None
-            return {'request_id': result.request.request_id, 'anchor': result.request.anchor,
+            anchor = execution.start_step if execution.open_loop and result is execution.current else result.request.anchor
+            return {'request_id': result.request.request_id, 'anchor': anchor,
                     'plans': result.request.plan_versions, 'q': result.value['q']}
         _put_latest(self._queue, {'step': step, 'q': np.asarray(q).copy(),
                                  'latest': pack(execution.latest), 'active': pack(execution.current),

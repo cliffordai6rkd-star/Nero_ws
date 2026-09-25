@@ -136,3 +136,8 @@ scripts/visualize_wm_lerobotv3.py \
   --action-key action.ee_pose \
   --max-steps 3000
 ```
+
+h5 rerun
+、、、
+python scripts/browse_h5_rerun.py --camera side/wrist
+、、、

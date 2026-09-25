@@ -673,8 +673,7 @@ class NeroInferenceRuntime:
             if (
                 callable(sampler)
                 and self.mujoco_visualizer.enabled
-                and callable(getattr(getattr(pipeline, "pinn", None), "encode_conditions", None))
-                and callable(getattr(getattr(pipeline, "pinn", None), "integrate_flow", None))
+                and callable(getattr(getattr(pipeline, "pinn", None), "sample", None))
             ):
                 sampled = sampler(
                     history,

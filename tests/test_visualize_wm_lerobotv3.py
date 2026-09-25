@@ -10,6 +10,7 @@ class _RecursiveModel(torch.nn.Module):
     history_horizon = 50
     future_horizon = 32
     action_condition_horizon = 8
+    action_start_offset = 0
     flow_dim = 28
     inputs = ("q", "dq", "delta_q", "tau")
 
@@ -71,6 +72,7 @@ def test_recursive_rollout_commits_16_of_32_and_reanchors_actions():
     }
     arrays["action"] = np.arange(count * 7, dtype=np.float64).reshape(count, 7)
     arrays["timestamp"] = np.arange(count, dtype=np.float64)
+    arrays["action_index"] = np.arange(count)
     q, _, timings = recursive_rollout(
         model,
         arrays,
@@ -100,6 +102,7 @@ def test_legacy_q_tau_sampler_does_not_require_predicted_dq_or_delta_q():
     }
     arrays["action"] = np.zeros((count, 7), dtype=np.float64)
     arrays["timestamp"] = np.arange(count, dtype=np.float64)
+    arrays["action_index"] = np.arange(count)
     q, _, timing = sample(model, arrays, start=50, samples=1, steps=1, solver="euler")
 
     assert q.shape == (1, 32, 7)
@@ -114,6 +117,7 @@ def test_strided_sampler_restores_external_rate_and_history():
         for key in ("q", "dq", "delta_q", "tau", "action")
     }
     arrays["timestamp"] = np.arange(count, dtype=np.float64) * 1e7
+    arrays["action_index"] = np.arange(count)
     q, _, _ = sample(model, arrays, start=50, samples=1, steps=1, solver="euler")
     assert q.shape == (1, 16, 7)
     # Internal prediction tokens are repeated to the 100 Hz external timeline.

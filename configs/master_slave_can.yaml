@@ -16,8 +16,8 @@ teleop:
       follower_kp: [4.0, 3.0, 4.0, 3.5, 5.0, 2.0, 3.0]   # q
       follower_kd: [0.1, 0.1, 0.25, 0.25, 0.1, 0.1, 0.1]  # v
       # 首次实机逐轴确认 sign，再逐步增加 gain/limit。
-      force_feedback_gain: [1, 1, 1, 1, 1, 1, 1]
-      # force_feedback_gain: [0, 0, 0, 0, 0, 0, 0]
+      # force_feedback_gain: [1, 1, 1, 1, 1, 1, 1]
+      force_feedback_gain: [0, 0, 0, 0, 0, 0, 0]
       force_feedback_sign: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
       force_feedback_deadband_nm: [0.25, 0.6, 0.25, 0.6, 0.25, 0.25, 0.25]
       # force_feedback_limit_nm: [5, 5, 5, 5, 5, 5, 5]
@@ -35,6 +35,7 @@ teleop:
           # Stable binding: this adapter is physically wired to the master arm.
           channel: can_master
           usb_serial: "004300304148570D20343133"
+          # usb_serial: "004400424148570A20343133"
           interface: socketcan
           bitrate: 1000000
           firmware: V120
@@ -44,6 +45,7 @@ teleop:
           # Stable binding: this adapter is physically wired to the slave arm.
           channel: can_slave
           usb_serial: "004400424148570A20343133"
+          # usb_serial: "'004300304148570D20343133"
           interface: socketcan
           bitrate: 1000000
           firmware: V120
@@ -187,7 +189,7 @@ gripper:
   offset_m: 0.0
   min_width_m: 0.0
   max_width_m: 0.1
-  force_n: 3
+  force_n: 5
   command_rate_hz: 25
   deadband_m: 0.0005
   keepalive_s: 0.5

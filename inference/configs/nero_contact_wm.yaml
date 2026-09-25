@@ -19,11 +19,15 @@ architecture:
   world_model_type: contact_wm
 
 contactworldmodel:
-  # Legacy CARS-WM checkpoint.  It consumes q/dq/delta_q/tau and predicts q/tau.
+  # Deterministic WM checkpoint; consumes q/dq/delta_q/tau and predicts q/tau.
   # path: ../../../PINN/outputs/cwm_insert_usb_50hz/checkpoints/step_00300000.pt
-  # path: ../../../PINN/outputs/cwm_all_100hz/checkpoints/step_00400000.pt
+  # path: ../../../PINN/outputs/cwm_all_100hz_16step/checkpoints/step_00500000.pt
+  path: ../../../PINN/outputs/cwm_all_100hz_40step/checkpoints/step_00500000.pt
   # path: ../../../PINN/outputs/cwm_insert_usb_100hz_40step/checkpoints/step_00100000.pt
-  path: ../../../PINN/outputs/cwm_insert_usb_100hz_80step/checkpoints/step_00250000.pt
+  # path: ../../../PINN/outputs/cwm_insert_usb_100hz_80step/checkpoints/step_00300000.pt
+  # path: ../../../PINN/outputs/cwm_insert_usb_100hz_40step/checkpoints/step_00100000.pt
+  # path: ../../../PINN/outputs/cwm_insert_usb_100hz_80step/checkpoints/step_00500000.pt
+  # path: ../../../PINN/outputs/deterministic_wm_baseline_ep2/checkpoints/step_00028353.pt
   device: cuda:0
   use_ema: true
 
@@ -59,11 +63,6 @@ execution:
   mit_velocity_limit: [1, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
   mit_feedback_torque_limit: [10, 10, 10, 8, 6, 5, 5]
 
-dp_sampling:
-  method: ddim
-  num_inference_steps: 50
-  # false makes DP camera-only; force-aware checkpoints require true.
-  use_tau_ext_observation: false
 
 robot:
   urdf_path: ../../urdf/nero/nero_with_gripper.urdf
@@ -125,9 +124,9 @@ wrench_visualization:
 # the arm. Keep enabled=false for unchanged deployment behavior.
 mujoco_visualization:
   enabled: false
-  num_future_samples: 30
-  execute_steps: 80
-  trajectory_horizon: 80
+  num_future_samples: 1
+  execute_steps: 20
+  trajectory_horizon: 40
   mujoco_model_path: ../../calibration/data/excitation_validation.scene.xml
   ee_body_name: gripper_base
   ee_site_name: gripper_fingertip_center

@@ -38,11 +38,18 @@ class Plan:
     start_token: int
     actions: np.ndarray  # retain the FULL response, consume only length tokens
     length: int
-    snapshot_anchor: int
+    snapshot_anchor: float
 
     @property
     def end_token(self):
         return self.start_token + self.length
+
+    def action_at(self, token, ratio):
+        # Each source action retains its time relative to the observation.
+        index = math.floor((token * ratio - self.snapshot_anchor) / ratio)
+        if index < 0 or index >= len(self.actions):
+            raise MissingActions(f'action token {token} outside request {self.request_id} validity')
+        return self.actions[index]
 
 
 class MissingActions(RuntimeError):
@@ -60,11 +67,15 @@ class Plans:
         actions = np.asarray(actions, dtype=np.float32).copy()
         if actions.ndim != 2 or actions.shape[1] != 7 or not np.isfinite(actions).all():
             raise ValueError("pi0 actions must be finite physical EE poses [T,7]")
-        if len(actions) < self.consume:
-            raise ValueError(f"consume_steps={self.consume} exceeds returned chunk={len(actions)}")
+        skipped = math.floor((start_token * self.ratio - anchor) / self.ratio)
+        if skipped < 0:
+            raise ValueError('plan cannot activate before its observation')
+        available = len(actions) - skipped
+        if available <= 0:
+            raise MissingActions('returned pi0 chunk has expired before activation')
         if self.plans and start_token < self.plans[-1].end_token:
             raise ValueError("a committed plan boundary may not move or overlap")
-        plan = Plan(self.next_id, request_id, start_token, actions, self.consume, anchor)
+        plan = Plan(self.next_id, request_id, start_token, actions, min(self.consume, available), anchor)
         self.next_id += 1
         self.plans.append(plan)
         return plan
@@ -86,29 +97,36 @@ class Plans:
             plan = next((p for p in self.plans if p.start_token <= token < p.end_token), None)
             if plan is None:
                 raise MissingActions(f"no native action token {token} for anchor {step}")
-            tokens.append(plan.actions[token - plan.start_token])
+            tokens.append(plan.action_at(token, self.ratio))
             if not versions or versions[-1] != plan.loop_id:
                 versions.append(plan.loop_id)
         return np.stack(tokens), tuple(versions)
 
     def prune(self, step):
-        # Keep the current and committed pending plan only.
+        # Retain all still-valid committed plans, including pending successors.
         self.plans[:] = [p for p in self.plans if p.end_token > step // self.ratio]
 
 
-def pi_trigger(consume, horizon, offset, latency_max, margin, action_hz):
-    # First cross-boundary window is at consume - horizon - offset + 1.
+def aligned_pi_schedule(requested_consume, chunk_length, horizon, offset, latency_max, margin, action_hz):
+    """Reserve the expired prefix and enough coverage for serial inference.
+
+    A pending plan may need its successor before it becomes active. Never wait
+    for activation to schedule that successor. One extra token covers phase.
+    """
     lead = math.ceil(math.nextafter((latency_max + margin) * action_hz, -math.inf))
-    trigger = consume - horizon - offset - lead
-    if trigger < 0:
-        raise ValueError("pi0 latency + WM action window exceeds consumable chunk; no continuous single-worker schedule")
-    return trigger
+    lookahead = horizon + offset + lead
+    consume = min(requested_consume, chunk_length - lookahead - 1)
+    if consume <= lead:
+        raise ValueError('pi0 chunk too short for time-aligned continuous inference: '
+                         f'available consumption={consume}, latency reserve={lead}; '
+                         'reduce latency/WM action horizon or use a longer trained pi0 chunk')
+    return consume, lookahead
 
 
 @dataclass(frozen=True)
 class Request:
     request_id: int
-    anchor: int
+    anchor: float  # WM uses integer state ticks; pi0 uses interpolated camera time.
     plan_versions: tuple[int, ...]
     payload: Any
     started: float
@@ -157,7 +175,10 @@ class Worker:
             return None
         self.busy = False
         if result.error is not None:
-            raise RuntimeError(f"{self.thread.name} request {result.request.request_id} failed") from result.error
+            raise RuntimeError(
+                f"{self.thread.name} request {result.request.request_id} failed: "
+                f"{type(result.error).__name__}: {result.error}"
+            ) from result.error
         return result
 
     def close(self):
@@ -170,8 +191,10 @@ class Worker:
 
 
 class Execution:
-    def __init__(self, schedule, selected_sample=0):
+    def __init__(self, schedule, selected_sample=0, *, open_loop=False):
         self.schedule = schedule
+        self.open_loop = open_loop
+        self.start_step = None
         self.selected_sample = selected_sample
         self.current: Result | None = None
         self.pending: Result | None = None
@@ -191,13 +214,14 @@ class Execution:
             return False
         candidate = self.pending
         self.pending = None
-        d = step - candidate.request.anchor
+        d = 0 if self.open_loop else step - candidate.request.anchor
         horizon = candidate.value['q'].shape[1]
         if d < 0 or d + self.schedule.execute_steps > horizon:
             self.rejected += 1
             self.requested = False
             return False
         self.current = candidate
+        self.start_step = step
         self.wm_loop_id += 1
         self.wm_execute_step = 0  # ONLY at actual takeover
         self.requested = False
@@ -205,20 +229,47 @@ class Execution:
         return True
 
     def should_request(self):
-        return not self.requested and (self.current is None or self.wm_execute_step >= self.schedule.trigger_step)
+        trigger = self.schedule.execute_steps if self.open_loop else self.schedule.trigger_step
+        return not self.requested and (self.current is None or self.wm_execute_step >= trigger)
 
     def command(self, step):
         if self.current is None:
             return None
+        if self.open_loop and self.wm_execute_step >= self.schedule.execute_steps:
+            return None
         if self.wm_execute_step >= self.schedule.execute_steps and not self._late:
             self.overruns += 1
             self._late = True
-        index = step - self.current.request.anchor
+        index = self.wm_execute_step if self.open_loop else step - self.current.request.anchor
         q = self.current.value['q']
         if index < 0 or index >= q.shape[1]:
             return None  # caller holds the last successfully issued bounded q
         return q[self.selected_sample, index].copy()
 
     def advance(self):
-        if self.current is not None:
+        if self.current is not None and (not self.open_loop or self.wm_execute_step < self.schedule.execute_steps):
             self.wm_execute_step += 1
+
+    def torque(self, step):
+        """Use exactly the same result, sample and delay index as command()."""
+        if self.current is None:
+            return None
+        if self.open_loop and self.wm_execute_step >= self.schedule.execute_steps:
+            return None
+        index = self.wm_execute_step if self.open_loop else step - self.current.request.anchor
+        q = self.current.value['q']
+        if index < 0 or index >= q.shape[1]:
+            return None
+        tau = self.current.value.get('tau')
+        if tau is None or tau.shape != q.shape:
+            raise ValueError('MTC requires WM tau predictions with the same shape as q')
+        return tau[self.selected_sample, index].copy()
+
+    def contact_phase(self, step):
+        if self.current is None or (self.open_loop and self.wm_execute_step >= self.schedule.execute_steps):
+            return None
+        phase = self.current.value.get('contact_phase')
+        index = self.wm_execute_step if self.open_loop else step - self.current.request.anchor
+        if phase is None or not 0 <= index < phase.shape[1]:
+            return None
+        return int(phase[self.selected_sample, index])
