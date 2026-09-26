@@ -5,6 +5,7 @@ from collections import deque
 import logging
 from pathlib import Path
 import sys
+import time
 
 import numpy as np
 
@@ -206,13 +207,75 @@ class WMAdapter:
         if n.get('normalize_lowdim_keys', self.normalize_keys) != self.normalize_keys:
             raise ValueError('normalizer keys disagree with checkpoint data config')
         self.operations = checkpoint_preprocessing(filters)
+        acceleration = dict(config.get('acceleration') or {})
+        self.acceleration = {
+            'enabled': bool(acceleration.get('enabled', False)),
+            'cache_condition_kv': bool(acceleration.get('cache_condition_kv', False)),
+            'compile': bool(acceleration.get('compile', False)),
+            'compile_mode': str(acceleration.get('compile_mode', 'reduce-overhead')),
+        }
+        self._compiled_integrate = None
+        self._compile_warmup_seconds = None
+        self._compile_warmup_reported = False
+        self._compile_counter_snapshot = None
+        self._compile_unique_graphs = None
+        self._last_timing = None
+        if self.acceleration['enabled'] and self.acceleration['compile']:
+            self._setup_compiled_integrator(torch)
+        log.info('WM acceleration enabled=%s cache_condition_kv=%s compile=%s mode=%s',
+                 self.acceleration['enabled'], self.acceleration['cache_condition_kv'],
+                 self.acceleration['compile'], self.acceleration['compile_mode'])
         log.info('WM restored %s weights=%s device=%s samples=%s flow_steps=%s solver=%s contract=%s',
                  config['checkpoint'], weights_key, self.device, self.num_samples,
                  self.steps or self.contract.get('flow', {}).get('steps'),
                  self.solver or self.contract.get('flow', {}).get('solver'), self.contract)
 
-    def infer(self, payload):
+    def _setup_compiled_integrator(self, torch):
+        """Compile the exact integration path used by ``model.sample``.
+
+        Flow steps and solver are captured from this deployment instance. A
+        different configured step count gets its own adapter and compilation,
+        while the model implementation remains generic for Euler and Heun.
+        """
+        if not hasattr(torch, 'compile'):
+            log.warning('WM acceleration compile unavailable: torch.compile is not present; using eager path')
+            return
+        if not hasattr(self.model, 'integrate_flow'):
+            log.warning('WM acceleration compile unavailable: model has no flow integration path; using eager path')
+            return
+        mode = self.acceleration['compile_mode']
+        try:
+            def integrate(source, encoded, *, steps=None, solver=None):
+                return self.model.integrate_flow(
+                    source, encoded, steps=self.steps if self.steps is not None else steps,
+                    solver=self.solver if self.solver is not None else solver,
+                )
+            self._compiled_integrate = torch.compile(
+                integrate, mode=mode, dynamic=False, fullgraph=False,
+            )
+            log.info('WM acceleration compile enabled backend=inductor(default) mode=%s steps=%s solver=%s; lazy compile will run in WM worker warmup',
+                     mode, self.steps or self.model.flow_inference_steps,
+                     self.solver or self.model.flow_solver)
+        except Exception as exc:
+            self._compiled_integrate = None
+            log.warning('WM acceleration compile setup failed (%s: %s); using eager path', type(exc).__name__, exc)
+
+    @staticmethod
+    def _compile_diagnostics():
+        try:
+            from torch._dynamo.utils import counters
+            graph_breaks = sum(
+                values.get('graph_break', 0) + values.get('graph_breaks', 0)
+                for values in counters.values()
+            )
+            unique_graphs = sum(values.get('unique_graphs', 0) for values in counters.values())
+            return graph_breaks, unique_graphs
+        except Exception:
+            return None
+
+    def infer(self, payload, source_noise=None):
         import torch
+        started_total = time.perf_counter()
         history, action = payload
         if np.shape(action) != (self.action_horizon, 7):
             raise ValueError('incorrect native action window shape')
@@ -223,9 +286,68 @@ class WMAdapter:
         for key in batch:
             if key in self.normalize_keys:
                 batch[key] = getattr(self.normalizer, f'{self.mode}_normalize')(key, batch[key])
+        if source_noise is not None:
+            source_noise = torch.as_tensor(
+                source_noise, device=self.device, dtype=batch[self.inputs[0]].dtype,
+            )
         # Public API owns state stride and expansion. Action is never sliced.
-        with torch.inference_mode():
-            result = self.model.sample(batch, num_samples=self.num_samples, steps=self.steps, solver=self.solver)
+        compiled_integrate = getattr(self, '_compiled_integrate', None)
+        acceleration = getattr(self, 'acceleration', {})
+        compile_started = time.perf_counter() if compiled_integrate is not None and not getattr(self, '_compile_warmup_reported', False) else None
+        gpu_start = gpu_end = None
+        if self.device.type == 'cuda':
+            torch.cuda.synchronize(self.device)
+            gpu_start = torch.cuda.Event(enable_timing=True)
+            gpu_end = torch.cuda.Event(enable_timing=True)
+            gpu_start.record()
+        sample_kwargs = {
+            'num_samples': self.num_samples,
+            'steps': self.steps,
+            'solver': self.solver,
+            'source_noise': source_noise,
+        }
+        if hasattr(self.model, 'flow_velocity'):
+            sample_kwargs.update(
+                cache_condition_kv=(
+                    acceleration.get('enabled', False) and acceleration.get('cache_condition_kv', False)
+                ),
+                integration_fn=compiled_integrate,
+            )
+        try:
+            with torch.inference_mode():
+                result = self.model.sample(batch, **sample_kwargs)
+        except Exception as exc:
+            if compiled_integrate is None:
+                raise
+            log.warning('WM compiled inference failed (%s: %s); disabling compile and retrying eager path',
+                        type(exc).__name__, exc)
+            self._compiled_integrate = None
+            sample_kwargs.pop('integration_fn', None)
+            with torch.inference_mode():
+                result = self.model.sample(batch, **sample_kwargs)
+        if gpu_end is not None:
+            gpu_end.record()
+            gpu_end.synchronize()
+        if compile_started is not None:
+            self._compile_warmup_seconds = time.perf_counter() - compile_started
+            self._compile_warmup_reported = True
+            try:
+                from torch._dynamo.utils import counters
+                self._compile_counter_snapshot = {
+                    group: dict(values) for group, values in counters.items()
+                }
+                graph_breaks, unique_graphs = self._compile_diagnostics()
+                self._compile_unique_graphs = unique_graphs
+                log.info('WM compile diagnostics: graph_breaks=%s unique_graphs=%s', graph_breaks, unique_graphs)
+            except Exception as exc:
+                log.debug('WM compile diagnostics unavailable: %s', exc)
+            log.info('WM compile+first worker warmup completed in %.6fs; excluded from stable inference timings',
+                     self._compile_warmup_seconds)
+        elif compiled_integrate is not None and self._compile_unique_graphs is not None:
+            diagnostics = self._compile_diagnostics()
+            if diagnostics is not None and diagnostics[1] > self._compile_unique_graphs:
+                log.warning('WM compile produced additional graphs after warmup: unique_graphs=%s (initial=%s); check input shapes/dtypes',
+                            diagnostics[1], self._compile_unique_graphs)
         physical = {}
         for key in self.outputs:
             value = result[f'{key}_pred'][0]
@@ -243,6 +365,10 @@ class WMAdapter:
             if phase.shape != (self.num_samples, self.future_horizon) or not np.isin(phase, [0, 1, 2]).all():
                 raise ValueError('invalid WM contact phase prediction')
             physical['contact_phase'] = phase.astype(np.int8)
+        self._last_timing = {
+            'gpu_seconds': None if gpu_start is None else gpu_start.elapsed_time(gpu_end) / 1000.0,
+            'adapter_seconds': time.perf_counter() - started_total,
+        }
         return physical
 
 

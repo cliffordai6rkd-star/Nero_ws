@@ -313,7 +313,19 @@ class Runtime:
         self.acquire()
 
     def await_result(self, worker):
-        deadline = time.monotonic() + self.cfg['calibration']['request_timeout_s']
+        timeout = self.cfg['calibration']['request_timeout_s']
+        compile_pending = (
+            worker is self.wm_worker
+            and getattr(self.wm, '_compiled_integrate', None) is not None
+            and not getattr(self.wm, '_compile_warmup_reported', False)
+        )
+        if compile_pending:
+            # The first real worker request performs lazy torch.compile. Keep
+            # this startup-only phase out of the ordinary request timeout;
+            # stable inference requests use the configured timeout below.
+            timeout = max(timeout, 300.0)
+            log.info('WM compile warmup pending; startup wait budget=%.1fs', timeout)
+        deadline = time.monotonic() + timeout
         while True:
             self.check_keys()
             result = worker.poll()
@@ -383,6 +395,11 @@ class Runtime:
             maximum = max(timings)
             log.info('%s calibration: samples=%s duration=%.3fs peak=%.6fs', name, len(timings),
                      time.monotonic() - measurement_started, maximum)
+            if name == 'WM':
+                compile_seconds = getattr(self.wm, '_compile_warmup_seconds', None)
+                if compile_seconds is not None:
+                    log.info('WM compile+first worker warmup: %.6fs (excluded from stable peak)',
+                             compile_seconds)
             if name == 'pi0':
                 self.plans.consume, self.pi_lookahead = aligned_pi_schedule(
                     self.cfg['pi0']['consume_steps'], min(chunk_lengths), self.wm.action_horizon,

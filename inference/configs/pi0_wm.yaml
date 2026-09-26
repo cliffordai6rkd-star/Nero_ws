@@ -30,16 +30,21 @@ wm:
   enable: true  # false: 跳过 WM，π0 末端绝对位姿经 IK 转为关节角开环执行。
   # PINN repo path and checkpont path 
   pinn_root: ../../../PINN
-  # checkpoint: ../../../PINN/outputs/cwm_insert_usb_100hz_16step/checkpoints/step_00200000.pt
-  checkpoint: ../../../PINN/outputs/cwm_insert_usb_100hz_80step/checkpoints/step_00300000.pt
-  # checkpoint: ../../../PINN/outputs/cwm_insert_usb_100hz_40step/checkpoints/step_00100000.pt
+  checkpoint: ../../../PINN/outputs/cwm_insert_usb_100hz_16step/checkpoints/step_00200000.pt
+  # checkpoint: ../../../PINN/outputs/cwm_insert_usb_100hz_40step/checkpoints/step_00200000.pt
   # checkpoint: ../../../PINN/outputs/cwm_all_100hz_40step/checkpoints/step_00400000.pt
+  # checkpoint: ../../../PINN/outputs/deterministic_wm_baseline_ep2/checkpoints/step_00028353.pt
   device: cuda:0
   use_ema: true
   num_samples: 1
   selected_sample: 0
-  flow_steps: 32
+  flow_steps: 4
   solver: heun
+  acceleration:
+    enabled: false
+    cache_condition_kv: false
+    compile: false
+    compile_mode: reduce-overhead
 
 control:
   inference_runs: 50  # 运行轮数；i 或达到 maximum_steps 完成本轮，d 暂停不计数。
@@ -47,12 +52,15 @@ control:
   mode: mtc  # q: move_js 位置控制；mtc: WM q/tau 同步 MIT 阻抗＋力矩前馈。
   mtc:
     # 仅 mode=mtc 时生效。
-    kp: [4.0, 4.0, 4.0, 4.0, 5.0, 2.0, 3.0]
+    kp: [6.0, 6.0, 6.0, 6.0, 5.0, 6.0, 6.0]
+    # kd: [1, 1, 1, 1, 1, 1, 1]
+    # kp: [4.0, 3.0, 4.0, 3.5, 5.0, 2.0, 3.0]   # q
     kd: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+
     # t_ff = g(q_measured) + tau_scale * (tau_WM - g(q_WM))。
     # 不是实测力矩误差闭环；明显限幅时自动降低预测残差权重。
     tau_scale: [1, 1, 1, 1, 1, 1, 1]
-    maximum_velocity_rad_s: 1.0
+    maximum_velocity_rad_s: 2.0
     maximum_acceleration_rad_s2: 2.0
     prediction_deviation_rad: 0.1
     feedforward_limit_nm: [12, 12, 10, 10, 5, 5, 5]
@@ -62,7 +70,7 @@ control:
     urdf_path: ../../urdf/nero/nero_with_gripper.urdf
   hz: 100
   command_hz: 100  # 只降低下发频率，不改变 WM 的 100 Hz 预测时间轴。
-  execute_steps: 16 # 每段执行步数；100 Hz 下 40 步=400 ms，模型预测长度不变。
+  execute_steps: 8 # 每段执行步数；100 Hz 下 40 步=400 ms，模型预测长度不变。
   maximum_steps: 10000
   maximum_state_age_s: 0.1
   maximum_camera_age_s: 0.3

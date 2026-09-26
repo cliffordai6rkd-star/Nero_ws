@@ -275,6 +275,32 @@ python /path/to/Nero_ws/scripts/serve_pi0_wm.py \
 # 如果只验证协议和调度，可额外传 --mock-wm；此选项禁止真实下发。
 ```
 
+### CaRS-WM 离线加速 benchmark
+
+`wm.acceleration` 默认四项均关闭，旧配置因此保持 eager 行为。需要启用加速时：
+
+```yaml
+wm:
+  acceleration:
+    enabled: true
+    cache_condition_kv: true
+    compile: true
+    compile_mode: reduce-overhead
+```
+
+不连接相机、π0 服务或机械臂的 benchmark 使用同一 checkpoint、条件、显式源噪声和
+`float32`，比较 eager、K/V 缓存、compile、缓存+compile 四种路径，并分别测量当前
+部署 Flow steps/solver 与 64 步 Heun：
+
+```bash
+PYTHONPATH=. .venv/bin/python scripts/benchmark_pi0_wm.py \
+  --config inference/configs/pi0_wm.yaml --iterations 30 --warmup 3
+```
+
+输出包含 GPU 计算和 WMAdapter 端到端的测量次数、p50、p95、最大值、峰值显存、
+compile+首次 worker warmup 时间，以及 q/tau/contact 输出的最大绝对误差。没有可用
+checkpoint 或 CUDA 时脚本明确退出或报告 GPU 项未提供，不使用 mock 耗时宣称加速。
+
 ## 验证记录与边界
 
 - 新测试覆盖：提前触发、当前计数不被请求重置、包含等待时间的延迟偏移、`d+E` 边界、跨 chunk 原生窗口、迟到尾部/保持/恢复、单请求 worker、实际限幅后 delta_q、因果滤波等价性、完整样本选择。

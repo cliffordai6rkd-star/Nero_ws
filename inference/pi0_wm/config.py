@@ -15,6 +15,16 @@ def load_config(path):
     wm = config['wm']
     wm.setdefault('enable', True)
     wm.setdefault('inference_mode', 'prefetch')
+    acceleration = wm.setdefault('acceleration', {})
+    if not isinstance(acceleration, dict):
+        raise ValueError('wm.acceleration must be a mapping')
+    for key in ('enabled', 'cache_condition_kv', 'compile'):
+        acceleration.setdefault(key, False)
+        if not isinstance(acceleration[key], bool):
+            raise ValueError(f'wm.acceleration.{key} must be true or false')
+    acceleration.setdefault('compile_mode', 'reduce-overhead')
+    if acceleration['compile_mode'] not in ('default', 'reduce-overhead', 'max-autotune'):
+        raise ValueError('wm.acceleration.compile_mode must be default, reduce-overhead or max-autotune')
     if wm['inference_mode'] not in ('prefetch', 'openloop'):
         raise ValueError('wm.inference_mode must be prefetch or openloop')
     if not isinstance(wm['enable'], bool):
