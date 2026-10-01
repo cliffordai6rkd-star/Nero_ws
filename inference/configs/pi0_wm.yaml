@@ -3,7 +3,8 @@ pi0:
   anchor_camera: wrist  # action 时间原点使用该相机帧时间戳，与训练一致。
   host: localhost
   port: 8000
-  prompt: "insert the USB into the port"
+  prompt: "peel the deep green part on the cucumber surface"
+  # prompt: "insert the USB into the port"
   # prompt: "push the button until the lamp light"
   action_hz: 25
   consume_steps: 50  # 消费上限；校准自动预留过期前缀，实际每段可能更短。
@@ -12,7 +13,8 @@ pi0:
   interface:
     # Replace with the ACTUAL Nero EE-pose LoRA TrainConfig name on the server.
     # training_config: pi0_nero_lora_push_button
-    training_config: pi0_nero_lora_insert_usb
+    # training_config: pi0_nero_lora_insert_usb
+    training_config: pi0_nero_lora_cucumber_peeling
     state_key: observation/state
     prompt_key: prompt
     images: {side: observation/image, wrist: observation/wrist_image}
@@ -30,10 +32,12 @@ wm:
   enable: true  # false: 跳过 WM，π0 末端绝对位姿经 IK 转为关节角开环执行。
   # PINN repo path and checkpont path 
   pinn_root: ../../../PINN
-  checkpoint: ../../../PINN/outputs/cwm_insert_usb_100hz_16step/checkpoints/step_00200000.pt
-  # checkpoint: ../../../PINN/outputs/cwm_insert_usb_100hz_40step/checkpoints/step_00200000.pt
+  # checkpoint: ../../../PINN/outputs/cwm_insert_usb_100hz_16step/checkpoints/step_00200000.pt
+  checkpoint: ../../../PINN/outputs/test_policy/cwm_insert_usb_100hz_40step/checkpoints/step_00200000.pt
   # checkpoint: ../../../PINN/outputs/cwm_all_100hz_40step/checkpoints/step_00400000.pt
   # checkpoint: ../../../PINN/outputs/deterministic_wm_baseline_ep2/checkpoints/step_00028353.pt
+  # checkpoint: ../../../PINN/outputs/cwm_teacher_policy/insert_usb_50h_40step/checkpoints/step_00200000.pt
+  # checkpoint: ../../../PINN/outputs/cwm_teacher_policy/ucumber_peeling_50h_40step/checkpoints/step_00100000.pt
   device: cuda:0
   use_ema: true
   num_samples: 1
@@ -49,9 +53,9 @@ wm:
 control:
   inference_runs: 50  # 运行轮数；i 或达到 maximum_steps 完成本轮，d 暂停不计数。
   wait_for_start: true  # s 开始/恢复，d 暂停，i 结束本轮并复位；Ctrl+C 退出程序。
-  mode: mtc  # q: move_js 位置控制；mtc: WM q/tau 同步 MIT 阻抗＋力矩前馈。
+  mode: mtc  # WM 开启时为 move_js；纯 Pi0（wm.enable=false）自动使用 MIT 柔顺跟踪。
   mtc:
-    # 仅 mode=mtc 时生效。
+    # 纯 Pi0（wm.enable=false）也默认通过 MIT 使用这组柔顺跟踪增益。
     kp: [6.0, 6.0, 6.0, 6.0, 5.0, 6.0, 6.0]
     # kd: [1, 1, 1, 1, 1, 1, 1]
     # kp: [4.0, 3.0, 4.0, 3.5, 5.0, 2.0, 3.0]   # q
@@ -70,7 +74,7 @@ control:
     urdf_path: ../../urdf/nero/nero_with_gripper.urdf
   hz: 100
   command_hz: 100  # 只降低下发频率，不改变 WM 的 100 Hz 预测时间轴。
-  execute_steps: 8 # 每段执行步数；100 Hz 下 40 步=400 ms，模型预测长度不变。
+  execute_steps: 8  # 每段执行步数；100 Hz 下 40 步=400 ms，模型预测长度不变。
   maximum_steps: 10000
   maximum_state_age_s: 0.1
   maximum_camera_age_s: 0.3

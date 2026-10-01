@@ -83,6 +83,20 @@ def test_expired_reference_returns_to_gravity_and_watchdog_fails(config):
         c.prepare(np.zeros(7), np.full(7, np.nan), state, np.zeros(7), .01)
 
 
+def test_pure_pi0_mit_tracks_q_without_wm_tau(config):
+    c = MtcController(config['control']['mtc'], config['hardware'], lambda q: np.ones(7),
+                      require_tau=False)
+    c.reset(np.zeros(7))
+    c.feedforward = np.ones(7)
+    c.transition_time_s = c.cfg['startup_blend_s']
+    state = SimpleNamespace(q=np.zeros(7), dq=np.zeros(7))
+    out = c.prepare(np.full(7, .1), None, state, np.zeros(7), .01)
+    assert np.all(out.q > 0)
+    np.testing.assert_allclose(out.feedforward, np.ones(7))
+    np.testing.assert_array_equal(out.kp, np.asarray(config['control']['mtc']['kp']))
+    np.testing.assert_array_equal(out.kd, np.asarray(config['control']['mtc']['kd']))
+
+
 def test_config_requires_wm_and_respects_per_joint_torque_limit(config, tmp_path):
     config['control']['mode'] = 'mtc'
     config['wm']['enable'] = False

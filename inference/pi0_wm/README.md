@@ -31,6 +31,11 @@ contact。alignment 对应模型的 precontact_or_transition 类，不表示独�
 不导入旧 DP runtime、TimestampFastSlowRuntime 或 ContactWMInferencePipeline。
 不会加载 DP checkpoint；支持 q 位置控制和可选 MTC/MIT 力矩前馈，不实现 MPC。
 
+如果控制进程因 CAN 反馈短暂超时退出，可运行
+`scripts/recover_nero_can.py --config inference/configs/pi0_wm.yaml`。脚本只重配主机
+SocketCAN、检查反馈帧并建立一次只读连接，不调用机械臂 reset、enable、disable 或运动命令；
+USB-CAN 设备若已从系统消失，仍需先恢复 USB 连接。
+
 ## 文件
 
 | 文件 | 用途 |
@@ -181,10 +186,12 @@ MTC 的速度/加速度和力矩变化率使用实际下发间隔；watchdog_tim
 1/command_hz 并留出抖动余量。启动复位、模式切换及退出保持不受此分频限制，复位仍用
 独立的数采复位频率。降低 command_hz 不会降低 WM 推理计算量。
 
-`control.mode` 默认 `q`（位置下发），设为 `mtc` 可启用 WM q/tau 同步 MIT 控制。
-`mtc` 要求 `wm.enable: true` 且模型预测 tau，纯 π0 模式需使用 `q`。参数在
-`control.mtc` 下：逐关节 kp/kd、tau_scale、速度/加速度、前馈/总力矩与变化率限值，
-以及控制周期 watchdog 和重力模型 URDF。标量限值会展开成七关节。
+`control.mode` 默认 `q`。WM 开启时它通过位置接口下发；设为 `mtc` 可启用 WM q/tau
+同步 MIT 控制。纯 π0（`wm.enable: false`）使用同一个 `q` 默认值，但会自动把 IK 关节
+目标送入 MIT 阻抗接口，使用 `control.mtc` 下的 kp/kd 和当前姿态重力补偿，不需要 WM tau。
+`mtc` 模式要求 `wm.enable: true` 且模型预测 tau。参数在 `control.mtc` 下：逐关节
+kp/kd、tau_scale、速度/加速度、前馈/总力矩与变化率限值，以及控制周期 watchdog 和
+重力模型 URDF。标量限值会展开成七关节。
 
 MTC 从同一 WM 结果、样本和延迟索引提取 q/tau。位置参考先做速度/加速度及关节范围
 限制，并按剩余距离提前制动，避免固定目标下的参考超调。目标突然反向或进入保持时，
@@ -237,7 +244,9 @@ wm:
 实测关节角作初值，后续点使用前一点的解。该模型仍是必需的，即使可视化已关闭。
 求解限制在模型与硬件共同允许的关节范围内；不收敛则退出，不发送失败解。
 π0+IK 的总耗时计入 π0 校准，继续使用观测锚定的 chunk 时间轴和过期前缀跳过逻辑。
-动作按 25 Hz 更新关节目标，按 command_hz 下发并沿用单步限幅；缺少有效计划时保持上次目标。
+动作按 25 Hz 更新关节目标；默认经 MIT 阻抗接口按 command_hz 下发，并沿用速度、加速度
+和单步限幅。MIT 的 kp/kd 直接取 `control.mtc`；前馈使用当前实测姿态的重力补偿，不使用
+WM tau。缺少有效计划时保持上次目标。
 开环指 chunk 内不使用 WM 预测或重新规划；仍读取反馈做状态新鲜度及关节范围检查。
 启动复位、终端按 `i` 复位退出、dry-run 行为与 WM 模式相同。`--mock-wm` 仅适用于 WM 开启时。
 

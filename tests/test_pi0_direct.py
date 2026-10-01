@@ -36,6 +36,51 @@ def test_disabled_wm_needs_no_checkpoint_and_is_not_constructed(config, tmp_path
     np.testing.assert_allclose(output, np.tile(seed, (50, 1)), atol=1e-6)
 
 
+def test_pure_pi0_automatically_uses_mit_and_configured_gains(config, monkeypatch):
+    import inference.pi0_wm.runtime as module
+    import nero_collection.inverse_dynamics as dynamics
+
+    config['wm']['enable'] = False
+    config['mujoco']['enabled'] = False
+    monkeypatch.setattr(
+        dynamics,
+        'PinocchioJointTorqueResidualEstimator',
+        lambda cfg: SimpleNamespace(gravity_torque=lambda q: np.ones(7)),
+    )
+    rt = Runtime(config, mock=True)
+    assert rt.pure_pi0_mit and rt.mit_mode
+    assert rt.mtc.require_tau is False
+    np.testing.assert_array_equal(rt.mtc.cfg['kp'], config['control']['mtc']['kp'])
+    np.testing.assert_array_equal(rt.mtc.cfg['kd'], config['control']['mtc']['kd'])
+
+
+def test_pure_pi0_q_target_uses_mit_transport(config, monkeypatch):
+    import nero_collection.inverse_dynamics as dynamics
+
+    config['wm']['enable'] = False
+    config['mujoco']['enabled'] = False
+    monkeypatch.setattr(
+        dynamics,
+        'PinocchioJointTorqueResidualEstimator',
+        lambda cfg: SimpleNamespace(gravity_torque=lambda q: np.zeros(7)),
+    )
+    rt = Runtime(config, mock=True)
+    rt.state = SimpleNamespace(q=np.zeros(7), dq=np.zeros(7), torque=np.zeros(7))
+    rt.held = np.zeros(7)
+    rt.mtc.reset(rt.state.q, rt.state.torque)
+    rt.mtc_active = True
+    rt.mtc_sent_at = None
+    rt.last_command_step = None
+    rt.step = 0
+    sent = []
+    rt.arm = SimpleNamespace(command_joint_impedance=lambda *args: sent.append(args))
+    rt.visualizer = SimpleNamespace(update=lambda *args: None)
+    rt.send(np.full(7, 0.1), None)
+    assert len(sent) == 1
+    np.testing.assert_array_equal(sent[0][2], np.asarray(config['control']['mtc']['kp']))
+    np.testing.assert_array_equal(sent[0][3], np.asarray(config['control']['mtc']['kd']))
+
+
 def test_real_ik_roundtrip_and_continuous_chunk(config):
     ik = PoseIK(config['mujoco'], config['hardware'])
     seed = np.asarray(config['hardware']['endpoint']['rest_q'])

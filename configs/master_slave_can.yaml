@@ -16,8 +16,8 @@ teleop:
       follower_kp: [4.0, 3.0, 4.0, 3.5, 5.0, 2.0, 3.0]   # q
       follower_kd: [0.1, 0.1, 0.25, 0.25, 0.1, 0.1, 0.1]  # v
       # 首次实机逐轴确认 sign，再逐步增加 gain/limit。
-      # force_feedback_gain: [1, 1, 1, 1, 1, 1, 1]
-      force_feedback_gain: [0, 0, 0, 0, 0, 0, 0]
+      force_feedback_gain: [1, 1, 1, 1, 1, 1, 1]
+      # force_feedback_gain: [0, 0, 0, 0, 0, 0, 0]
       force_feedback_sign: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
       force_feedback_deadband_nm: [0.25, 0.6, 0.25, 0.6, 0.25, 0.25, 0.25]
       # force_feedback_limit_nm: [5, 5, 5, 5, 5, 5, 5]
@@ -79,7 +79,8 @@ tau_ext_inference:
   maximum_prediction_age_s: 0.06
 
   tau_other:
-    checkpoint_path: model/tau_other/epoch_121_val_loss_0.001129.pt
+    # checkpoint_path: ../../PINN/outputs/tau_other_sequence/ep4/checkpoints/epoch_118_val_loss_0.001123.pt
+    checkpoint_path: ../../PINN/outputs/tau_other_sequence/ep3/checkpoints/epoch_094_val_loss_0.020716.pt
     # stride = teleop.command.sample_rate_hz / observation_sample_rate_hz = 2。
     observation_sample_rate_hz: 50.0
 
@@ -118,7 +119,7 @@ realtime_plot:
   window_s: 0.1
   update_rate_hz: 50.0
   # 填写数值后会在两个 ||tau_ext|| 窗口绘制红色虚线；null 表示不绘制。
-  precontact_threshold: 0.6
+  precontact_threshold: 0.4
   contact_threshold: 2.5
 
 cameras:
@@ -161,22 +162,22 @@ cameras:
     # crop: [0, null, 0, null]
     output_size: [256, 192]
 
-  - name: side_2
-    enabled: false
-    visualize: true
-    backend: v4l2
-    serial_number: CC1N16202KT
-    pixel_format: MJPG
-    buffer_size: 1
-    startup_timeout_s: 2.0
-    frame_timeout_s: 0.5
-    width: 640
-    height: 480
-    fps: 25
-    exposure: 200
-    exposure_dynamic_framerate: false
-    depth: false
-    output_size: [256, 192]
+  # - name: side_2
+  #   enabled: false
+  #   visualize: true
+  #   backend: v4l2
+  #   serial_number: CC1N16202KT
+  #   pixel_format: MJPG
+  #   buffer_size: 1
+  #   startup_timeout_s: 2.0
+  #   frame_timeout_s: 0.5
+  #   width: 640
+  #   height: 480
+  #   fps: 25
+  #   exposure: 200
+  #   exposure_dynamic_framerate: false
+  #   depth: false
+  #   output_size: [256, 192]
 
 gripper:
   enabled: true

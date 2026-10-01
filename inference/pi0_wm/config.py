@@ -46,8 +46,9 @@ def load_config(path):
         raise ValueError('multiple inference_runs requires wait_for_start=true')
     if control['mode'] not in ('q', 'mtc', 'tau'):
         raise ValueError('control.mode must be q, mtc or tau')
-    if control['mode'] in ('mtc', 'tau'):
-        if not wm['enable']:
+    pure_pi0_mit = control['mode'] == 'q' and not wm['enable']
+    if control['mode'] in ('mtc', 'tau') or pure_pi0_mit:
+        if control['mode'] in ('mtc', 'tau') and not wm['enable']:
             raise ValueError(f"control.mode={control['mode']} requires wm.enable=true for synchronized q/tau")
         from inference.pi0_wm.mtc import validate_mtc
         validate_mtc(control.setdefault('mtc', {}))

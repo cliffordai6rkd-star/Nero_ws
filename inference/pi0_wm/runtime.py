@@ -37,6 +37,11 @@ class Runtime:
             raise ValueError('--mock cannot be combined with --enable-commands')
         self.command_enabled = enable_commands
         self.control_mode = config['control'].get('mode', 'q')
+        # Pure Pi0 has no WM tau stream, but its IK q targets can still be
+        # sent through the same firmware impedance (MIT) transport.  Keep
+        # this automatic for the existing ``mode: q`` configuration.
+        self.pure_pi0_mit = self.control_mode == 'q' and not config['wm'].get('enable', True)
+        self.mit_mode = self.control_mode in ('mtc', 'tau') or self.pure_pi0_mit
         self.mtc = None
         self.mtc_active = False
         self.mtc_sent_at = None
@@ -73,10 +78,10 @@ class Runtime:
         self.history = History(self.wm.history_horizon, self.hz, self.wm.operations)
         if self.wm_enabled and self.wm_open_loop and config['control']['execute_steps'] > self.wm.future_horizon:
             raise ValueError('open-loop execute_steps exceeds WM prediction horizon')
-        if self.control_mode in ('mtc', 'tau'):
-            if not self.wm_enabled:
+        if self.mit_mode:
+            if self.control_mode in ('mtc', 'tau') and not self.wm_enabled:
                 raise ValueError('MTC requires WM q/tau predictions')
-            if 'tau' not in getattr(self.wm, 'outputs', ('q', 'tau')):
+            if self.wm_enabled and 'tau' not in getattr(self.wm, 'outputs', ('q', 'tau')):
                 raise ValueError('MTC requires a WM checkpoint that predicts tau')
             from pathlib import Path
             from nero_collection.config import InverseDynamicsConfig
@@ -85,7 +90,8 @@ class Runtime:
             dynamics = PinocchioJointTorqueResidualEstimator(InverseDynamicsConfig(
                 urdf_path=Path(config['control']['mtc']['urdf_path'])))
             self.mtc = MtcController(config['control']['mtc'], config['hardware'], dynamics.gravity_torque,
-                                     torque_only=self.control_mode == 'tau')
+                                     torque_only=self.control_mode == 'tau',
+                                     require_tau=self.wm_enabled)
         self.simulated_arm = mock or config['hardware']['backend'] == 'mock'
         if enable_commands and self.simulated_arm:
             raise ValueError('--enable-commands requires hardware.backend=pyagx')
@@ -176,7 +182,7 @@ class Runtime:
         self.history.append(self.step, self.state, self.held, time.monotonic())
 
     def enter_mtc(self):
-        if getattr(self, 'control_mode', 'q') not in ('mtc', 'tau'):
+        if not getattr(self, 'mit_mode', getattr(self, 'control_mode', 'q') in ('mtc', 'tau')):
             return
         # Anchor MIT to actual feedback, rather than the last position-mode
         # target which may still have tracking error after reset.
@@ -499,7 +505,13 @@ class Runtime:
             self.pi_worker = Worker('pi0', self.infer_pi)
             if self.wm_enabled:
                 self.wm_worker = Worker('WM', self.wm.infer)
-            log.info('inference mode: %s', 'pi0 + WM' if self.wm_enabled else 'pi0 EE pose -> IK -> open-loop q')
+            if self.wm_enabled:
+                inference_mode = 'pi0 + WM'
+            elif getattr(self, 'pure_pi0_mit', False):
+                inference_mode = 'pi0 EE pose -> IK -> MIT compliant q tracking'
+            else:
+                inference_mode = 'pi0 EE pose -> IK -> open-loop q'
+            log.info('inference mode: %s', inference_mode)
             self.deadline = time.monotonic()
             if getattr(self, 'interactive_session', False):
                 return self._session_loop(limit)

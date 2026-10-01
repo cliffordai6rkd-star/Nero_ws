@@ -15,11 +15,15 @@ class MitReference:
 
 
 class MtcController:
-    def __init__(self, config, hardware, gravity, *, torque_only=False):
+    def __init__(self, config, hardware, gravity, *, torque_only=False, require_tau=True):
         self.cfg = config
         self.hw = hardware
         self.gravity = gravity
         self.torque_only = torque_only
+        # WM-backed MTC requires a synchronized tau prediction.  Pure Pi0
+        # impedance tracking intentionally has no tau stream and uses only
+        # analytical gravity feed-forward.
+        self.require_tau = require_tau
         self.velocity = np.zeros(7)
         self.feedforward = None
 
@@ -48,7 +52,9 @@ class MtcController:
         valid = q_prediction is not None
         target = vector(q_prediction, 'predicted q') if valid else held.copy()
         target = np.clip(target, self.hw['q_min'], self.hw['q_max'])
-        tau = vector(tau_prediction, 'predicted tau') if valid else None
+        if valid and tau_prediction is None and self.require_tau:
+            raise ValueError('MTC predicted tau is required for WM tracking')
+        tau = vector(tau_prediction, 'predicted tau') if valid and tau_prediction is not None else None
         vmax = np.asarray(cfg['maximum_velocity_rad_s'])
         amax = np.asarray(cfg['maximum_acceleration_rad_s2'])
         error = target - held
@@ -69,7 +75,7 @@ class MtcController:
                             self.hw['q_min'], self.hw['q_max'])
         velocity = (command_q - held) / dt
         baseline = vector(self.gravity(q), 'gravity')
-        if valid:
+        if valid and tau is not None:
             # Reduce learned feedforward when the executed reference diverges
             # from the WM trajectory due to limiting/transition handling.
             deviation = np.abs(command_q - target)
